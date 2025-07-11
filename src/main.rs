@@ -503,7 +503,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_model_override_header_returns_400() {
+    async fn test_invalid_model_override_header_returns_404() {
         // Create a target
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
@@ -531,6 +531,8 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 404);
+        let response_body: serde_json::Value = response.json();
+        assert_eq!(response_body["code"], "model not found");
     }
 
     #[tokio::test]
