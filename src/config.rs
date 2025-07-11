@@ -7,15 +7,15 @@ use std::path::PathBuf;
 #[command(version, about, long_about = None)]
 pub(crate) struct Config {
     /// The port on which the proxy server will listen.
-    #[arg(short = 'p', default_value_t = 3000)]
+    #[arg(short = 'p', long, default_value_t = 3000)]
     pub(crate) port: u16,
 
     /// The file from which to read the targets.
-    #[arg(short = 'f')]
+    #[arg(short = 'f', long)]
     pub(crate) targets: PathBuf,
 
     /// Whether we should continue watching the targets file for changes
-    #[arg(short = 'w', default_value_t = true)]
+    #[arg(short = 'w', long, default_value_t = true)]
     pub(crate) watch: bool,
 }
 
@@ -30,4 +30,3 @@ impl Config {
         Ok(self)
     }
 }
-
