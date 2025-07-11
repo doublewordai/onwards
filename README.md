@@ -51,6 +51,16 @@ disable, set the `--watch` flag to false).
 
 ### API Usage
 
+### List Available Models
+
+Get a list of all configured targets, in the openAI models format:
+
+```bash
+curl http://localhost:3000/v1/models
+```
+
+### Sending requests
+
 Send requests to the gateway using the standard OpenAI API format:
 
 ```bash
@@ -76,11 +86,11 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
-This is also used for routing requests without bodies - for example, to list
-models available at a specific provider:
+This is also used for routing requests without bodies - for example, to get the
+embeddings usage for your organization:
 
 ```bash
-curl -X GET http://localhost:3000/v1/models \
+curl -X GET http://localhost:3000/v1/organization/usage/embeddings \
   -H "model-override: claude-3"
 ```
 
@@ -97,14 +107,6 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "model": "gpt-4",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
-```
-
-### List Available Models
-
-Get a list of all configured models:
-
-```bash
-curl http://localhost:3000/v1/models
 ```
 
 ## Testing
