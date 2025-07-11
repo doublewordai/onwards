@@ -3,7 +3,7 @@
 A Rust-based AI Gateway that provides a unified interface for routing requests
 to openAI compatible targets. The goal is to be as 'transparent' as possible.
 
-## Configuration
+## Quickstart
 
 Create a `config.json` file with your target configurations:
 
@@ -26,6 +26,15 @@ Create a `config.json` file with your target configurations:
 }
 ```
 
+Start the gateway:
+
+```bash
+cargo run -- -f config.json
+```
+
+Modifying the file will automatically reload the configuration (to disable, set
+the `--watch` flag to false).
+
 ### Configuration Options
 
 - `url`: The base URL of the AI provider
@@ -33,14 +42,6 @@ Create a `config.json` file with your target configurations:
 - `onwards_model`: Model name to use when forwarding requests (optional)
 
 ## Usage
-
-### Basic Usage
-
-Start the gateway:
-
-```bash
-cargo run -- --targets config.json --port 3000
-```
 
 ### Command Line Options
 
@@ -113,4 +114,3 @@ Run the test suite:
 ```bash
 cargo test
 ```
-
