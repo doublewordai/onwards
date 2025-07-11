@@ -16,6 +16,7 @@ const ONWARD_MODEL_HEADER: &str = "onwards-model";
 const MODEL_OVERRIDE_HEADER: &str = "model-override";
 
 /// The main handler responsible for forwarding requests to targets
+/// TODO(fergus): Better error messages beyond raw status codes.
 #[instrument(skip(state, req))]
 pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
