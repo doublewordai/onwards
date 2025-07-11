@@ -9,7 +9,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
-use serde_json::Value;
 use tracing::{debug, error, info, instrument};
 
 const ONWARD_MODEL_HEADER: &str = "onwards-model";
