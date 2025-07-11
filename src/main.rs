@@ -532,7 +532,7 @@ mod tests {
 
         assert_eq!(response.status_code(), 404);
         let response_body: serde_json::Value = response.json();
-        assert_eq!(response_body["code"], "model not found");
+        assert_eq!(response_body["code"], "model_not_found");
     }
 
     #[tokio::test]
