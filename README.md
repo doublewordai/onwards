@@ -32,8 +32,8 @@ Start the gateway:
 cargo run -- -f config.json
 ```
 
-Modifying the file will automatically reload the configuration (to disable, set
-the `--watch` flag to false).
+Modifying the file will automatically & atomically reload the configuration (to
+disable, set the `--watch` flag to false).
 
 ### Configuration Options
 
