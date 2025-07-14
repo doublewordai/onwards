@@ -11,8 +11,7 @@ use crate::target::{Target, Targets};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ErrorResponseBody {   
     pub(crate) message: String,
-    #[serde(rename = "type")]
-    pub(crate) type_: String,
+    pub(crate) r#type: String,
     pub(crate) param: Option<String>,
     pub(crate) code: String,
 }

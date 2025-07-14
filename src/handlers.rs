@@ -69,7 +69,7 @@ pub async fn target_message_handler<T: HttpClient>(
             // Body is as per OpenAI's response
             body: Some(ErrorResponseBody {
                 message: format!("The model `{}` does not exist or you do not have access to it.", model.model),
-                type_: "invalid_request_error".to_string(),
+                r#type: "invalid_request_error".to_string(),
                 param: None,
                 code: "model_not_found".to_string(),
             }),
