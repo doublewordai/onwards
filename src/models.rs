@@ -1,12 +1,7 @@
-use axum::Json;
-use axum::response::Response;
-use axum::response::IntoResponse;
-use hyper::StatusCode;
 /// Data for the /v1/models endpoint.
 /// This endpoint mimics the openai API's models endpoint. Each 'model' is actually a target to
 /// forward requests onto.
 use serde::{Deserialize, Serialize};
-use crate::target::{Target, Targets};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ErrorResponseBody {   
@@ -16,19 +11,6 @@ pub(crate) struct ErrorResponseBody {
     pub(crate) code: String,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct OnwardsErrorResponse {
-    pub(crate) body: Option<ErrorResponseBody>,
-    pub(crate) status: StatusCode,
-}
-impl IntoResponse for OnwardsErrorResponse {
-    fn into_response(self) -> Response {
-        match self.body {
-            Some(body) => (self.status, Json(body)).into_response(),
-            None => self.status.into_response(), // No body, just status
-        }
-    }
-}
 /// Requests to the /v1/{*} endpoints get forwarded onto OpenAI compatible targets.
 /// The target is chosen based on the model specified in the request body.
 #[derive(Debug, Clone, Deserialize)]
