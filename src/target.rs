@@ -11,13 +11,9 @@ use bon::Builder;
 use dashmap::DashMap;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use url::Url;
 
 /// A target represents a destination for requests, specified by its URL.
@@ -164,10 +160,17 @@ impl Targets {
             .take()
             .map(|x| x.global_keys)
             .unwrap_or_default();
+        debug!("{} global keys configured", global_keys.len());
 
         let targets = Arc::new(DashMap::new());
         for (name, mut target) in config_file.targets {
             if let Some(ref mut keys) = target.keys {
+                debug!(
+                    "Target {}:{:?} has {} keys configured",
+                    target.url,
+                    target.onwards_model,
+                    keys.len()
+                );
                 keys.extend(global_keys.clone());
             } else if !global_keys.is_empty() {
                 target.keys = Some(global_keys.clone());
@@ -442,21 +445,49 @@ mod tests {
 
         let config_file = ConfigFile {
             targets,
-            auth: Some(Auth {
-                global_keys,
-            }),
+            auth: Some(Auth { global_keys }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
         let target = targets.targets.get("test-model").unwrap();
-        
+
         // Target should have both its own keys and global keys (5 unique keys)
         assert_eq!(target.keys.as_ref().unwrap().len(), 5);
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-1".to_string())));
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-2".to_string())));
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-1".to_string())));
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-2".to_string())));
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("shared-key".to_string())));
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("target-key-1".to_string()))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("target-key-2".to_string()))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("global-key-1".to_string()))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("global-key-2".to_string()))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("shared-key".to_string()))
+        );
     }
 
     #[test]
@@ -476,18 +507,28 @@ mod tests {
 
         let config_file = ConfigFile {
             targets,
-            auth: Some(Auth {
-                global_keys,
-            }),
+            auth: Some(Auth { global_keys }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
         let target = targets.targets.get("test-model").unwrap();
-        
+
         // Target without keys should get global keys
         assert_eq!(target.keys.as_ref().unwrap().len(), 2);
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-1".to_string())));
-        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-2".to_string())));
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("global-key-1".to_string()))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("global-key-2".to_string()))
+        );
     }
 
     #[test]
@@ -519,13 +560,25 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        
+
         // Target with keys should keep them unchanged
         let target_with_keys = targets.targets.get("model-with-keys").unwrap();
         assert_eq!(target_with_keys.keys.as_ref().unwrap().len(), 2);
-        assert!(target_with_keys.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-1".to_string())));
-        assert!(target_with_keys.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-2".to_string())));
-        
+        assert!(
+            target_with_keys
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("target-key-1".to_string()))
+        );
+        assert!(
+            target_with_keys
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from("target-key-2".to_string()))
+        );
+
         // Target without keys should remain None
         let target_without_keys = targets.targets.get("model-without-keys").unwrap();
         assert_eq!(target_without_keys.keys, None);
