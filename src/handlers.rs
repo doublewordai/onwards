@@ -1,4 +1,5 @@
 /// Axum handlers for the proxy server
+use crate::auth;
 use crate::client::HttpClient;
 use crate::models::ListModelResponse;
 use crate::{AppState, models::ExtractedModel};
@@ -58,6 +59,20 @@ pub async fn target_message_handler<T: HttpClient>(
         Some(target) => target,
         None => return Err(StatusCode::NOT_FOUND),
     };
+
+    // Validate API key if target has keys configured
+    if let Some(ref keys) = target.keys {
+        let bearer_token = req
+            .headers()
+            .get("authorization")
+            .and_then(|auth_header| auth_header.to_str().ok())
+            .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
+
+        match bearer_token {
+            Some(token) if auth::validate_bearer_token(keys, token) => {} // Valid token, continue
+            _ => return Err(StatusCode::UNAUTHORIZED),
+        }
+    }
 
     // Users can specify the onwards value of the model field via a header, or it can be specified in the target
     // config. If neither is supplied, its left as is.
@@ -139,7 +154,7 @@ pub async fn target_message_handler<T: HttpClient>(
             .insert("host", host_value.parse().unwrap());
     }
 
-    if let Some(key) = &target.key {
+    if let Some(key) = &target.onwards_key {
         debug!("Adding authorization header for {}", target.url);
         req.headers_mut()
             .insert("Authorization", format!("Bearer {key}").parse().unwrap());
