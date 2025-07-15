@@ -18,10 +18,13 @@ const MODEL_OVERRIDE_HEADER: &str = "model-override";
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
 #[instrument(skip(state, req))]
-pub async fn target_message_handler<T: HttpClient>(
-    State(state): State<AppState<T>>,
+pub async fn target_message_handler<T: HttpClient, C>(
+    State(state): State<AppState<T, C>>,
     mut req: axum::extract::Request,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, StatusCode>
+where
+    C: governor::clock::Clock + Clone,
+{
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
@@ -58,6 +61,14 @@ pub async fn target_message_handler<T: HttpClient>(
         Some(target) => target,
         None => return Err(StatusCode::NOT_FOUND),
     };
+
+    // Check rate limit if configured for this target
+    if let Some(rate_limiter) = state.targets.rate_limiters.get(model.model) {
+        if rate_limiter.check().is_err() {
+            debug!("Rate limit exceeded for model: {}", model.model);
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+    }
 
     // Users can specify the onwards value of the model field via a header, or it can be specified in the target
     // config. If neither is supplied, its left as is.
@@ -161,6 +172,9 @@ pub async fn target_message_handler<T: HttpClient>(
 }
 
 #[instrument(skip(state))]
-pub async fn models<T: HttpClient>(State(state): State<AppState<T>>) -> impl IntoResponse {
+pub async fn models<T: HttpClient, C>(State(state): State<AppState<T, C>>) -> impl IntoResponse
+where
+    C: governor::clock::Clock + Clone,
+{
     Json(ListModelResponse::from_targets(&state.targets))
 }
