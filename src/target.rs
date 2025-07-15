@@ -4,32 +4,50 @@
 ///
 /// Incoming requests are forwarded to one of the targets, based on the 'model' field in the
 /// incoming request.
+use crate::auth::KeySet;
 use anyhow::anyhow;
 use async_trait::async_trait;
+use bon::Builder;
 use dashmap::DashMap;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use url::Url;
 
 /// A target represents a destination for requests, specified by its URL.
 ///
-/// Optionally, a target can have a key and a onwards_model. The key is put into the Authorization:
+/// ## Validating incoming requests
+/// A target can have a set of keys associated with it, one of which will be required in the Authorization: Bearer header.
+///
+/// ## Forwarding requests
+/// A target can have a onwards_key and a onwards_model. The key is put into the Authorization:
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub(crate) struct Target {
     pub(crate) url: Url,
-    pub(crate) key: Option<String>,
+    pub(crate) keys: Option<KeySet>,
+    pub(crate) onwards_key: Option<String>,
     pub(crate) onwards_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Auth {
+    /// global keys are merged with the per-target keys.
+    global_keys: KeySet,
 }
 
 /// The config file contains a map of target names to targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ConfigFile {
     pub(crate) targets: HashMap<String, Target>,
+    pub(crate) auth: Option<Auth>,
 }
 
 /// The live-updating collection of targets.
@@ -130,16 +148,33 @@ impl Targets {
             )
         })?;
 
-        let targets = Arc::new(DashMap::new());
-        for (name, target) in config_file.targets {
-            targets.insert(name, target);
-        }
+        let targets = Self::from_config(config_file)?;
 
         info!(
             "Loaded {} targets from {}",
-            targets.len(),
+            targets.targets.len(),
             config_path.display()
         );
+        Ok(targets)
+    }
+
+    pub(crate) fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
+        let global_keys = config_file
+            .auth
+            .take()
+            .map(|x| x.global_keys)
+            .unwrap_or_default();
+
+        let targets = Arc::new(DashMap::new());
+        for (name, mut target) in config_file.targets {
+            if let Some(ref mut keys) = target.keys {
+                keys.extend(global_keys.clone());
+            } else if !global_keys.is_empty() {
+                target.keys = Some(global_keys.clone());
+            }
+            targets.insert(name, target);
+        }
+
         Ok(Targets { targets })
     }
 
@@ -191,7 +226,9 @@ impl Targets {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::ConstantTimeString;
     use dashmap::DashMap;
+    use std::collections::HashSet;
     use std::sync::Arc;
     pub struct MockConfigWatcher {
         configs: Vec<Result<Targets, String>>,
@@ -239,11 +276,10 @@ mod tests {
         for (model, url) in models {
             targets_map.insert(
                 model.to_string(),
-                Target {
-                    url: url.parse().unwrap(),
-                    key: Some(format!("key-{model}")),
-                    onwards_model: None,
-                },
+                Target::builder()
+                    .url(url.parse().unwrap())
+                    .onwards_key(format!("key-{model}"))
+                    .build(),
             );
         }
         Targets {
@@ -357,11 +393,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            Target {
-                url: "https://api.openai.com/v2".parse().unwrap(), // Different URL
-                key: Some("new-key".to_string()),                  // Different key
-                onwards_model: Some("gpt-4-turbo".to_string()),    // Added model_key
-            },
+            Target::builder()
+                .url("https://api.openai.com/v2".parse().unwrap()) // Different URL
+                .onwards_key("new-key".to_string()) // Different key
+                .onwards_model("gpt-4-turbo".to_string()) // Added model_key
+                .build(),
         );
         let updated_targets = Targets {
             targets: targets_map,
@@ -378,7 +414,120 @@ mod tests {
         // Verify target properties were updated
         let target = initial_targets.targets.get("gpt-4").unwrap();
         assert_eq!(target.url.as_str(), "https://api.openai.com/v2");
-        assert_eq!(target.key, Some("new-key".to_string()));
+        assert_eq!(target.onwards_key, Some("new-key".to_string()));
         assert_eq!(target.onwards_model, Some("gpt-4-turbo".to_string()));
+    }
+
+    #[test]
+    fn test_from_config_merges_global_keys_with_target_keys() {
+        let mut target_keys = HashSet::new();
+        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
+        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
+        target_keys.insert(ConstantTimeString::from("shared-key".to_string()));
+
+        let mut global_keys = HashSet::new();
+        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
+        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
+        global_keys.insert(ConstantTimeString::from("shared-key".to_string())); // Duplicate with target
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .keys(target_keys)
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: Some(Auth {
+                global_keys,
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+        
+        // Target should have both its own keys and global keys (5 unique keys)
+        assert_eq!(target.keys.as_ref().unwrap().len(), 5);
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-1".to_string())));
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-2".to_string())));
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-1".to_string())));
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-2".to_string())));
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("shared-key".to_string())));
+    }
+
+    #[test]
+    fn test_from_config_target_without_keys_gets_global_keys() {
+        let mut global_keys = HashSet::new();
+        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
+        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: Some(Auth {
+                global_keys,
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+        
+        // Target without keys should get global keys
+        assert_eq!(target.keys.as_ref().unwrap().len(), 2);
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-1".to_string())));
+        assert!(target.keys.as_ref().unwrap().contains(&ConstantTimeString::from("global-key-2".to_string())));
+    }
+
+    #[test]
+    fn test_from_config_no_global_keys() {
+        let mut target_keys = HashSet::new();
+        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
+        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "model-with-keys".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .keys(target_keys)
+                .build(),
+        );
+        targets.insert(
+            "model-without-keys".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        
+        // Target with keys should keep them unchanged
+        let target_with_keys = targets.targets.get("model-with-keys").unwrap();
+        assert_eq!(target_with_keys.keys.as_ref().unwrap().len(), 2);
+        assert!(target_with_keys.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-1".to_string())));
+        assert!(target_with_keys.keys.as_ref().unwrap().contains(&ConstantTimeString::from("target-key-2".to_string())));
+        
+        // Target without keys should remain None
+        let target_without_keys = targets.targets.get("model-without-keys").unwrap();
+        assert_eq!(target_without_keys.keys, None);
     }
 }

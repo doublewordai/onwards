@@ -1,3 +1,4 @@
+mod auth;
 mod client;
 mod config;
 mod handlers;
@@ -239,19 +240,17 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            Target {
-                url: "https://api.openai.com".parse().unwrap(),
-                key: Some("sk-test-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-test-key".to_string())
+                .build(),
         );
         targets_map.insert(
             "claude-3".to_string(),
-            Target {
-                url: "https://api.anthropic.com".parse().unwrap(),
-                key: Some("sk-ant-test-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.anthropic.com".parse().unwrap())
+                .onwards_key("sk-ant-test-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -314,11 +313,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            Target {
-                url: "https://api.example.com".parse().unwrap(),
-                key: Some("test-api-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-api-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -399,19 +397,17 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "header-model".to_string(),
-            Target {
-                url: "https://api.header.com".parse().unwrap(),
-                key: Some("header-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.header.com".parse().unwrap())
+                .onwards_key("header-key".to_string())
+                .build(),
         );
         targets_map.insert(
             "body-model".to_string(),
-            Target {
-                url: "https://api.body.com".parse().unwrap(),
-                key: Some("body-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.body.com".parse().unwrap())
+                .onwards_key("body-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -458,11 +454,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "header-only-model".to_string(),
-            Target {
-                url: "https://api.headeronly.com".parse().unwrap(),
-                key: Some("header-only-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.headeronly.com".parse().unwrap())
+                .onwards_key("header-only-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -508,11 +503,9 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "valid-model".to_string(),
-            Target {
-                url: "https://api.valid.com".parse().unwrap(),
-                key: None,
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.valid.com".parse().unwrap())
+                .build(),
         );
 
         let targets = Targets {
@@ -539,11 +532,9 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "some-model".to_string(),
-            Target {
-                url: "https://api.some.com".parse().unwrap(),
-                key: None,
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.some.com".parse().unwrap())
+                .build(),
         );
 
         let targets = Targets {
@@ -591,11 +582,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "input-model".to_string(),
-            Target {
-                url: "https://api.example.com".parse().unwrap(),
-                key: Some("test-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -651,11 +641,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "input-model".to_string(),
-            Target {
-                url: "https://api.example.com".parse().unwrap(),
-                key: Some("test-key".to_string()),
-                onwards_model: Some("config-model".to_string()), // This should be overridden by header
-            },
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .onwards_model("config-model".to_string()) // This should be overridden by header
+                .build(),
         );
 
         let targets = Targets {
@@ -697,11 +687,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            Target {
-                url: "https://api.example.com".parse().unwrap(),
-                key: Some("test-key".to_string()),
-                onwards_model: Some("should-not-be-used".to_string()), // This should be ignored due to empty body
-            },
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .onwards_model("should-not-be-used".to_string()) // This should be ignored due to empty body
+                .build(),
         );
 
         let targets = Targets {
@@ -742,11 +732,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            Target {
-                url: "https://api.methods.com".parse().unwrap(),
-                key: Some("method-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.methods.com".parse().unwrap())
+                .onwards_key("method-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -821,11 +810,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "query-model".to_string(),
-            Target {
-                url: "https://api.query.com".parse().unwrap(),
-                key: Some("query-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.query.com".parse().unwrap())
+                .onwards_key("query-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -869,11 +857,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "endpoint-model".to_string(),
-            Target {
-                url: "https://api.endpoints.com".parse().unwrap(),
-                key: Some("endpoint-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.endpoints.com".parse().unwrap())
+                .onwards_key("endpoint-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -931,11 +918,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "header-test-model".to_string(),
-            Target {
-                url: "https://api.headers.com".parse().unwrap(),
-                key: Some("header-test-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.headers.com".parse().unwrap())
+                .onwards_key("header-test-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -1026,11 +1012,9 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "no-auth-model".to_string(),
-            Target {
-                url: "https://api.noauth.com".parse().unwrap(),
-                key: None, // No API key
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.noauth.com".parse().unwrap())
+                .build(), // No API key
         );
 
         let targets = Targets {
@@ -1083,27 +1067,24 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            Target {
-                url: "https://api.openai.com".parse().unwrap(),
-                key: Some("sk-openai-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-openai-key".to_string())
+                .build(),
         );
         targets_map.insert(
             "claude-3".to_string(),
-            Target {
-                url: "https://api.anthropic.com".parse().unwrap(),
-                key: Some("sk-ant-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.anthropic.com".parse().unwrap())
+                .onwards_key("sk-ant-key".to_string())
+                .build(),
         );
         targets_map.insert(
             "gemini-pro".to_string(),
-            Target {
-                url: "https://api.google.com".parse().unwrap(),
-                key: None,
-                onwards_model: Some("gemini-1.5-pro".to_string()),
-            },
+            Target::builder()
+                .url("https://api.google.com".parse().unwrap())
+                .onwards_model("gemini-1.5-pro".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -1158,11 +1139,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            Target {
-                url: "https://api.shouldnotreceive.com".parse().unwrap(),
-                key: Some("should-not-be-used".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.shouldnotreceive.com".parse().unwrap())
+                .onwards_key("should-not-be-used".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -1211,11 +1191,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "error-model".to_string(),
-            Target {
-                url: "https://api.errors.com".parse().unwrap(),
-                key: Some("error-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.errors.com".parse().unwrap())
+                .onwards_key("error-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -1308,11 +1287,10 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "streaming-model".to_string(),
-            Target {
-                url: "https://api.streaming.com".parse().unwrap(),
-                key: Some("streaming-key".to_string()),
-                onwards_model: None,
-            },
+            Target::builder()
+                .url("https://api.streaming.com".parse().unwrap())
+                .onwards_key("streaming-key".to_string())
+                .build(),
         );
 
         let targets = Targets {
@@ -1376,5 +1354,190 @@ mod tests {
             .find(|(key, _)| key == "authorization")
             .map(|(_, value)| value);
         assert_eq!(auth_header, Some(&"Bearer streaming-key".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_validation_with_valid_token() {
+        let targets_map = Arc::new(DashMap::new());
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
+        
+        targets_map.insert(
+            "secure-model".to_string(),
+            Target::builder()
+                .url("https://api.secure.com".parse().unwrap())
+                .onwards_key("secure-key".to_string())
+                .keys(keys)
+                .build(),
+        );
+        
+        let targets = Targets { targets: targets_map };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with valid Bearer token
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", "Bearer valid-token")
+            .json(&json!({
+                "model": "secure-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        
+        // Verify request was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_validation_with_invalid_token() {
+        let targets_map = Arc::new(DashMap::new());
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
+        
+        targets_map.insert(
+            "secure-model".to_string(),
+            Target::builder()
+                .url("https://api.secure.com".parse().unwrap())
+                .onwards_key("secure-key".to_string())
+                .keys(keys)
+                .build(),
+        );
+        
+        let targets = Targets { targets: targets_map };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with invalid Bearer token
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", "Bearer invalid-token")
+            .json(&json!({
+                "model": "secure-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 401);
+        
+        // Verify no request was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_validation_missing_token() {
+        let targets_map = Arc::new(DashMap::new());
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
+        
+        targets_map.insert(
+            "secure-model".to_string(),
+            Target::builder()
+                .url("https://api.secure.com".parse().unwrap())
+                .onwards_key("secure-key".to_string())
+                .keys(keys)
+                .build(),
+        );
+        
+        let targets = Targets { targets: targets_map };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request without Bearer token
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "secure-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 401);
+        
+        // Verify no request was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_validation_malformed_header() {
+        let targets_map = Arc::new(DashMap::new());
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
+        
+        targets_map.insert(
+            "secure-model".to_string(),
+            Target::builder()
+                .url("https://api.secure.com".parse().unwrap())
+                .onwards_key("secure-key".to_string())
+                .keys(keys)
+                .build(),
+        );
+        
+        let targets = Targets { targets: targets_map };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with malformed authorization header
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", "Basic valid-token")
+            .json(&json!({
+                "model": "secure-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 401);
+        
+        // Verify no request was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_validation_skipped_for_targets_without_keys() {
+        let targets_map = Arc::new(DashMap::new());
+        
+        targets_map.insert(
+            "open-model".to_string(),
+            Target::builder()
+                .url("https://api.open.com".parse().unwrap())
+                .onwards_key("open-key".to_string())
+                .build(),
+        );
+        
+        let targets = Targets { targets: targets_map };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request without Bearer token to target without keys
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "open-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        
+        // Verify request was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
     }
 }
