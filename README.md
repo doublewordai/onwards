@@ -20,7 +20,11 @@ Create a `config.json` file with your target configurations:
       "key": "sk-ant-your-anthropic-key"
     },
     "local-model": {
-      "url": "http://localhost:8080"
+      "url": "http://localhost:8080",
+      "rate_limit": {
+        "requests_per_second": 5.0,
+        "burst_size": 10
+      }
     }
   }
 }
@@ -40,6 +44,9 @@ disable, set the `--watch` flag to false).
 - `url`: The base URL of the AI provider
 - `key`: API key for authentication (optional)
 - `onwards_model`: Model name to use when forwarding requests (optional)
+- `rate_limit`: Rate limiting configuration (optional)
+  - `requests_per_second`: Maximum requests per second (e.g., 5.0)
+  - `burst_size`: Maximum burst capacity (e.g., 10)
 
 ## Usage
 
@@ -108,6 +115,54 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
+
+## Rate Limiting
+
+Onwards supports per-target rate limiting using a token bucket algorithm. This allows you to control the request rate to each AI provider independently.
+
+### Configuration
+
+Add rate limiting to any target in your `config.json`:
+
+```json
+{
+  "targets": {
+    "rate-limited-model": {
+      "url": "https://api.provider.com",
+      "key": "your-api-key",
+      "rate_limit": {
+        "requests_per_second": 5.0,
+        "burst_size": 10
+      }
+    }
+  }
+}
+```
+
+### How It Works
+
+- **Token Bucket Algorithm**: Each target gets its own token bucket
+- **Requests Per Second**: Tokens are refilled at this rate 
+- **Burst Size**: Maximum number of tokens (allows bursts up to this limit)
+- **Rate Limit Response**: Returns `429 Too Many Requests` when limit exceeded
+
+### Examples
+
+```json
+// Allow 1 request per second with burst of 5
+"rate_limit": {
+  "requests_per_second": 1.0,
+  "burst_size": 5
+}
+
+// Allow 100 requests per second with burst of 200  
+"rate_limit": {
+  "requests_per_second": 100.0,
+  "burst_size": 200
+}
+```
+
+Rate limiting is optional - targets without `rate_limit` configuration have no rate limiting applied.
 
 ## Testing
 

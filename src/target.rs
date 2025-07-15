@@ -9,10 +9,25 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct RateLimit {
+    pub(crate) requests_per_second: u64,
+}
+
+use governor::{
+    Quota, RateLimiter as GovernorRateLimiter,
+    clock::{Clock, DefaultClock},
+    middleware::NoOpMiddleware,
+    state::{InMemoryState, NotKeyed},
+};
+
+pub(crate) type RateLimiter<C = DefaultClock> =
+    GovernorRateLimiter<NotKeyed, InMemoryState, C, NoOpMiddleware<<C as Clock>::Instant>>;
 
 /// A target represents a destination for requests, specified by its URL.
 ///
@@ -24,6 +39,7 @@ pub(crate) struct Target {
     pub(crate) url: Url,
     pub(crate) key: Option<String>,
     pub(crate) onwards_model: Option<String>,
+    pub(crate) rate_limit: Option<RateLimit>,
 }
 
 /// The config file contains a map of target names to targets.
@@ -33,18 +49,25 @@ pub(crate) struct ConfigFile {
 }
 
 /// The live-updating collection of targets.
-#[derive(Debug, Clone)]
-pub(crate) struct Targets {
+#[derive(Clone)]
+pub(crate) struct Targets<C = DefaultClock>
+where
+    C: Clock + Clone,
+{
     pub(crate) targets: Arc<DashMap<String, Target>>,
+    pub(crate) rate_limiters: Arc<DashMap<String, RateLimiter<C>>>,
 }
 
 #[async_trait]
-pub trait TargetsStream {
+pub trait TargetsStream<C = DefaultClock>
+where
+    C: Clock + Clone,
+{
     /// TODO(fergus): This would probably be nicer if the error were associated types and it
-    /// returned a Result<Box<dyn Stream<Item = Result<Targets, E>>, U> + Send>
+    /// returned a Result<Box<dyn Stream<Item = Result<Targets<C>, E>>, U> + Send>
     async fn receive(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error>;
+    ) -> Result<mpsc::Receiver<Result<Targets<C>, anyhow::Error>>, anyhow::Error>;
 }
 
 pub struct WatchedFile(pub PathBuf);
@@ -131,7 +154,17 @@ impl Targets {
         })?;
 
         let targets = Arc::new(DashMap::new());
+        let rate_limiters = Arc::new(DashMap::new());
+
         for (name, target) in config_file.targets {
+            // Create rate limiter if configured
+            if let Some(rate_limit) = &target.rate_limit {
+                let quota = Quota::per_second(
+                    NonZeroU32::new(rate_limit.requests_per_second as u32).unwrap(),
+                );
+                let limiter = RateLimiter::direct(quota);
+                rate_limiters.insert(name.clone(), limiter);
+            }
             targets.insert(name, target);
         }
 
@@ -140,7 +173,10 @@ impl Targets {
             targets.len(),
             config_path.display()
         );
-        Ok(Targets { targets })
+        Ok(Targets {
+            targets,
+            rate_limiters,
+        })
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
@@ -149,6 +185,7 @@ impl Targets {
         targets_stream: W,
     ) -> Result<(), anyhow::Error> {
         let targets = Arc::clone(&self.targets);
+        let rate_limiters = Arc::clone(&self.rate_limiters);
 
         let mut rx = targets_stream.receive().await?;
 
@@ -165,16 +202,29 @@ impl Targets {
                         // Do it like this for atomicity (if you delete and recreate, there's a
                         // moment with no targets during which requests can fail)
 
-                        // Remove deleted targets
+                        // Remove deleted targets and their rate limiters
                         for key in current_keys {
                             if !new_targets.targets.contains_key(&key) {
                                 targets.remove(&key);
+                                rate_limiters.remove(&key);
                             }
                         }
 
                         // Insert/update targets
                         for entry in new_targets.targets.iter() {
-                            targets.insert(entry.key().clone(), entry.value().clone());
+                            let target = entry.value();
+                            let target_name = entry.key().clone();
+
+                            // Create new rate limiter if needed
+                            if let Some(rate_limit) = &target.rate_limit {
+                                let quota = Quota::per_second(
+                                    NonZeroU32::new(rate_limit.requests_per_second as u32).unwrap(),
+                                );
+                                let limiter = RateLimiter::direct(quota);
+                                rate_limiters.insert(target_name.clone(), limiter);
+                            }
+
+                            targets.insert(target_name, target.clone());
                         }
                     }
                     Err(e) => {
@@ -236,6 +286,7 @@ mod tests {
 
     fn create_test_targets(models: Vec<(&str, &str)>) -> Targets {
         let targets_map = Arc::new(DashMap::new());
+        let rate_limiters = Arc::new(DashMap::new());
         for (model, url) in models {
             targets_map.insert(
                 model.to_string(),
@@ -243,11 +294,13 @@ mod tests {
                     url: url.parse().unwrap(),
                     key: Some(format!("key-{model}")),
                     onwards_model: None,
+                    rate_limit: None,
                 },
             );
         }
         Targets {
             targets: targets_map,
+            rate_limiters,
         }
     }
 
@@ -306,6 +359,7 @@ mod tests {
         // Create initial empty targets
         let targets = Targets {
             targets: Arc::new(DashMap::new()),
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create sequence of target updates
@@ -361,10 +415,12 @@ mod tests {
                 url: "https://api.openai.com/v2".parse().unwrap(), // Different URL
                 key: Some("new-key".to_string()),                  // Different key
                 onwards_model: Some("gpt-4-turbo".to_string()),    // Added model_key
+                rate_limit: None,
             },
         );
         let updated_targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);

@@ -49,7 +49,10 @@ pub(crate) struct ListModelResponse {
 
 impl ListModelResponse {
     /// Creates a new ListModelResponse from the given Targets.
-    pub(crate) fn from_targets(targets: &Targets) -> Self {
+    pub(crate) fn from_targets<C>(targets: &Targets<C>) -> Self
+    where
+        C: governor::clock::Clock + Clone,
+    {
         let data = targets
             .targets
             .iter()

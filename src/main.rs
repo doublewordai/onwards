@@ -16,10 +16,13 @@ use target::{Targets, WatchedFile};
 use tokio::net::TcpListener;
 use tracing::{Level, info, instrument};
 
-#[derive(Clone, Debug)]
-pub(crate) struct AppState<T: HttpClient> {
+#[derive(Clone)]
+pub(crate) struct AppState<T: HttpClient, C = governor::clock::DefaultClock>
+where
+    C: governor::clock::Clock + Clone,
+{
     pub(crate) http_client: T,
-    pub(crate) targets: Targets,
+    pub(crate) targets: Targets<C>,
 }
 
 impl AppState<HyperClient> {
@@ -33,9 +36,12 @@ impl AppState<HyperClient> {
     }
 }
 
-impl<T: HttpClient> AppState<T> {
+impl<T: HttpClient, C> AppState<T, C>
+where
+    C: governor::clock::Clock + Clone,
+{
     #[cfg(test)]
-    pub(crate) fn with_client(targets: Targets, http_client: T) -> Self {
+    pub(crate) fn with_client(targets: Targets<C>, http_client: T) -> Self {
         Self {
             http_client,
             targets,
@@ -44,9 +50,12 @@ impl<T: HttpClient> AppState<T> {
 }
 
 #[instrument(skip(state))]
-pub(crate) async fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
-    state: AppState<T>,
-) -> Router {
+pub(crate) async fn build_router<T: HttpClient + Clone + Send + Sync + 'static, C>(
+    state: AppState<T, C>,
+) -> Router
+where
+    C: governor::clock::Clock + Clone + Send + Sync + 'static,
+{
     info!("Building router");
     Router::new()
         .route("/v1/models", get(models)) // Intercept the /v1/models call at the gateway level.
@@ -213,8 +222,9 @@ mod tests {
     #[tokio::test]
     async fn test_empty_targets_returns_404() {
         // Create empty targets
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: Arc::new(DashMap::new()),
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -243,6 +253,7 @@ mod tests {
                 url: "https://api.openai.com".parse().unwrap(),
                 key: Some("sk-test-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
         targets_map.insert(
@@ -251,11 +262,13 @@ mod tests {
                 url: "https://api.anthropic.com".parse().unwrap(),
                 key: Some("sk-ant-test-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(
@@ -318,11 +331,13 @@ mod tests {
                 url: "https://api.example.com".parse().unwrap(),
                 key: Some("test-api-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -403,6 +418,7 @@ mod tests {
                 url: "https://api.header.com".parse().unwrap(),
                 key: Some("header-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
         targets_map.insert(
@@ -411,11 +427,13 @@ mod tests {
                 url: "https://api.body.com".parse().unwrap(),
                 key: Some("body-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -462,11 +480,13 @@ mod tests {
                 url: "https://api.headeronly.com".parse().unwrap(),
                 key: Some("header-only-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
@@ -512,11 +532,13 @@ mod tests {
                 url: "https://api.valid.com".parse().unwrap(),
                 key: None,
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
@@ -543,11 +565,13 @@ mod tests {
                 url: "https://api.some.com".parse().unwrap(),
                 key: None,
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
@@ -595,11 +619,13 @@ mod tests {
                 url: "https://api.example.com".parse().unwrap(),
                 key: Some("test-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
@@ -655,11 +681,13 @@ mod tests {
                 url: "https://api.example.com".parse().unwrap(),
                 key: Some("test-key".to_string()),
                 onwards_model: Some("config-model".to_string()), // This should be overridden by header
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
@@ -701,11 +729,13 @@ mod tests {
                 url: "https://api.example.com".parse().unwrap(),
                 key: Some("test-key".to_string()),
                 onwards_model: Some("should-not-be-used".to_string()), // This should be ignored due to empty body
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
@@ -746,11 +776,13 @@ mod tests {
                 url: "https://api.methods.com".parse().unwrap(),
                 key: Some("method-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"method": "success"}"#);
@@ -825,11 +857,13 @@ mod tests {
                 url: "https://api.query.com".parse().unwrap(),
                 key: Some("query-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"query": "preserved"}"#);
@@ -873,11 +907,13 @@ mod tests {
                 url: "https://api.endpoints.com".parse().unwrap(),
                 key: Some("endpoint-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"endpoint": "success"}"#);
@@ -935,11 +971,13 @@ mod tests {
                 url: "https://api.headers.com".parse().unwrap(),
                 key: Some("header-test-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"headers": "forwarded"}"#);
@@ -1030,11 +1068,13 @@ mod tests {
                 url: "https://api.noauth.com".parse().unwrap(),
                 key: None, // No API key
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"no_auth": "success"}"#);
@@ -1087,6 +1127,7 @@ mod tests {
                 url: "https://api.openai.com".parse().unwrap(),
                 key: Some("sk-openai-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
         targets_map.insert(
@@ -1095,6 +1136,7 @@ mod tests {
                 url: "https://api.anthropic.com".parse().unwrap(),
                 key: Some("sk-ant-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
         targets_map.insert(
@@ -1103,11 +1145,13 @@ mod tests {
                 url: "https://api.google.com".parse().unwrap(),
                 key: None,
                 onwards_model: Some("gemini-1.5-pro".to_string()),
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1162,11 +1206,13 @@ mod tests {
                 url: "https://api.shouldnotreceive.com".parse().unwrap(),
                 key: Some("should-not-be-used".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"should": "not_be_called"}"#);
@@ -1215,11 +1261,13 @@ mod tests {
                 url: "https://api.errors.com".parse().unwrap(),
                 key: Some("error-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Test different error status codes
@@ -1303,6 +1351,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rate_limiting_with_mocked_time() {
+        use dashmap::DashMap;
+        use governor::clock::FakeRelativeClock;
+        use std::{sync::Arc, time::Duration};
+
+        // Create a fake clock for testing
+        let clock = FakeRelativeClock::default();
+
+        // Create targets with rate limiting
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "rate-limited-model".to_string(),
+            Target {
+                url: "https://api.ratelimited.com".parse().unwrap(),
+                key: Some("rate-key".to_string()),
+                onwards_model: None,
+                rate_limit: Some(crate::target::RateLimit {
+                    requests_per_second: 1,
+                }),
+            },
+        );
+
+        // Create targets with the fake clock - inline the logic
+        let targets: Targets<FakeRelativeClock> = Targets {
+            targets: Arc::new(DashMap::new()),
+            rate_limiters: Arc::new(DashMap::new()),
+        };
+
+        // Insert the target
+        targets.targets.insert(
+            "rate-limited-model".to_string(),
+            targets_map.get("rate-limited-model").unwrap().clone(),
+        );
+
+        // Create rate limiter with the fake clock - inline the logic
+        let quota = governor::Quota::per_second(std::num::NonZeroU32::new(1).unwrap());
+        let limiter = crate::target::RateLimiter::direct_with_clock(quota, clock.clone());
+        targets
+            .rate_limiters
+            .insert("rate-limited-model".to_string(), limiter);
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // First request should succeed
+        let response1 = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "First request"}]
+            }))
+            .await;
+        assert_eq!(response1.status_code(), 200);
+
+        // Second immediate request should be rate limited (no time has passed)
+        let response2 = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "Second request"}]
+            }))
+            .await;
+        assert_eq!(response2.status_code(), 429); // Too Many Requests
+
+        // Advance the fake clock by 1 second
+        clock.advance(Duration::from_secs(1));
+
+        // Now the third request should succeed because time has advanced
+        let response3 = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "Third request after time advance"}]
+            }))
+            .await;
+        assert_eq!(response3.status_code(), 200);
+
+        // Fourth immediate request should be rate limited again
+        let response4 = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "Fourth request"}]
+            }))
+            .await;
+        assert_eq!(response4.status_code(), 429); // Too Many Requests
+
+        // Verify that only 2 requests made it through (first and third)
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+
+        // Verify the content of the successful requests
+        let first_request_body: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).unwrap();
+        let second_request_body: serde_json::Value =
+            serde_json::from_slice(&requests[1].body).unwrap();
+
+        assert_eq!(
+            first_request_body["messages"][0]["content"],
+            "First request"
+        );
+        assert_eq!(
+            second_request_body["messages"][0]["content"],
+            "Third request after time advance"
+        );
+    }
+
+    #[tokio::test]
     async fn test_streaming_responses_pass_through() {
         // Create a target
         let targets_map = Arc::new(DashMap::new());
@@ -1312,11 +1470,13 @@ mod tests {
                 url: "https://api.streaming.com".parse().unwrap(),
                 key: Some("streaming-key".to_string()),
                 onwards_model: None,
+                rate_limit: None,
             },
         );
 
-        let targets = Targets {
+        let targets: Targets = Targets {
             targets: targets_map,
+            rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create mock streaming response chunks (simulating OpenAI streaming format)
