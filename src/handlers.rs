@@ -23,24 +23,12 @@ pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
 ) -> Result<Response, StatusCode> {
-    info!("=== Incoming Request ===");
-    info!("Method: {}, Path: {}", req.method(), req.uri().path());
-    
-    // Log content-type header if present
-    if let Some(content_type) = req.headers().get("content-type") {
-        if let Ok(ct) = content_type.to_str() {
-            info!("Content-Type: {}", ct);
-        }
-    }
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
-            Err(e) => {
-                error!("Failed to extract request body: {}", e);
-                return Err(StatusCode::BAD_REQUEST);
-            }
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
 
     // Log full incoming request details for debugging
@@ -66,18 +54,10 @@ pub async fn target_message_handler<T: HttpClient>(
             ExtractedModel { model: model_str }
         }
         None => {
-            info!("Received request body of size: {} bytes", body_bytes.len());
-            debug!("Request body content: {}", String::from_utf8_lossy(&body_bytes));
-            match serde_json::from_slice::<ExtractedModel>(&body_bytes) {
-                Ok(model) => {
-                    debug!("Successfully extracted model from body: {}", model.model);
-                    model
-                }
-                Err(e) => {
-                    error!("Failed to parse model from request body: {}", e);
-                    error!("Body was: {}", String::from_utf8_lossy(&body_bytes));
-                    return Err(StatusCode::BAD_REQUEST);
-                }
+            debug!("Received request body of size: {}", body_bytes.len());
+            match serde_json::from_slice(&body_bytes) {
+                Ok(model) => model,
+                Err(_) => return Err(StatusCode::BAD_REQUEST),
             }
         }
     };
@@ -85,19 +65,8 @@ pub async fn target_message_handler<T: HttpClient>(
     info!("Received request for model: {}", model.model);
 
     let target = match state.targets.targets.get(model.model) {
-        Some(target) => {
-            debug!("Found target for model '{}': {:?}", model.model, target);
-            target
-        }
-        None => {
-            error!("No target found for model: '{}'", model.model);
-            error!("Available targets: {:?}", 
-                state.targets.targets.iter()
-                    .map(|entry| entry.key().clone())
-                    .collect::<Vec<_>>()
-            );
-            return Err(StatusCode::NOT_FOUND);
-        }
+        Some(target) => target,
+        None => return Err(StatusCode::NOT_FOUND),
     };
 
     // Validate API key if target has keys configured
@@ -124,13 +93,10 @@ pub async fn target_message_handler<T: HttpClient>(
         .or(target.onwards_model.clone())
     {
         if !body_bytes.is_empty() {
-        info!("Rewriting model in request body from '{}' to '{}'", model.model, rewrite);
+        debug!("Rewriting model key to: {}", rewrite);
         let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(value) => value,
-            Err(e) => {
-                error!("Failed to parse body for rewriting: {}", e);
-                return Err(StatusCode::BAD_REQUEST);
-            }
+            Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
         let entry = body_serialized
             .as_object_mut()
@@ -170,26 +136,20 @@ pub async fn target_message_handler<T: HttpClient>(
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or(req.uri().path());
-    info!("Building upstream URI - base: {}, path: {}", target.url, path_and_query);
     let upstream_uri = target
         .url
         .join(path_and_query.strip_prefix('/').unwrap_or(path_and_query))
-        .map_err(|e| {
-            error!("Failed to join URL: {} with path: {} - error: {}", target.url, path_and_query, e);
-            StatusCode::BAD_REQUEST
-        })?
+        .map_err(|_| StatusCode::BAD_REQUEST)?
         .to_string();
-    info!("Upstream URI: {}", upstream_uri);
     let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
         Ok(uri) => uri,
-        Err(e) => {
-            error!("Invalid URI: {} - error: {}", upstream_uri, e);
+        Err(_) => {
+            error!("Invalid URI: {}", upstream_uri);
             return Err(StatusCode::BAD_REQUEST);
         }
     };
 
     *req.uri_mut() = upstream_uri_parsed.clone();
-    info!("Set request URI to: {}", req.uri());
 
     // Update the host header to match the target server (otherwise cloudflare gets mad).
     if let Some(host) = upstream_uri_parsed.host() {
@@ -198,17 +158,16 @@ pub async fn target_message_handler<T: HttpClient>(
         } else {
             host.to_string()
         };
-        info!("Setting host header to: {}", host_value);
         req.headers_mut()
             .insert("host", host_value.parse().unwrap());
     }
 
     if let Some(key) = &target.onwards_key {
-        info!("Adding authorization header for target");
+        debug!("Adding authorization header for {}", target.url);
         req.headers_mut()
             .insert("Authorization", format!("Bearer {key}").parse().unwrap());
     } else {
-        info!("No authorization key configured for target {}", target.url);
+        debug!("No key configured for target {}", target.url);
     }
 
     // Log full outgoing request details for debugging
@@ -221,35 +180,15 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     *req.body_mut() = axum::body::Body::from(body_bytes);
-    
+
     // Fix conflicting headers: remove transfer-encoding if content-length is present
     if req.headers().contains_key("content-length") && req.headers().contains_key("transfer-encoding") {
-        info!("Removing transfer-encoding header due to presence of content-length header");
         req.headers_mut().remove("transfer-encoding");
-    }
-    
-    info!("Forwarding request to upstream URL: {}", upstream_uri);
-    info!("Request method: {}, Headers count: {}", req.method(), req.headers().len());
-    
-    // Log all headers for debugging
-    info!("Request headers:");
-    for (name, value) in req.headers() {
-        if let Ok(v) = value.to_str() {
-            // Mask authorization headers for security
-            if name == "authorization" {
-                info!("  {}: [MASKED]", name);
-            } else {
-                info!("  {}: {}", name, v);
-            }
-        }
     }
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
-        Ok(response) => {
-            info!("Successfully forwarded request to {}", upstream_uri);
-            Ok(response)
-        }
+        Ok(response) => Ok(response),
         Err(e) => {
             error!(
                 "Error forwarding request to target url {}: {}",
