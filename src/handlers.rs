@@ -25,6 +25,13 @@ pub async fn target_message_handler<T: HttpClient>(
 ) -> Result<Response, StatusCode> {
     info!("=== Incoming Request ===");
     info!("Method: {}, Path: {}", req.method(), req.uri().path());
+    
+    // Log content-type header if present
+    if let Some(content_type) = req.headers().get("content-type") {
+        if let Ok(ct) = content_type.to_str() {
+            info!("Content-Type: {}", ct);
+        }
+    }
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
@@ -59,7 +66,7 @@ pub async fn target_message_handler<T: HttpClient>(
             ExtractedModel { model: model_str }
         }
         None => {
-            debug!("Received request body of size: {}", body_bytes.len());
+            info!("Received request body of size: {} bytes", body_bytes.len());
             debug!("Request body content: {}", String::from_utf8_lossy(&body_bytes));
             match serde_json::from_slice::<ExtractedModel>(&body_bytes) {
                 Ok(model) => {
@@ -217,6 +224,19 @@ pub async fn target_message_handler<T: HttpClient>(
     
     info!("Forwarding request to upstream URL: {}", upstream_uri);
     info!("Request method: {}, Headers count: {}", req.method(), req.headers().len());
+    
+    // Log all headers for debugging
+    info!("Request headers:");
+    for (name, value) in req.headers() {
+        if let Ok(v) = value.to_str() {
+            // Mask authorization headers for security
+            if name == "authorization" {
+                info!("  {}: [MASKED]", name);
+            } else {
+                info!("  {}: {}", name, v);
+            }
+        }
+    }
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
