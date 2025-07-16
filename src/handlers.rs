@@ -222,6 +222,12 @@ pub async fn target_message_handler<T: HttpClient>(
 
     *req.body_mut() = axum::body::Body::from(body_bytes);
     
+    // Fix conflicting headers: remove transfer-encoding if content-length is present
+    if req.headers().contains_key("content-length") && req.headers().contains_key("transfer-encoding") {
+        info!("Removing transfer-encoding header due to presence of content-length header");
+        req.headers_mut().remove("transfer-encoding");
+    }
+    
     info!("Forwarding request to upstream URL: {}", upstream_uri);
     info!("Request method: {}, Headers count: {}", req.method(), req.headers().len());
     
