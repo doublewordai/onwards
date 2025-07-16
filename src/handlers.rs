@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, trace};
 
 const ONWARD_MODEL_HEADER: &str = "onwards-model";
 
@@ -30,6 +30,15 @@ pub async fn target_message_handler<T: HttpClient>(
             Ok(bytes) => bytes,
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
+
+    // Log full incoming request details for debugging
+    trace!(
+        "Incoming request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
+        req.method(),
+        req.uri(),
+        req.headers(),
+        String::from_utf8_lossy(&body_bytes)
+    );
 
     // Order of precedence for the target to use:
     // 1. supplied as a header (model-override)
@@ -120,8 +129,6 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
-    *req.body_mut() = axum::body::Body::from(body_bytes);
-
     // Build the onwards URI
     let path_and_query = req
         .uri()
@@ -161,6 +168,17 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         debug!("No key configured for target {}", target.url);
     }
+
+    // Log full outgoing request details for debugging
+    trace!(
+        "Outgoing request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
+        req.method(),
+        req.uri(),
+        req.headers(),
+        String::from_utf8_lossy(&body_bytes)
+    );
+
+    *req.body_mut() = axum::body::Body::from(body_bytes);
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
