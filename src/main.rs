@@ -72,6 +72,15 @@ pub async fn main() -> anyhow::Result<()> {
     let targets = Targets::from_config_file(&config.targets)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create targets from config: {}", e))?;
+    
+    info!("Loaded {} targets:", targets.targets.len());
+    for entry in targets.targets.iter() {
+        info!("  - Model '{}' -> URL: {}, onwards_model: {:?}", 
+            entry.key(), 
+            entry.value().url,
+            entry.value().onwards_model
+        );
+    }
 
     // Start file watcher if a config file was specified
     if config.watch {

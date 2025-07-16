@@ -23,12 +23,17 @@ pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
 ) -> Result<Response, StatusCode> {
+    info!("=== Incoming Request ===");
+    info!("Method: {}, Path: {}", req.method(), req.uri().path());
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+            Err(e) => {
+                error!("Failed to extract request body: {}", e);
+                return Err(StatusCode::BAD_REQUEST);
+            }
         };
 
     // Log full incoming request details for debugging
@@ -55,9 +60,17 @@ pub async fn target_message_handler<T: HttpClient>(
         }
         None => {
             debug!("Received request body of size: {}", body_bytes.len());
-            match serde_json::from_slice(&body_bytes) {
-                Ok(model) => model,
-                Err(_) => return Err(StatusCode::BAD_REQUEST),
+            debug!("Request body content: {}", String::from_utf8_lossy(&body_bytes));
+            match serde_json::from_slice::<ExtractedModel>(&body_bytes) {
+                Ok(model) => {
+                    debug!("Successfully extracted model from body: {}", model.model);
+                    model
+                }
+                Err(e) => {
+                    error!("Failed to parse model from request body: {}", e);
+                    error!("Body was: {}", String::from_utf8_lossy(&body_bytes));
+                    return Err(StatusCode::BAD_REQUEST);
+                }
             }
         }
     };
@@ -65,8 +78,19 @@ pub async fn target_message_handler<T: HttpClient>(
     info!("Received request for model: {}", model.model);
 
     let target = match state.targets.targets.get(model.model) {
-        Some(target) => target,
-        None => return Err(StatusCode::NOT_FOUND),
+        Some(target) => {
+            debug!("Found target for model '{}': {:?}", model.model, target);
+            target
+        }
+        None => {
+            error!("No target found for model: '{}'", model.model);
+            error!("Available targets: {:?}", 
+                state.targets.targets.iter()
+                    .map(|entry| entry.key().clone())
+                    .collect::<Vec<_>>()
+            );
+            return Err(StatusCode::NOT_FOUND);
+        }
     };
 
     // Validate API key if target has keys configured
@@ -91,12 +115,15 @@ pub async fn target_message_handler<T: HttpClient>(
         .and_then(|x| x.to_str().ok())
         .map(|x| x.to_owned())
         .or(target.onwards_model.clone())
-        && !body_bytes.is_empty()
     {
+        if !body_bytes.is_empty() {
         debug!("Rewriting model key to: {}", rewrite);
         let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(value) => value,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+            Err(e) => {
+                error!("Failed to parse body for rewriting: {}", e);
+                return Err(StatusCode::BAD_REQUEST);
+            }
         };
         let entry = body_serialized
             .as_object_mut()
@@ -127,6 +154,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 .parse()
                 .expect("Content-Length should be valid"),
         );
+        }
     }
 
     // Build the onwards URI
@@ -182,7 +210,10 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
-        Ok(response) => Ok(response),
+        Ok(response) => {
+            debug!("Successfully forwarded request to {}", upstream_uri);
+            Ok(response)
+        }
         Err(e) => {
             error!(
                 "Error forwarding request to target url {}: {}",
