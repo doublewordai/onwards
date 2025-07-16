@@ -15,7 +15,7 @@ use config::Config;
 use handlers::{models, target_message_handler};
 use target::{Targets, WatchedFile};
 use tokio::net::TcpListener;
-use tracing::{Level, info, instrument};
+use tracing::{info, instrument};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppState<T: HttpClient> {
@@ -60,7 +60,10 @@ pub(crate) async fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
 pub async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
-        .with_max_level(Level::DEBUG)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let config = Config::parse().validate()?;
@@ -1360,8 +1363,10 @@ mod tests {
     async fn test_bearer_token_validation_with_valid_token() {
         let targets_map = Arc::new(DashMap::new());
         let mut keys = std::collections::HashSet::new();
-        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
-        
+        keys.insert(crate::auth::ConstantTimeString::from(
+            "valid-token".to_string(),
+        ));
+
         targets_map.insert(
             "secure-model".to_string(),
             Target::builder()
@@ -1370,8 +1375,10 @@ mod tests {
                 .keys(keys)
                 .build(),
         );
-        
-        let targets = Targets { targets: targets_map };
+
+        let targets = Targets {
+            targets: targets_map,
+        };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
         let router = build_router(app_state).await;
@@ -1388,7 +1395,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 200);
-        
+
         // Verify request was forwarded
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 1);
@@ -1398,8 +1405,10 @@ mod tests {
     async fn test_bearer_token_validation_with_invalid_token() {
         let targets_map = Arc::new(DashMap::new());
         let mut keys = std::collections::HashSet::new();
-        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
-        
+        keys.insert(crate::auth::ConstantTimeString::from(
+            "valid-token".to_string(),
+        ));
+
         targets_map.insert(
             "secure-model".to_string(),
             Target::builder()
@@ -1408,8 +1417,10 @@ mod tests {
                 .keys(keys)
                 .build(),
         );
-        
-        let targets = Targets { targets: targets_map };
+
+        let targets = Targets {
+            targets: targets_map,
+        };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
         let router = build_router(app_state).await;
@@ -1426,7 +1437,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 401);
-        
+
         // Verify no request was forwarded
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 0);
@@ -1436,8 +1447,10 @@ mod tests {
     async fn test_bearer_token_validation_missing_token() {
         let targets_map = Arc::new(DashMap::new());
         let mut keys = std::collections::HashSet::new();
-        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
-        
+        keys.insert(crate::auth::ConstantTimeString::from(
+            "valid-token".to_string(),
+        ));
+
         targets_map.insert(
             "secure-model".to_string(),
             Target::builder()
@@ -1446,8 +1459,10 @@ mod tests {
                 .keys(keys)
                 .build(),
         );
-        
-        let targets = Targets { targets: targets_map };
+
+        let targets = Targets {
+            targets: targets_map,
+        };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
         let router = build_router(app_state).await;
@@ -1463,7 +1478,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 401);
-        
+
         // Verify no request was forwarded
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 0);
@@ -1473,8 +1488,10 @@ mod tests {
     async fn test_bearer_token_validation_malformed_header() {
         let targets_map = Arc::new(DashMap::new());
         let mut keys = std::collections::HashSet::new();
-        keys.insert(crate::auth::ConstantTimeString::from("valid-token".to_string()));
-        
+        keys.insert(crate::auth::ConstantTimeString::from(
+            "valid-token".to_string(),
+        ));
+
         targets_map.insert(
             "secure-model".to_string(),
             Target::builder()
@@ -1483,8 +1500,10 @@ mod tests {
                 .keys(keys)
                 .build(),
         );
-        
-        let targets = Targets { targets: targets_map };
+
+        let targets = Targets {
+            targets: targets_map,
+        };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
         let router = build_router(app_state).await;
@@ -1501,7 +1520,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 401);
-        
+
         // Verify no request was forwarded
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 0);
@@ -1510,7 +1529,7 @@ mod tests {
     #[tokio::test]
     async fn test_bearer_token_validation_skipped_for_targets_without_keys() {
         let targets_map = Arc::new(DashMap::new());
-        
+
         targets_map.insert(
             "open-model".to_string(),
             Target::builder()
@@ -1518,8 +1537,10 @@ mod tests {
                 .onwards_key("open-key".to_string())
                 .build(),
         );
-        
-        let targets = Targets { targets: targets_map };
+
+        let targets = Targets {
+            targets: targets_map,
+        };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
         let router = build_router(app_state).await;
@@ -1535,7 +1556,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 200);
-        
+
         // Verify request was forwarded
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 1);
