@@ -117,7 +117,7 @@ pub async fn target_message_handler<T: HttpClient>(
         .or(target.onwards_model.clone())
     {
         if !body_bytes.is_empty() {
-        debug!("Rewriting model key to: {}", rewrite);
+        info!("Rewriting model in request body from '{}' to '{}'", model.model, rewrite);
         let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(value) => value,
             Err(e) => {
@@ -163,20 +163,26 @@ pub async fn target_message_handler<T: HttpClient>(
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or(req.uri().path());
+    info!("Building upstream URI - base: {}, path: {}", target.url, path_and_query);
     let upstream_uri = target
         .url
         .join(path_and_query.strip_prefix('/').unwrap_or(path_and_query))
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|e| {
+            error!("Failed to join URL: {} with path: {} - error: {}", target.url, path_and_query, e);
+            StatusCode::BAD_REQUEST
+        })?
         .to_string();
+    info!("Upstream URI: {}", upstream_uri);
     let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
         Ok(uri) => uri,
-        Err(_) => {
-            error!("Invalid URI: {}", upstream_uri);
+        Err(e) => {
+            error!("Invalid URI: {} - error: {}", upstream_uri, e);
             return Err(StatusCode::BAD_REQUEST);
         }
     };
 
     *req.uri_mut() = upstream_uri_parsed.clone();
+    info!("Set request URI to: {}", req.uri());
 
     // Update the host header to match the target server (otherwise cloudflare gets mad).
     if let Some(host) = upstream_uri_parsed.host() {
@@ -185,16 +191,17 @@ pub async fn target_message_handler<T: HttpClient>(
         } else {
             host.to_string()
         };
+        info!("Setting host header to: {}", host_value);
         req.headers_mut()
             .insert("host", host_value.parse().unwrap());
     }
 
     if let Some(key) = &target.onwards_key {
-        debug!("Adding authorization header for {}", target.url);
+        info!("Adding authorization header for target");
         req.headers_mut()
             .insert("Authorization", format!("Bearer {key}").parse().unwrap());
     } else {
-        debug!("No key configured for target {}", target.url);
+        info!("No authorization key configured for target {}", target.url);
     }
 
     // Log full outgoing request details for debugging
@@ -207,11 +214,14 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     *req.body_mut() = axum::body::Body::from(body_bytes);
+    
+    info!("Forwarding request to upstream URL: {}", upstream_uri);
+    info!("Request method: {}, Headers count: {}", req.method(), req.headers().len());
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
         Ok(response) => {
-            debug!("Successfully forwarded request to {}", upstream_uri);
+            info!("Successfully forwarded request to {}", upstream_uri);
             Ok(response)
         }
         Err(e) => {
