@@ -6,7 +6,10 @@ use crate::{AppState, models::ExtractedModel};
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode, Uri},
+    http::{
+        StatusCode, Uri,
+        header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+    },
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
@@ -117,16 +120,6 @@ pub async fn target_message_handler<T: HttpClient>(
             Ok(bytes) => axum::body::Bytes::from(bytes),
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
-
-        // Update Content-Length header to match the new body size
-        req.headers_mut().insert(
-            "content-length",
-            body_bytes
-                .len()
-                .to_string()
-                .parse()
-                .expect("Content-Length should be valid"),
-        );
     }
 
     // Build the onwards URI
@@ -168,6 +161,17 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         debug!("No key configured for target {}", target.url);
     }
+
+    // Always set Content-Length and remove Transfer-Encoding since we buffer the full body
+    req.headers_mut().insert(
+        CONTENT_LENGTH,
+        body_bytes
+            .len()
+            .to_string()
+            .parse()
+            .expect("Content-Length should be valid"),
+    );
+    req.headers_mut().remove(TRANSFER_ENCODING);
 
     // Log full outgoing request details for debugging
     trace!(
