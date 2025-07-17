@@ -1561,4 +1561,216 @@ mod tests {
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 1);
     }
+
+    #[tokio::test]
+    async fn test_transfer_encoding_header_always_removed() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.test.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with Transfer-Encoding header
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("transfer-encoding", "chunked")
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Verify Transfer-Encoding header was removed from forwarded request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let request = &requests[0];
+        let transfer_encoding_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "transfer-encoding")
+            .map(|(_, value)| value);
+        assert_eq!(transfer_encoding_header, None);
+
+        // Verify Content-Length header was set
+        let content_length_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .map(|(_, value)| value);
+        assert!(content_length_header.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_content_length_header_always_set() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.test.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request without Content-Length header
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Verify Content-Length header was set on forwarded request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let request = &requests[0];
+        let content_length_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .map(|(_, value)| value);
+        assert!(content_length_header.is_some());
+
+        // Verify Content-Length matches actual body length
+        let expected_length = request.body.len().to_string();
+        assert_eq!(content_length_header, Some(&expected_length));
+    }
+
+    #[tokio::test]
+    async fn test_both_transfer_encoding_and_content_length_headers_handled() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.test.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with both Transfer-Encoding and Content-Length headers
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("transfer-encoding", "chunked")
+            .add_header("content-length", "999")
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Verify proper header handling in forwarded request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let request = &requests[0];
+
+        // Transfer-Encoding should be removed
+        let transfer_encoding_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "transfer-encoding")
+            .map(|(_, value)| value);
+        assert_eq!(transfer_encoding_header, None);
+
+        // Content-Length should be set to actual body size (not original value)
+        let content_length_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .map(|(_, value)| value);
+        assert!(content_length_header.is_some());
+
+        let expected_length = request.body.len().to_string();
+        assert_eq!(content_length_header, Some(&expected_length));
+        assert_ne!(content_length_header, Some(&"999".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_header_handling_with_empty_body() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.test.com".parse().unwrap())
+                .onwards_key("test-key".to_string())
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state).await;
+        let server = TestServer::new(router).unwrap();
+
+        // Make request with empty body but Transfer-Encoding header
+        let response = server
+            .post("/v1/embeddings")
+            .add_header("model-override", "test-model")
+            .add_header("transfer-encoding", "chunked")
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Verify header handling even with empty body
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let request = &requests[0];
+
+        // Transfer-Encoding should be removed
+        let transfer_encoding_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "transfer-encoding")
+            .map(|(_, value)| value);
+        assert_eq!(transfer_encoding_header, None);
+
+        // Content-Length should be set to 0 for empty body
+        let content_length_header = request
+            .headers
+            .iter()
+            .find(|(key, _)| key == "content-length")
+            .map(|(_, value)| value);
+        assert_eq!(content_length_header, Some(&"0".to_string()));
+
+        // Verify body is empty
+        assert!(request.body.is_empty());
+    }
 }

@@ -6,7 +6,10 @@ use crate::{AppState, models::ExtractedModel};
 use axum::{
     Json,
     extract::State,
-    http::{StatusCode, Uri},
+    http::{
+        StatusCode, Uri,
+        header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+    },
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
@@ -91,8 +94,8 @@ pub async fn target_message_handler<T: HttpClient>(
         .and_then(|x| x.to_str().ok())
         .map(|x| x.to_owned())
         .or(target.onwards_model.clone())
+        && !body_bytes.is_empty()
     {
-        if !body_bytes.is_empty() {
         debug!("Rewriting model key to: {}", rewrite);
         let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(value) => value,
@@ -117,17 +120,6 @@ pub async fn target_message_handler<T: HttpClient>(
             Ok(bytes) => axum::body::Bytes::from(bytes),
             Err(_) => return Err(StatusCode::BAD_REQUEST),
         };
-
-        // Update Content-Length header to match the new body size
-        req.headers_mut().insert(
-            "content-length",
-            body_bytes
-                .len()
-                .to_string()
-                .parse()
-                .expect("Content-Length should be valid"),
-        );
-        }
     }
 
     // Build the onwards URI
@@ -170,6 +162,17 @@ pub async fn target_message_handler<T: HttpClient>(
         debug!("No key configured for target {}", target.url);
     }
 
+    // Always set Content-Length and remove Transfer-Encoding since we buffer the full body
+    req.headers_mut().insert(
+        CONTENT_LENGTH,
+        body_bytes
+            .len()
+            .to_string()
+            .parse()
+            .expect("Content-Length should be valid"),
+    );
+    req.headers_mut().remove(TRANSFER_ENCODING);
+
     // Log full outgoing request details for debugging
     trace!(
         "Outgoing request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
@@ -180,11 +183,6 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     *req.body_mut() = axum::body::Body::from(body_bytes);
-
-    // Fix conflicting headers: remove transfer-encoding if content-length is present
-    if req.headers().contains_key("content-length") && req.headers().contains_key("transfer-encoding") {
-        req.headers_mut().remove("transfer-encoding");
-    }
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
