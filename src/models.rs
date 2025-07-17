@@ -19,7 +19,7 @@ pub(crate) struct Model {
     /// The model identifier, which can be referenced in the API endpoints.
     pub(crate) id: String,
     /// The Unix timestamp (in seconds) when the model was created.
-    pub(crate) created: Option<u32>,
+    pub(crate) created: u32,
     /// The object type, which is always "model".
     pub(crate) object: String,
     /// The organization that owns the model.
@@ -31,7 +31,10 @@ impl Model {
     pub(crate) fn from_target(id: &str, _target: &Target) -> Self {
         Model {
             id: id.to_owned(),
-            created: None,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32,
             object: "model".into(),
             owned_by: "None".into(),
         }
