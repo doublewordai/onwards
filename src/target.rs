@@ -26,11 +26,11 @@ use url::Url;
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
-pub(crate) struct Target {
-    pub(crate) url: Url,
-    pub(crate) keys: Option<KeySet>,
-    pub(crate) onwards_key: Option<String>,
-    pub(crate) onwards_model: Option<String>,
+pub struct Target {
+    pub url: Url,
+    pub keys: Option<KeySet>,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,15 +41,15 @@ pub struct Auth {
 
 /// The config file contains a map of target names to targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ConfigFile {
-    pub(crate) targets: HashMap<String, Target>,
-    pub(crate) auth: Option<Auth>,
+pub struct ConfigFile {
+    pub targets: HashMap<String, Target>,
+    pub auth: Option<Auth>,
 }
 
 /// The live-updating collection of targets.
 #[derive(Debug, Clone)]
-pub(crate) struct Targets {
-    pub(crate) targets: Arc<DashMap<String, Target>>,
+pub struct Targets {
+    pub targets: Arc<DashMap<String, Target>>,
 }
 
 #[async_trait]
@@ -127,7 +127,7 @@ impl TargetsStream for WatchedFile {
 }
 
 impl Targets {
-    pub(crate) async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
+    pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
             anyhow!(
                 "Failed to read config file {}: {}",
@@ -154,7 +154,7 @@ impl Targets {
         Ok(targets)
     }
 
-    pub(crate) fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
+    pub fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
         let global_keys = config_file
             .auth
             .take()
@@ -182,7 +182,7 @@ impl Targets {
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
-    pub(crate) async fn receive_updates<W: TargetsStream + Send + 'static>(
+    pub async fn receive_updates<W: TargetsStream + Send + 'static>(
         &self,
         targets_stream: W,
     ) -> Result<(), anyhow::Error> {
