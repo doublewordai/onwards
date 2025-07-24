@@ -1,7 +1,8 @@
 /// Axum handlers for the proxy server
 use crate::auth;
 use crate::client::HttpClient;
-use crate::models::ListModelResponse;
+use crate::models::{ErrorResponseBody, ListModelResponse};
+use crate::models::OnwardsErrorResponse;
 use crate::{AppState, models::ExtractedModel};
 use axum::{
     Json,
@@ -25,13 +26,16 @@ const MODEL_OVERRIDE_HEADER: &str = "model-override";
 pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, OnwardsErrorResponse> {
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+            Err(_) => return Err(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            }),
         };
 
     // Log full incoming request details for debugging
@@ -51,7 +55,10 @@ pub async fn target_message_handler<T: HttpClient>(
         Some(header_value) => {
             let model_str = match header_value.to_str() {
                 Ok(value) => value,
-                Err(_) => return Err(StatusCode::BAD_REQUEST),
+                Err(_) => return Err(OnwardsErrorResponse {
+                    body: None,
+                    status: StatusCode::BAD_REQUEST,
+                }),
             };
             debug!("Using model override from header: {}", model_str);
             ExtractedModel { model: model_str }
@@ -60,7 +67,10 @@ pub async fn target_message_handler<T: HttpClient>(
             debug!("Received request body of size: {}", body_bytes.len());
             match serde_json::from_slice(&body_bytes) {
                 Ok(model) => model,
-                Err(_) => return Err(StatusCode::BAD_REQUEST),
+                Err(_) => return Err(OnwardsErrorResponse {
+                    body: None,
+                    status: StatusCode::BAD_REQUEST,
+                }),
             }
         }
     };
@@ -69,7 +79,16 @@ pub async fn target_message_handler<T: HttpClient>(
 
     let target = match state.targets.targets.get(model.model) {
         Some(target) => target,
-        None => return Err(StatusCode::NOT_FOUND),
+        None => return Err(OnwardsErrorResponse {
+            // Body is as per OpenAI's response
+            body: Some(ErrorResponseBody {
+                message: format!("The model `{}` does not exist or you do not have access to it.", model.model),
+                r#type: "invalid_request_error".to_string(),
+                param: None,
+                code: "model_not_found".to_string(),
+            }),
+            status: StatusCode::NOT_FOUND,
+        })
     };
 
     // Validate API key if target has keys configured
@@ -99,11 +118,17 @@ pub async fn target_message_handler<T: HttpClient>(
         debug!("Rewriting model key to: {}", rewrite);
         let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(value) => value,
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+            Err(_) => return Err(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            }),
         };
         let entry = body_serialized
             .as_object_mut()
-            .ok_or(StatusCode::BAD_REQUEST)? // if the body is not an object (we know its not empty), return 400
+            .ok_or(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            })? // if the body is not an object (we know its not empty), return 400
             .entry("model");
         match entry {
             Entry::Occupied(mut entry) => {
@@ -113,12 +138,18 @@ pub async fn target_message_handler<T: HttpClient>(
             Entry::Vacant(_entry) => {
                 // If the body didn't have a model key, then 400 (header shouldn't have been
                 // provided)
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(OnwardsErrorResponse {
+                    body: None,
+                    status: StatusCode::BAD_REQUEST,
+                });
             }
         }
         body_bytes = match serde_json::to_vec(&body_serialized) {
             Ok(bytes) => axum::body::Bytes::from(bytes),
-            Err(_) => return Err(StatusCode::BAD_REQUEST),
+            Err(_) => return Err(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            }),
         };
     }
 
@@ -131,13 +162,19 @@ pub async fn target_message_handler<T: HttpClient>(
     let upstream_uri = target
         .url
         .join(path_and_query.strip_prefix('/').unwrap_or(path_and_query))
-        .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map_err(|_| OnwardsErrorResponse {
+            body: None,
+            status: StatusCode::BAD_REQUEST,
+        })?
         .to_string();
     let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
         Ok(uri) => uri,
         Err(_) => {
             error!("Invalid URI: {}", upstream_uri);
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_REQUEST,
+            });
         }
     };
 
@@ -192,7 +229,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Error forwarding request to target url {}: {}",
                 upstream_uri, e
             );
-            Err(StatusCode::BAD_GATEWAY)
+            Err(OnwardsErrorResponse {
+                body: None,
+                status: StatusCode::BAD_GATEWAY,
+            })
         }
     }
 }
