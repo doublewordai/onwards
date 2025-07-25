@@ -9,10 +9,12 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
 use dashmap::DashMap;
+use futures_util::{Stream, StreamExt};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -54,21 +56,25 @@ pub struct Targets {
 
 #[async_trait]
 pub trait TargetsStream {
-    /// TODO(fergus): This would probably be nicer if the error were associated types and it
-    /// returned a Result<Box<dyn Stream<Item = Result<Targets, E>>, U> + Send>
-    async fn receive(
+    // TODO: Replace Into<anyhow::Error> with a custom error type using thiserror
+    type Error: Into<anyhow::Error> + Send + Sync + 'static;
+    
+    /// Returns a stream of Targets updates
+    async fn stream(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error>;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error>;
 }
 
 pub struct WatchedFile(pub PathBuf);
 
 #[async_trait]
 impl TargetsStream for WatchedFile {
+    type Error = anyhow::Error;
+    
     /// Watches a file for changes and returns a stream of Targets updates.
-    async fn receive(
+    async fn stream(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error> {
         // TODO(fergus): think about buffers
         let (targets_tx, targets_rx) = mpsc::channel(100);
         let (file_tx, mut file_rx) = mpsc::channel(100);
@@ -122,7 +128,31 @@ impl TargetsStream for WatchedFile {
         // Keep the watcher alive
         std::mem::forget(watcher);
 
-        Ok(targets_rx)
+        Ok(Box::pin(ReceiverStream::new(targets_rx)))
+    }
+}
+
+/// A watch channel-based implementation of TargetsStream for receiving configuration updates
+pub struct WatchTargetsStream {
+    receiver: tokio::sync::watch::Receiver<Targets>,
+}
+
+impl WatchTargetsStream {
+    pub fn new(receiver: tokio::sync::watch::Receiver<Targets>) -> Self {
+        Self { receiver }
+    }
+}
+
+#[async_trait]
+impl TargetsStream for WatchTargetsStream {
+    type Error = std::convert::Infallible;
+    
+    async fn stream(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error> {
+        let stream = WatchStream::new(self.receiver.clone())
+            .map(|targets| Ok(targets));
+        Ok(Box::pin(stream))
     }
 }
 
@@ -182,17 +212,21 @@ impl Targets {
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
-    pub async fn receive_updates<W: TargetsStream + Send + 'static>(
+    pub async fn receive_updates<W>(
         &self,
         targets_stream: W,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), W::Error>
+    where
+        W: TargetsStream + Send + 'static,
+        W::Error: Into<anyhow::Error>,
+    {
         let targets = Arc::clone(&self.targets);
 
-        let mut rx = targets_stream.receive().await?;
+        let mut stream = targets_stream.stream().await?;
 
         // TODO(fergus): stash the handle to this thread somewhere
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            while let Some(result) = stream.next().await {
                 match result {
                     Ok(new_targets) => {
                         info!("Config file changed, updating targets...");
@@ -216,7 +250,8 @@ impl Targets {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to reload config: {}", e);
+                        let err: anyhow::Error = e.into();
+                        error!("Failed to reload config: {}", err);
                     }
                 }
             }
