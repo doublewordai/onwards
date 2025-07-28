@@ -2,7 +2,7 @@
 use crate::auth;
 use crate::client::HttpClient;
 use crate::models::ListModelResponse;
-use crate::{AppState, models::ExtractedModel};
+use crate::AppState;
 use axum::{
     Json,
     extract::State,
@@ -17,7 +17,6 @@ use tracing::{debug, error, info, instrument, trace};
 
 const ONWARD_MODEL_HEADER: &str = "onwards-model";
 
-const MODEL_OVERRIDE_HEADER: &str = "model-override";
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
@@ -43,31 +42,15 @@ pub async fn target_message_handler<T: HttpClient>(
         String::from_utf8_lossy(&body_bytes)
     );
 
-    // Order of precedence for the target to use:
-    // 1. supplied as a header (model-override)
-    // 2. Available in the request body as JSON
-    // If neither is present, return a 400 Bad Request.
-    let model = match req.headers().get(MODEL_OVERRIDE_HEADER) {
-        Some(header_value) => {
-            let model_str = match header_value.to_str() {
-                Ok(value) => value,
-                Err(_) => return Err(StatusCode::BAD_REQUEST),
-            };
-            debug!("Using model override from header: {}", model_str);
-            ExtractedModel { model: model_str }
-        }
-        None => {
-            debug!("Received request body of size: {}", body_bytes.len());
-            match serde_json::from_slice(&body_bytes) {
-                Ok(model) => model,
-                Err(_) => return Err(StatusCode::BAD_REQUEST),
-            }
-        }
+    // Extract the model using the shared function
+    let model_name = match crate::extract_model_from_request(req.headers(), &body_bytes) {
+        Ok(model) => model,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    info!("Received request for model: {}", model.model);
+    info!("Received request for model: {}", model_name);
 
-    let target = match state.targets.targets.get(model.model) {
+    let target = match state.targets.targets.get(&model_name) {
         Some(target) => target,
         None => return Err(StatusCode::NOT_FOUND),
     };

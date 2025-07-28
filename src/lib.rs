@@ -5,6 +5,7 @@
 
 use axum::Router;
 use axum::routing::{any, get};
+use axum::http::HeaderMap;
 
 pub mod auth;
 pub mod client;
@@ -14,6 +15,7 @@ pub mod target;
 
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
+use models::ExtractedModel;
 
 /// The main application state containing the HTTP client and targets configuration
 #[derive(Clone, Debug)]
@@ -40,6 +42,36 @@ impl<T: HttpClient> AppState<T> {
         Self {
             http_client,
             targets,
+        }
+    }
+}
+
+/// Extract the model name from a request
+/// 
+/// This function checks for a model override header first, then extracts the model from the JSON body.
+/// This is the same logic used by the proxy handler, extracted for reuse.
+/// 
+/// # Arguments
+/// * `headers` - The request headers to check for model override
+/// * `body_bytes` - The request body as bytes to parse for model field
+/// 
+/// # Returns
+/// * `Ok(String)` - The extracted model name
+/// * `Err(())` - If no model could be extracted or parsing failed
+pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Result<String, ()> {
+    const MODEL_OVERRIDE_HEADER: &str = "model-override";
+    
+    // Order of precedence for the model:
+    // 1. supplied as a header (model-override)
+    // 2. Available in the request body as JSON
+    match headers.get(MODEL_OVERRIDE_HEADER) {
+        Some(header_value) => {
+            let model_str = header_value.to_str().map_err(|_| ())?;
+            Ok(model_str.to_string())
+        }
+        None => {
+            let extracted: ExtractedModel = serde_json::from_slice(body_bytes).map_err(|_| ())?;
+            Ok(extracted.model.to_string())
         }
     }
 }
