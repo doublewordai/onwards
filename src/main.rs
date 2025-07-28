@@ -95,7 +95,7 @@ pub async fn main() -> anyhow::Result<()> {
             .enable_response_body_size(true)
             .build();
 
-        let metrics_router = build_metrics_router().layer(prometheus_layer.clone());
+        let metrics_router = build_metrics_router();
         let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
         let listener = TcpListener::bind(&bind_addr).await?;
         serves.push(axum::serve(listener, metrics_router).into_future());
