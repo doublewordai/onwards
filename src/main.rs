@@ -9,6 +9,7 @@ use axum::{
     Router,
     routing::{any, get},
 };
+use axum_prometheus::{Handle, MakeDefaultHandle, PrometheusMetricLayerBuilder};
 use clap::Parser as _;
 use client::{HttpClient, HyperClient, create_hyper_client};
 use config::Config;
@@ -45,7 +46,7 @@ impl<T: HttpClient> AppState<T> {
 }
 
 #[instrument(skip(state))]
-pub(crate) async fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
+pub(crate) fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
 ) -> Router {
     info!("Building router");
@@ -53,6 +54,15 @@ pub(crate) async fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .route("/v1/models", get(models)) // Intercept the /v1/models call at the gateway level.
         .route("/{*path}", any(target_message_handler)) // Anything else is passed straight through to the corresponding target
         .with_state(state)
+}
+
+pub(crate) fn build_metrics_router() -> Router {
+    info!("Building metrics router");
+    let handle = Handle::default().make_default_handle();
+    Router::new().route(
+        "/metrics",
+        axum::routing::get(move || async move { handle.render() }),
+    )
 }
 
 #[tokio::main]
@@ -78,14 +88,35 @@ pub async fn main() -> anyhow::Result<()> {
         targets.receive_updates(WatchedFile(config.targets)).await?;
     }
 
-    let app_state = AppState::new(targets);
-    let router = build_router(app_state).await;
+    let mut serves = vec![];
+    let prometheus_layer = if config.metrics {
+        let prometheus_layer = PrometheusMetricLayerBuilder::new()
+            .with_prefix("onwards")
+            .enable_response_body_size(true)
+            .build();
 
+        let metrics_router = build_metrics_router().layer(prometheus_layer.clone());
+        let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
+        let listener = TcpListener::bind(&bind_addr).await?;
+        serves.push(axum::serve(listener, metrics_router).into_future());
+        info!("Metrics endpoint enabled on {}", bind_addr);
+        Some(prometheus_layer)
+    } else {
+        info!("Metrics endpoint disabled");
+        None
+    };
+
+    let app_state = AppState::new(targets);
+    let mut router = build_router(app_state);
+    if let Some(prometheus_layer) = prometheus_layer {
+        router = router.layer(prometheus_layer)
+    };
     let bind_addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
+    serves.push(axum::serve(listener, router).into_future());
     info!("AI Gateway listening on {}", bind_addr);
 
-    axum::serve(listener, router).await?;
+    futures::future::join_all(serves).await;
 
     Ok(())
 }
@@ -223,7 +254,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
         let app_state = AppState::with_client(targets, mock_client);
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         let response = server
@@ -265,7 +296,7 @@ mod tests {
             r#"{"choices": [{"message": {"content": "Hello!"}}]}"#,
         );
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test that gpt-4 model is recognized and returns 200
@@ -329,7 +360,7 @@ mod tests {
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response_body);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make a request
@@ -419,7 +450,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with model in JSON body AND model-override header
@@ -469,7 +500,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with only model-override header, no JSON body
@@ -517,7 +548,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Non-existent model in header should return 404 (target not found)
@@ -546,7 +577,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"result": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test 1: No header, no body
@@ -597,7 +628,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with onwards-model header to rewrite the model in the body
@@ -657,7 +688,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with onwards-model header that should override the target's model_key
@@ -703,7 +734,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with model-override header and onwards-model header, but empty body
@@ -747,7 +778,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"method": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test GET request (use a different endpoint since /v1/models is intercepted)
@@ -825,7 +856,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"query": "preserved"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test request with various query parameters
@@ -872,7 +903,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"endpoint": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test different OpenAI API endpoints
@@ -933,7 +964,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"headers": "forwarded"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with various custom headers that should be forwarded
@@ -1026,7 +1057,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"no_auth": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request to target without API key
@@ -1096,7 +1127,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Request the /v1/models endpoint
@@ -1154,7 +1185,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"should": "not_be_called"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Test various ways to call the models endpoint
@@ -1244,7 +1275,7 @@ mod tests {
             // Create a new mock client for each error code test
             let mock_client = MockHttpClient::new(error_code, error_body);
             let app_state = AppState::with_client(targets.clone(), mock_client.clone());
-            let router = build_router(app_state).await;
+            let router = build_router(app_state);
             let server = TestServer::new(router).unwrap();
 
             // Make a request that should return the error
@@ -1311,7 +1342,7 @@ mod tests {
 
         let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks.clone());
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make a streaming request
@@ -1381,7 +1412,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with valid Bearer token
@@ -1423,7 +1454,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with invalid Bearer token
@@ -1465,7 +1496,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request without Bearer token
@@ -1506,7 +1537,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with malformed authorization header
@@ -1543,7 +1574,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request without Bearer token to target without keys
@@ -1578,7 +1609,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with Transfer-Encoding header
@@ -1630,7 +1661,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request without Content-Length header
@@ -1677,7 +1708,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with both Transfer-Encoding and Content-Length headers
@@ -1736,7 +1767,7 @@ mod tests {
         };
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"response": "success"}"#);
         let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state).await;
+        let router = build_router(app_state);
         let server = TestServer::new(router).unwrap();
 
         // Make request with empty body but Transfer-Encoding header

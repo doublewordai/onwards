@@ -10,6 +10,14 @@ pub(crate) struct Config {
     #[arg(short = 'p', long, default_value_t = 3000)]
     pub(crate) port: u16,
 
+    /// The port on which the proxy server will listen.
+    #[arg(long, default_value_t = 9090)]
+    pub(crate) metrics_port: u16,
+
+    /// Whether to enable the metrics endpoint.
+    #[arg(short = 'm', long, default_value_t = false)]
+    pub(crate) metrics: bool,
+
     /// The file from which to read the targets.
     #[arg(short = 'f', long)]
     pub(crate) targets: PathBuf,

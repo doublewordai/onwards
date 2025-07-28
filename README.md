@@ -153,6 +153,7 @@ You can also specify authentication keys for individual targets:
 ```
 
 In this example:
+
 - `secure-gpt-4` requires a valid bearer token from the `keys` array
 - `open-local` has no authentication requirements
 
@@ -163,6 +164,7 @@ If both global and local keys are supplied, either global or local keys will be 
 When a target has `keys` configured, requests must include a valid `Authorization: Bearer <token>` header where `<token>` matches one of the configured keys. If global keys are configured, they are automatically added to each target's key set.
 
 **Successful authenticated request:**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer secure-key-1" \
@@ -174,6 +176,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **Failed authentication (invalid key):**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer wrong-key" \
@@ -186,6 +189,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **Failed authentication (missing header):**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -197,6 +201,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **No authentication required:**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
