@@ -1,8 +1,8 @@
+use crate::AppState;
 /// Axum handlers for the proxy server
 use crate::auth;
 use crate::client::HttpClient;
 use crate::models::ListModelResponse;
-use crate::AppState;
 use axum::{
     Json,
     extract::State,
@@ -13,10 +13,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
-use tracing::{debug, error, info, instrument, trace};
+use tracing::{debug, error, instrument, trace};
 
 const ONWARD_MODEL_HEADER: &str = "onwards-model";
-
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
@@ -48,11 +47,26 @@ pub async fn target_message_handler<T: HttpClient>(
         Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
 
-    info!("Received request for model: {}", model_name);
+    trace!("Received request for model: {}", model_name);
+    trace!(
+        "Available targets: {:?}",
+        state
+            .targets
+            .targets
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect::<Vec<_>>()
+    );
 
     let target = match state.targets.targets.get(&model_name) {
-        Some(target) => target,
-        None => return Err(StatusCode::NOT_FOUND),
+        Some(target) => {
+            debug!("Found target for model '{}': {:?}", model_name, target.url);
+            target
+        }
+        None => {
+            debug!("No target found for model: {}", model_name);
+            return Err(StatusCode::NOT_FOUND);
+        }
     };
 
     // Validate API key if target has keys configured
@@ -64,9 +78,25 @@ pub async fn target_message_handler<T: HttpClient>(
             .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
 
         match bearer_token {
-            Some(token) if auth::validate_bearer_token(keys, token) => {} // Valid token, continue
-            _ => return Err(StatusCode::UNAUTHORIZED),
+            Some(token) => {
+                trace!("Validating bearer token");
+                if auth::validate_bearer_token(keys, token) {
+                    debug!("Bearer token validation successful");
+                } else {
+                    debug!("Bearer token validation failed - token not in key set");
+                    return Err(StatusCode::UNAUTHORIZED);
+                }
+            }
+            None => {
+                debug!("No bearer token found in authorization header");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
         }
+    } else {
+        debug!(
+            "Target '{}' has no keys configured - allowing request",
+            model_name
+        );
     }
 
     // Users can specify the onwards value of the model field via a header, or it can be specified in the target

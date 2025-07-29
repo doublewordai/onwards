@@ -2,7 +2,10 @@ mod config;
 
 use clap::Parser as _;
 use config::Config;
-use onwards::{AppState, build_router, target::{Targets, WatchedFile}};
+use onwards::{
+    AppState, build_router,
+    target::{Targets, WatchedFile},
+};
 use tokio::net::TcpListener;
 use tracing::{info, instrument};
 

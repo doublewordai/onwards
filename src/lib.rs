@@ -1,11 +1,11 @@
 //! Onwards - A flexible LLM proxy library
-//! 
+//!
 //! This library provides the core functionality for proxying requests to various LLM endpoints
 //! with support for authentication, model routing, and dynamic configuration.
 
 use axum::Router;
-use axum::routing::{any, get};
 use axum::http::HeaderMap;
+use axum::routing::{any, get};
 
 pub mod auth;
 pub mod client;
@@ -47,20 +47,20 @@ impl<T: HttpClient> AppState<T> {
 }
 
 /// Extract the model name from a request
-/// 
+///
 /// This function checks for a model override header first, then extracts the model from the JSON body.
 /// This is the same logic used by the proxy handler, extracted for reuse.
-/// 
+///
 /// # Arguments
 /// * `headers` - The request headers to check for model override
 /// * `body_bytes` - The request body as bytes to parse for model field
-/// 
+///
 /// # Returns
 /// * `Ok(String)` - The extracted model name
 /// * `Err(())` - If no model could be extracted or parsing failed
 pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Result<String, ()> {
     const MODEL_OVERRIDE_HEADER: &str = "model-override";
-    
+
     // Order of precedence for the model:
     // 1. supplied as a header (model-override)
     // 2. Available in the request body as JSON
@@ -77,7 +77,6 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Res
 }
 
 /// Build the main router for the proxy
-/// 
 /// This creates routes for:
 /// - `/v1/models` - Returns available models
 /// - `/{*path}` - Forwards all other requests to the appropriate target

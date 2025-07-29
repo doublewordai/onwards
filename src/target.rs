@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 /// A target represents a destination for requests, specified by its URL.
@@ -58,7 +58,7 @@ pub struct Targets {
 pub trait TargetsStream {
     // TODO: Replace Into<anyhow::Error> with a custom error type using thiserror
     type Error: Into<anyhow::Error> + Send + Sync + 'static;
-    
+
     /// Returns a stream of Targets updates
     async fn stream(
         &self,
@@ -70,7 +70,7 @@ pub struct WatchedFile(pub PathBuf);
 #[async_trait]
 impl TargetsStream for WatchedFile {
     type Error = anyhow::Error;
-    
+
     /// Watches a file for changes and returns a stream of Targets updates.
     async fn stream(
         &self,
@@ -146,12 +146,11 @@ impl WatchTargetsStream {
 #[async_trait]
 impl TargetsStream for WatchTargetsStream {
     type Error = std::convert::Infallible;
-    
+
     async fn stream(
         &self,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error> {
-        let stream = WatchStream::new(self.receiver.clone())
-            .map(|targets| Ok(targets));
+        let stream = WatchStream::from_changes(self.receiver.clone()).map(Ok);
         Ok(Box::pin(stream))
     }
 }
@@ -212,10 +211,7 @@ impl Targets {
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
-    pub async fn receive_updates<W>(
-        &self,
-        targets_stream: W,
-    ) -> Result<(), W::Error>
+    pub async fn receive_updates<W>(&self, targets_stream: W) -> Result<(), W::Error>
     where
         W: TargetsStream + Send + 'static,
         W::Error: Into<anyhow::Error>,
@@ -230,6 +226,7 @@ impl Targets {
                 match result {
                     Ok(new_targets) => {
                         info!("Config file changed, updating targets...");
+                        trace!("{:?}", new_targets);
                         // Copy the new targets to our existing targets map
                         let current_keys: Vec<String> =
                             targets.iter().map(|entry| entry.key().clone()).collect();
