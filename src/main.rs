@@ -130,7 +130,13 @@ pub async fn main() -> anyhow::Result<()> {
     serves.push(axum::serve(listener, router).into_future());
     info!("AI Gateway listening on {}", bind_addr);
 
-    futures::future::join_all(serves).await;
+    let results = futures::future::join_all(serves).await;
+    for result in results {
+        if let Err(e) = result {
+            error!("Server failed: {}", e);
+            return Err(anyhow::anyhow!("One or more servers failed: {}", e));
+        }
+    }
 
     Ok(())
 }
