@@ -11,7 +11,10 @@ use axum::{
     Router,
     routing::{any, get},
 };
-use axum_prometheus::{Handle, PrometheusMetricLayerBuilder};
+use axum_prometheus::{
+    GenericMetricLayer, Handle, PrometheusMetricLayerBuilder,
+    metrics_exporter_prometheus::PrometheusHandle,
+};
 use clap::Parser as _;
 use client::{HttpClient, HyperClient, create_hyper_client};
 use config::Config;
@@ -59,11 +62,9 @@ pub(crate) fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .with_state(state)
 }
 
-type MetricsHandle = axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
-
 /// Builds a router for the metrics endpoint.
 #[instrument(skip(handle))]
-pub(crate) fn build_metrics_router(handle: MetricsHandle) -> Router {
+pub(crate) fn build_metrics_router(handle: PrometheusHandle) -> Router {
     info!("Building metrics router");
     Router::new().route(
         "/metrics",
@@ -72,8 +73,8 @@ pub(crate) fn build_metrics_router(handle: MetricsHandle) -> Router {
 }
 
 type MetricsLayerAndHandle = (
-    axum_prometheus::GenericMetricLayer<'static, MetricsHandle, Handle>,
-    MetricsHandle,
+    GenericMetricLayer<'static, PrometheusHandle, Handle>,
+    PrometheusHandle,
 );
 
 /// Builds a layer and handle for prometheus metrics collection.
