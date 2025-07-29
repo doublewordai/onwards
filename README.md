@@ -49,7 +49,7 @@ disable, set the `--watch` flag to false).
 - `--targets <file>`: Path to configuration file (required)
 - `--port <port>`: Port to listen on (default: 3000)
 - `--watch`: Enable configuration file watching for hot-reloading (default: true)
-- `--metrics`: Enable Prometheus metrics endpoint (default: false)
+- `--metrics`: Enable Prometheus metrics endpoint (default: true)
 - `--metrics-port <port>`: Port for Prometheus metrics (default: 9090)
 - `--metrics-prefix <prefix>`: Prefix for metrics (default: "onwards")
 
