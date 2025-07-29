@@ -3,12 +3,11 @@ mod config;
 use clap::Parser as _;
 use config::Config;
 use onwards::{
-    AppState, build_router,
+    AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
     target::{Targets, WatchedFile},
 };
-use tokio::net::TcpListener;
-use tracing::{info, instrument};
-
+use tokio::{net::TcpListener, task::JoinSet};
+use tracing::{error, info, instrument};
 #[tokio::main]
 #[instrument]
 pub async fn main() -> anyhow::Result<()> {
@@ -32,14 +31,39 @@ pub async fn main() -> anyhow::Result<()> {
         targets.receive_updates(WatchedFile(config.targets)).await?;
     }
 
-    let app_state = AppState::new(targets);
-    let router = build_router(app_state).await;
+    let mut serves = JoinSet::new();
+    // If we are running with metrics enabled, set up the metrics layer and router.
+    let prometheus_layer = if config.metrics {
+        let (prometheus_layer, prometheus_handle) =
+            build_metrics_layer_and_handle(config.metrics_prefix);
 
+        let metrics_router = build_metrics_router(prometheus_handle);
+        let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
+        let listener = TcpListener::bind(&bind_addr).await?;
+        serves.spawn(axum::serve(listener, metrics_router).into_future());
+        info!("Metrics endpoint enabled on {}", bind_addr);
+        Some(prometheus_layer)
+    } else {
+        info!("Metrics endpoint disabled");
+        None
+    };
+
+    let app_state = AppState::new(targets);
+    let mut router = build_router(app_state);
+    // If we have a metrics layer, add it to the router.
+    if let Some(prometheus_layer) = prometheus_layer {
+        router = router.layer(prometheus_layer)
+    };
     let bind_addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
+    serves.spawn(axum::serve(listener, router).into_future());
     info!("AI Gateway listening on {}", bind_addr);
 
-    axum::serve(listener, router).await?;
-
-    Ok(())
+    // Wait for all servers to complete
+    if let Some(result) = serves.join_next().await {
+        result?.map_err(anyhow::Error::from)
+    } else {
+        error!("No server tasks were spawned");
+        Err(anyhow::anyhow!("No server tasks were spawned"))
+    }
 }

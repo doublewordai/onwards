@@ -285,9 +285,14 @@ mod tests {
 
     #[async_trait]
     impl TargetsStream for MockConfigWatcher {
-        async fn receive(
+        type Error = anyhow::Error;
+
+        async fn stream(
             &self,
-        ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error> {
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error>
+        {
+            use tokio_stream::wrappers::ReceiverStream;
+
             let (tx, rx) = mpsc::channel(100);
 
             let configs = self.configs.clone();
@@ -302,7 +307,7 @@ mod tests {
                 }
             });
 
-            Ok(rx)
+            Ok(Box::pin(ReceiverStream::new(rx)))
         }
     }
 

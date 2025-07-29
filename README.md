@@ -49,6 +49,9 @@ disable, set the `--watch` flag to false).
 - `--targets <file>`: Path to configuration file (required)
 - `--port <port>`: Port to listen on (default: 3000)
 - `--watch`: Enable configuration file watching for hot-reloading (default: true)
+- `--metrics`: Enable Prometheus metrics endpoint (default: true)
+- `--metrics-port <port>`: Port for Prometheus metrics (default: 9090)
+- `--metrics-prefix <prefix>`: Prefix for metrics (default: "onwards")
 
 ### API Usage
 
@@ -110,6 +113,14 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 ```
 
+### Metrics
+
+To enable Prometheus metrics, start the gateway with the `--metrics` flag, then access the metrics endpoint by:
+
+```bash
+curl http://localhost:9090/metrics
+```
+
 ## Authentication
 
 Onwards supports bearer token authentication to control access to your AI targets. You can configure authentication keys both globally and per-target.
@@ -153,6 +164,7 @@ You can also specify authentication keys for individual targets:
 ```
 
 In this example:
+
 - `secure-gpt-4` requires a valid bearer token from the `keys` array
 - `open-local` has no authentication requirements
 
@@ -163,6 +175,7 @@ If both global and local keys are supplied, either global or local keys will be 
 When a target has `keys` configured, requests must include a valid `Authorization: Bearer <token>` header where `<token>` matches one of the configured keys. If global keys are configured, they are automatically added to each target's key set.
 
 **Successful authenticated request:**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer secure-key-1" \
@@ -174,6 +187,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **Failed authentication (invalid key):**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer wrong-key" \
@@ -186,6 +200,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **Failed authentication (missing header):**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -197,6 +212,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 ```
 
 **No authentication required:**
+
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \

@@ -10,6 +10,14 @@ pub(crate) struct Config {
     #[arg(short = 'p', long, default_value_t = 3000)]
     pub(crate) port: u16,
 
+    /// The port on which the metrics server will listen.
+    #[arg(long, default_value_t = 9090)]
+    pub(crate) metrics_port: u16,
+
+    /// Whether to enable the metrics endpoint.
+    #[arg(short = 'm', long, default_value_t = true)]
+    pub(crate) metrics: bool,
+
     /// The file from which to read the targets.
     #[arg(short = 'f', long)]
     pub(crate) targets: PathBuf,
@@ -17,6 +25,10 @@ pub(crate) struct Config {
     /// Whether we should continue watching the targets file for changes
     #[arg(short = 'w', long, default_value_t = true)]
     pub(crate) watch: bool,
+
+    /// The prefix to use for metrics.
+    #[arg(long, default_value = "onwards")]
+    pub(crate) metrics_prefix: String,
 }
 
 impl Config {
