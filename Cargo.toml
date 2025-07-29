@@ -32,9 +32,11 @@ tokio = { version = "1.45.1", features = [
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }
-bon = "3.6.4"
+bon = "3.6.5"
 subtle = "2.6.1"
+axum-prometheus = "0.8.0"
 
 [dev-dependencies]
 axum-test = "17.3.0"
 futures-util = "0.3"
+rstest = "0.26.1"
