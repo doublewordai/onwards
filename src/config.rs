@@ -10,7 +10,7 @@ pub(crate) struct Config {
     #[arg(short = 'p', long, default_value_t = 3000)]
     pub(crate) port: u16,
 
-    /// The port on which the proxy server will listen.
+    /// The port on which the metrics server will listen.
     #[arg(long, default_value_t = 9090)]
     pub(crate) metrics_port: u16,
 
