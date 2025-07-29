@@ -18,7 +18,7 @@ use config::Config;
 use handlers::{models, target_message_handler};
 use target::{Targets, WatchedFile};
 use tokio::net::TcpListener;
-use tracing::{info, instrument};
+use tracing::{info, error, instrument};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppState<T: HttpClient> {
@@ -59,9 +59,11 @@ pub(crate) fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .with_state(state)
 }
 
+type MetricsHandle = axum_prometheus::metrics_exporter_prometheus::PrometheusHandle;
+
 /// Builds a router for the metrics endpoint.
 #[instrument(skip(handle))]
-pub(crate) fn build_metrics_router(handle: axum_prometheus::metrics_exporter_prometheus::PrometheusHandle) -> Router {
+pub(crate) fn build_metrics_router(handle: MetricsHandle) -> Router {
     info!("Building metrics router");
     Router::new().route(
         "/metrics",
@@ -69,8 +71,13 @@ pub(crate) fn build_metrics_router(handle: axum_prometheus::metrics_exporter_pro
     )
 }
 
+type MetricsLayerAndHandle = (
+    axum_prometheus::GenericMetricLayer<'static, MetricsHandle, Handle>,
+    MetricsHandle,
+);
+
 /// Builds a layer and handle for prometheus metrics collection.
-pub(crate) fn build_metrics_layer_and_handle(prefix: impl Into<Cow<'static, str>>) -> (axum_prometheus::GenericMetricLayer<'static, axum_prometheus::metrics_exporter_prometheus::PrometheusHandle, Handle>, axum_prometheus::metrics_exporter_prometheus::PrometheusHandle) {
+pub(crate) fn build_metrics_layer_and_handle(prefix: impl Into<Cow<'static, str>>) -> MetricsLayerAndHandle {
     info!("Building metrics layer");
     PrometheusMetricLayerBuilder::new()
         .with_prefix(prefix)
