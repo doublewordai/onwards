@@ -15,7 +15,7 @@ pub(crate) struct Config {
     pub(crate) metrics_port: u16,
 
     /// Whether to enable the metrics endpoint.
-    #[arg(short = 'm', long, default_value_t = false)]
+    #[arg(short = 'm', long, default_value_t = true)]
     pub(crate) metrics: bool,
 
     /// The file from which to read the targets.

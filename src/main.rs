@@ -17,8 +17,8 @@ use client::{HttpClient, HyperClient, create_hyper_client};
 use config::Config;
 use handlers::{models, target_message_handler};
 use target::{Targets, WatchedFile};
-use tokio::net::TcpListener;
-use tracing::{info, error, instrument};
+use tokio::{net::TcpListener, task::JoinSet};
+use tracing::{error, info, instrument};
 
 #[derive(Clone, Debug)]
 pub(crate) struct AppState<T: HttpClient> {
@@ -77,13 +77,15 @@ type MetricsLayerAndHandle = (
 );
 
 /// Builds a layer and handle for prometheus metrics collection.
-/// 
+///
 /// # Parameters
 /// - `prefix`: A string prefix for the metrics, which can be either a string literal or an owned string.
 ///   This parameter uses `impl Into<Cow<'static, str>>` to allow flexibility in passing either borrowed
 ///   or owned strings. The `'static` lifetime ensures that the prefix is valid for the entire duration
 ///   of the program, as required by the Prometheus metrics layer.
-pub(crate) fn build_metrics_layer_and_handle(prefix: impl Into<Cow<'static, str>>) -> MetricsLayerAndHandle {
+pub(crate) fn build_metrics_layer_and_handle(
+    prefix: impl Into<Cow<'static, str>>,
+) -> MetricsLayerAndHandle {
     info!("Building metrics layer");
     PrometheusMetricLayerBuilder::new()
         .with_prefix(prefix)
@@ -116,15 +118,16 @@ pub async fn main() -> anyhow::Result<()> {
         targets.receive_updates(WatchedFile(config.targets)).await?;
     }
 
-    let mut serves = vec![];
+    let mut serves = JoinSet::new();
     // If we are running with metrics enabled, set up the metrics layer and router.
     let prometheus_layer = if config.metrics {
-        let (prometheus_layer, prometheus_handle) = build_metrics_layer_and_handle(config.metrics_prefix);
+        let (prometheus_layer, prometheus_handle) =
+            build_metrics_layer_and_handle(config.metrics_prefix);
 
         let metrics_router = build_metrics_router(prometheus_handle);
         let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
         let listener = TcpListener::bind(&bind_addr).await?;
-        serves.push(axum::serve(listener, metrics_router).into_future());
+        serves.spawn(axum::serve(listener, metrics_router).into_future());
         info!("Metrics endpoint enabled on {}", bind_addr);
         Some(prometheus_layer)
     } else {
@@ -140,18 +143,16 @@ pub async fn main() -> anyhow::Result<()> {
     };
     let bind_addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
-    serves.push(axum::serve(listener, router).into_future());
+    serves.spawn(axum::serve(listener, router).into_future());
     info!("AI Gateway listening on {}", bind_addr);
 
-    let results = futures::future::join_all(serves).await;
-    for result in results {
-        if let Err(e) = result {
-            error!("Server failed: {}", e);
-            return Err(anyhow::anyhow!("One or more servers failed: {}", e));
-        }
+    // Wait for all servers to complete
+    if let Some(result) = serves.join_next().await {
+        result?.map_err(anyhow::Error::from)
+    } else {
+        error!("No server tasks were spawned");
+        Err(anyhow::anyhow!("No server tasks were spawned"))
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1839,19 +1840,19 @@ mod tests {
     }
 
     mod metrics {
-        use rstest::*;
         use super::*;
+        use rstest::*;
 
-        /// Fixture to create a shared metrics server and main server. 
-        /// The axum-prometheus library using a global Prometheus registry that maintains state across test executions within the same process. Even 
+        /// Fixture to create a shared metrics server and main server.
+        /// The axum-prometheus library using a global Prometheus registry that maintains state across test executions within the same process. Even
         /// with unique prefixes and serial execution, the library prevents creating multiple metric registries with overlapping metric names. So we
         /// use a shared metrics server for all metrics tests.
         #[fixture]
         #[once]
-        fn get_shared_metrics_servers(#[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, Target>>) -> (TestServer, TestServer) {
-            let targets = Targets {
-                targets,
-            };
+        fn get_shared_metrics_servers(
+            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, Target>>,
+        ) -> (TestServer, TestServer) {
+            let targets = Targets { targets };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
 
@@ -1865,18 +1866,17 @@ mod tests {
             (server, metrics_server)
         }
 
-
         #[rstest]
         #[tokio::test]
-        async fn test_metrics_server_for_v1_models(get_shared_metrics_servers: &(TestServer, TestServer)) {
+        async fn test_metrics_server_for_v1_models(
+            get_shared_metrics_servers: &(TestServer, TestServer),
+        ) {
             let (server, metrics_server) = get_shared_metrics_servers;
 
             // Get current metrics count before making requests
-            let initial_response = metrics_server
-                .get("/metrics")
-                .await;
+            let initial_response = metrics_server.get("/metrics").await;
             let initial_metrics = initial_response.text();
-            
+
             // Count existing v1/models requests (if any)
             let initial_count = initial_metrics
                 .lines()
@@ -1886,63 +1886,63 @@ mod tests {
                 .unwrap_or(0);
 
             // Make a request
-            let response = server
-                .get("/v1/models")
-                .await;
+            let response = server.get("/v1/models").await;
             assert_eq!(response.status_code(), 200);
 
             // Check metrics increased by 1
-            let response = metrics_server
-                .get("/metrics")
-                .await;
+            let response = metrics_server.get("/metrics").await;
             assert_eq!(response.status_code(), 200);
             let metrics_text = response.text();
-            
+
             let new_count = metrics_text
                 .lines()
                 .find(|line| line.contains("onwards_http_requests_total{method=\"GET\",status=\"200\",endpoint=\"/v1/models\"}"))
                 .and_then(|line| line.split_whitespace().last())
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0);
-            
-            assert_eq!(new_count, initial_count + 1, "Metrics should increment by 1");
+
+            assert_eq!(
+                new_count,
+                initial_count + 1,
+                "Metrics should increment by 1"
+            );
 
             // Make 10 more requests
             for _ in 0..10 {
-                let response = server
-                    .get("/v1/models")
-                    .await;
+                let response = server.get("/v1/models").await;
                 assert_eq!(response.status_code(), 200);
             }
 
             // Check metrics increased by 11 total
-            let response = metrics_server
-                .get("/metrics")
-                .await;
+            let response = metrics_server.get("/metrics").await;
             assert_eq!(response.status_code(), 200);
             let metrics_text = response.text();
-            
+
             let final_count = metrics_text
                 .lines()
                 .find(|line| line.contains("onwards_http_requests_total{method=\"GET\",status=\"200\",endpoint=\"/v1/models\"}"))
                 .and_then(|line| line.split_whitespace().last())
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0);
-            
-            assert_eq!(final_count, initial_count + 11, "Metrics should increment by 11 total");
+
+            assert_eq!(
+                final_count,
+                initial_count + 11,
+                "Metrics should increment by 11 total"
+            );
         }
 
         #[rstest]
         #[tokio::test]
-        async fn test_metrics_server_for_missing_targets(get_shared_metrics_servers: &(TestServer, TestServer)) {
+        async fn test_metrics_server_for_missing_targets(
+            get_shared_metrics_servers: &(TestServer, TestServer),
+        ) {
             let (server, metrics_server) = get_shared_metrics_servers;
 
             // Get current metrics count before making requests
-            let initial_response = metrics_server
-                .get("/metrics")
-                .await;
+            let initial_response = metrics_server.get("/metrics").await;
             let initial_metrics = initial_response.text();
-            
+
             // Count existing chat/completions 404 requests (if any)
             let initial_count = initial_metrics
                 .lines()
@@ -1960,21 +1960,23 @@ mod tests {
                 .await;
             assert_eq!(response.status_code(), 404);
 
-            let response = metrics_server
-                .get("/metrics")
-                .await;
+            let response = metrics_server.get("/metrics").await;
 
             assert_eq!(response.status_code(), 200);
             let metrics_text = response.text();
-            
+
             let new_count = metrics_text
                 .lines()
                 .find(|line| line.contains("onwards_http_requests_total{method=\"POST\",status=\"404\",endpoint=\"/v1/chat/completions\"}"))
                 .and_then(|line| line.split_whitespace().last())
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0);
-            
-            assert_eq!(new_count, initial_count + 1, "Metrics should increment by 1");
+
+            assert_eq!(
+                new_count,
+                initial_count + 1,
+                "Metrics should increment by 1"
+            );
 
             for _ in 0..10 {
                 let response = server
@@ -1987,20 +1989,22 @@ mod tests {
                 assert_eq!(response.status_code(), 404);
             }
 
-            let response = metrics_server
-                .get("/metrics")
-                .await;
+            let response = metrics_server.get("/metrics").await;
             assert_eq!(response.status_code(), 200);
             let metrics_text = response.text();
-            
+
             let final_count = metrics_text
                 .lines()
                 .find(|line| line.contains("onwards_http_requests_total{method=\"POST\",status=\"404\",endpoint=\"/v1/chat/completions\"}"))
                 .and_then(|line| line.split_whitespace().last())
                 .and_then(|s| s.parse::<i32>().ok())
                 .unwrap_or(0);
-            
-            assert_eq!(final_count, initial_count + 11, "Metrics should increment by 11 total");
+
+            assert_eq!(
+                final_count,
+                initial_count + 11,
+                "Metrics should increment by 11 total"
+            );
         }
     }
 }
