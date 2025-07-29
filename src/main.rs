@@ -5,11 +5,13 @@ mod handlers;
 mod models;
 mod target;
 
+use std::borrow::Cow;
+
 use axum::{
     Router,
     routing::{any, get},
 };
-use axum_prometheus::{Handle, MakeDefaultHandle, PrometheusMetricLayerBuilder};
+use axum_prometheus::{Handle, PrometheusMetricLayerBuilder};
 use clap::Parser as _;
 use client::{HttpClient, HyperClient, create_hyper_client};
 use config::Config;
@@ -45,6 +47,7 @@ impl<T: HttpClient> AppState<T> {
     }
 }
 
+/// Builds the main router for the application.
 #[instrument(skip(state))]
 pub(crate) fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
@@ -56,13 +59,25 @@ pub(crate) fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .with_state(state)
 }
 
-pub(crate) fn build_metrics_router() -> Router {
+/// Builds a router for the metrics endpoint.
+#[instrument(skip(handle))]
+pub(crate) fn build_metrics_router(handle: axum_prometheus::metrics_exporter_prometheus::PrometheusHandle) -> Router {
     info!("Building metrics router");
-    let handle = Handle::default().make_default_handle();
     Router::new().route(
         "/metrics",
         axum::routing::get(move || async move { handle.render() }),
     )
+}
+
+/// Builds a layer and handle for prometheus metrics collection.
+pub(crate) fn build_metrics_layer_and_handle(prefix: impl Into<Cow<'static, str>>) -> (axum_prometheus::GenericMetricLayer<'static, axum_prometheus::metrics_exporter_prometheus::PrometheusHandle, Handle>, axum_prometheus::metrics_exporter_prometheus::PrometheusHandle) {
+    info!("Building metrics layer");
+    PrometheusMetricLayerBuilder::new()
+        .with_prefix(prefix)
+        .enable_response_body_size(true)
+        .with_endpoint_label_type(axum_prometheus::EndpointLabel::Exact)
+        .with_default_metrics()
+        .build_pair()
 }
 
 #[tokio::main]
@@ -89,13 +104,11 @@ pub async fn main() -> anyhow::Result<()> {
     }
 
     let mut serves = vec![];
+    // If we are running with metrics enabled, set up the metrics layer and router.
     let prometheus_layer = if config.metrics {
-        let prometheus_layer = PrometheusMetricLayerBuilder::new()
-            .with_prefix("onwards")
-            .enable_response_body_size(true)
-            .build();
+        let (prometheus_layer, prometheus_handle) = build_metrics_layer_and_handle("onwards");
 
-        let metrics_router = build_metrics_router();
+        let metrics_router = build_metrics_router(prometheus_handle);
         let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
         let listener = TcpListener::bind(&bind_addr).await?;
         serves.push(axum::serve(listener, metrics_router).into_future());
@@ -108,6 +121,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let app_state = AppState::new(targets);
     let mut router = build_router(app_state);
+    // If we have a metrics layer, add it to the router.
     if let Some(prometheus_layer) = prometheus_layer {
         router = router.layer(prometheus_layer)
     };
@@ -1803,5 +1817,171 @@ mod tests {
 
         // Verify body is empty
         assert!(request.body.is_empty());
+    }
+
+    mod metrics {
+        use rstest::*;
+        use super::*;
+
+        /// Fixture to create a shared metrics server and main server. 
+        /// The axum-prometheus library using a global Prometheus registry that maintains state across test executions within the same process. Even 
+        /// with unique prefixes and serial execution, the library prevents creating multiple metric registries with overlapping metric names. So we
+        /// use a shared metrics server for all metrics tests.
+        #[fixture]
+        #[once]
+        fn get_shared_metrics_servers(#[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, Target>>) -> (TestServer, TestServer) {
+            let targets = Targets {
+                targets,
+            };
+
+            let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
+
+            let metrics_router = build_metrics_router(handle);
+            let metrics_server = TestServer::new(metrics_router).unwrap();
+
+            let app_state = AppState::new(targets);
+            let router = build_router(app_state).layer(prometheus_layer);
+            let server = TestServer::new(router).unwrap();
+
+            (server, metrics_server)
+        }
+
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_metrics_server_for_v1_models(get_shared_metrics_servers: &(TestServer, TestServer)) {
+            let (server, metrics_server) = get_shared_metrics_servers;
+
+            // Get current metrics count before making requests
+            let initial_response = metrics_server
+                .get("/metrics")
+                .await;
+            let initial_metrics = initial_response.text();
+            
+            // Count existing v1/models requests (if any)
+            let initial_count = initial_metrics
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"GET\",status=\"200\",endpoint=\"/v1/models\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+
+            // Make a request
+            let response = server
+                .get("/v1/models")
+                .await;
+            assert_eq!(response.status_code(), 200);
+
+            // Check metrics increased by 1
+            let response = metrics_server
+                .get("/metrics")
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let metrics_text = response.text();
+            
+            let new_count = metrics_text
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"GET\",status=\"200\",endpoint=\"/v1/models\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            
+            assert_eq!(new_count, initial_count + 1, "Metrics should increment by 1");
+
+            // Make 10 more requests
+            for _ in 0..10 {
+                let response = server
+                    .get("/v1/models")
+                    .await;
+                assert_eq!(response.status_code(), 200);
+            }
+
+            // Check metrics increased by 11 total
+            let response = metrics_server
+                .get("/metrics")
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let metrics_text = response.text();
+            
+            let final_count = metrics_text
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"GET\",status=\"200\",endpoint=\"/v1/models\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            
+            assert_eq!(final_count, initial_count + 11, "Metrics should increment by 11 total");
+        }
+
+        #[rstest]
+        #[tokio::test]
+        async fn test_metrics_server_for_missing_targets(get_shared_metrics_servers: &(TestServer, TestServer)) {
+            let (server, metrics_server) = get_shared_metrics_servers;
+
+            // Get current metrics count before making requests
+            let initial_response = metrics_server
+                .get("/metrics")
+                .await;
+            let initial_metrics = initial_response.text();
+            
+            // Count existing chat/completions 404 requests (if any)
+            let initial_count = initial_metrics
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"POST\",status=\"404\",endpoint=\"/v1/chat/completions\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "claude-3",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+            assert_eq!(response.status_code(), 404);
+
+            let response = metrics_server
+                .get("/metrics")
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            let metrics_text = response.text();
+            
+            let new_count = metrics_text
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"POST\",status=\"404\",endpoint=\"/v1/chat/completions\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            
+            assert_eq!(new_count, initial_count + 1, "Metrics should increment by 1");
+
+            for _ in 0..10 {
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model": "claude-3",
+                        "messages": [{"role": "user", "content": "Hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 404);
+            }
+
+            let response = metrics_server
+                .get("/metrics")
+                .await;
+            assert_eq!(response.status_code(), 200);
+            let metrics_text = response.text();
+            
+            let final_count = metrics_text
+                .lines()
+                .find(|line| line.contains("onwards_http_requests_total{method=\"POST\",status=\"404\",endpoint=\"/v1/chat/completions\"}"))
+                .and_then(|line| line.split_whitespace().last())
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0);
+            
+            assert_eq!(final_count, initial_count + 11, "Metrics should increment by 11 total");
+        }
     }
 }

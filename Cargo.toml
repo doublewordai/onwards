@@ -36,6 +36,7 @@ bon = "3.6.5"
 subtle = "2.6.1"
 axum-prometheus = "0.8.0"
 futures = "0.3.31"
+rstest = "0.26.1"
 
 [dev-dependencies]
 axum-test = "17.3.0"
