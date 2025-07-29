@@ -49,6 +49,9 @@ disable, set the `--watch` flag to false).
 - `--targets <file>`: Path to configuration file (required)
 - `--port <port>`: Port to listen on (default: 3000)
 - `--watch`: Enable configuration file watching for hot-reloading (default: true)
+- `--metrics`: Enable Prometheus metrics endpoint (default: false)
+- `--metrics-port <port>`: Port for Prometheus metrics (default: 9090)
+- `--metrics-prefix <prefix>`: Prefix for metrics (default: "onwards")
 
 ### API Usage
 
@@ -108,6 +111,14 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "model": "gpt-4",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
+```
+
+### Metrics
+
+To enable Prometheus metrics, start the gateway with the `--metrics` flag, then access the metrics endpoint by:
+
+```bash
+curl http://localhost:9090/metrics
 ```
 
 ## Authentication

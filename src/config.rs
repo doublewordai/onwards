@@ -25,6 +25,10 @@ pub(crate) struct Config {
     /// Whether we should continue watching the targets file for changes
     #[arg(short = 'w', long, default_value_t = true)]
     pub(crate) watch: bool,
+
+    /// The prefix to use for metrics.
+    #[arg(long, default_value = "onwards")]
+    pub(crate) metrics_prefix: String,
 }
 
 impl Config {
