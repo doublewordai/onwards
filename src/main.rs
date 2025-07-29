@@ -77,6 +77,12 @@ type MetricsLayerAndHandle = (
 );
 
 /// Builds a layer and handle for prometheus metrics collection.
+/// 
+/// # Parameters
+/// - `prefix`: A string prefix for the metrics, which can be either a string literal or an owned string.
+///   This parameter uses `impl Into<Cow<'static, str>>` to allow flexibility in passing either borrowed
+///   or owned strings. The `'static` lifetime ensures that the prefix is valid for the entire duration
+///   of the program, as required by the Prometheus metrics layer.
 pub(crate) fn build_metrics_layer_and_handle(prefix: impl Into<Cow<'static, str>>) -> MetricsLayerAndHandle {
     info!("Building metrics layer");
     PrometheusMetricLayerBuilder::new()
