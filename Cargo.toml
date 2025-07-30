@@ -10,6 +10,7 @@ async-trait = "0.1.88"
 axum = "0.8.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 dashmap = "6.1.0"
+futures-util = "0.3"
 hyper = "1.0"
 hyper-util = { version = "0.1.0", features = [
   "client",
@@ -29,6 +30,7 @@ tokio = { version = "1.45.1", features = [
   "sync",
   "time",
 ] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }

@@ -9,11 +9,13 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
 use dashmap::DashMap;
+use futures_util::{Stream, StreamExt};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tokio_stream::wrappers::{ReceiverStream, WatchStream};
+use tracing::{debug, error, info, trace};
 use url::Url;
 
 /// A target represents a destination for requests, specified by its URL.
@@ -26,11 +28,11 @@ use url::Url;
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
-pub(crate) struct Target {
-    pub(crate) url: Url,
-    pub(crate) keys: Option<KeySet>,
-    pub(crate) onwards_key: Option<String>,
-    pub(crate) onwards_model: Option<String>,
+pub struct Target {
+    pub url: Url,
+    pub keys: Option<KeySet>,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,34 +43,38 @@ pub struct Auth {
 
 /// The config file contains a map of target names to targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ConfigFile {
-    pub(crate) targets: HashMap<String, Target>,
-    pub(crate) auth: Option<Auth>,
+pub struct ConfigFile {
+    pub targets: HashMap<String, Target>,
+    pub auth: Option<Auth>,
 }
 
 /// The live-updating collection of targets.
 #[derive(Debug, Clone)]
-pub(crate) struct Targets {
-    pub(crate) targets: Arc<DashMap<String, Target>>,
+pub struct Targets {
+    pub targets: Arc<DashMap<String, Target>>,
 }
 
 #[async_trait]
 pub trait TargetsStream {
-    /// TODO(fergus): This would probably be nicer if the error were associated types and it
-    /// returned a Result<Box<dyn Stream<Item = Result<Targets, E>>, U> + Send>
-    async fn receive(
+    // TODO: Replace Into<anyhow::Error> with a custom error type using thiserror
+    type Error: Into<anyhow::Error> + Send + Sync + 'static;
+
+    /// Returns a stream of Targets updates
+    async fn stream(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error>;
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error>;
 }
 
 pub struct WatchedFile(pub PathBuf);
 
 #[async_trait]
 impl TargetsStream for WatchedFile {
+    type Error = anyhow::Error;
+
     /// Watches a file for changes and returns a stream of Targets updates.
-    async fn receive(
+    async fn stream(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error> {
         // TODO(fergus): think about buffers
         let (targets_tx, targets_rx) = mpsc::channel(100);
         let (file_tx, mut file_rx) = mpsc::channel(100);
@@ -122,12 +128,35 @@ impl TargetsStream for WatchedFile {
         // Keep the watcher alive
         std::mem::forget(watcher);
 
-        Ok(targets_rx)
+        Ok(Box::pin(ReceiverStream::new(targets_rx)))
+    }
+}
+
+/// A watch channel-based implementation of TargetsStream for receiving configuration updates
+pub struct WatchTargetsStream {
+    receiver: tokio::sync::watch::Receiver<Targets>,
+}
+
+impl WatchTargetsStream {
+    pub fn new(receiver: tokio::sync::watch::Receiver<Targets>) -> Self {
+        Self { receiver }
+    }
+}
+
+#[async_trait]
+impl TargetsStream for WatchTargetsStream {
+    type Error = std::convert::Infallible;
+
+    async fn stream(
+        &self,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error> {
+        let stream = WatchStream::from_changes(self.receiver.clone()).map(Ok);
+        Ok(Box::pin(stream))
     }
 }
 
 impl Targets {
-    pub(crate) async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
+    pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
             anyhow!(
                 "Failed to read config file {}: {}",
@@ -154,7 +183,7 @@ impl Targets {
         Ok(targets)
     }
 
-    pub(crate) fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
+    pub fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
         let global_keys = config_file
             .auth
             .take()
@@ -182,20 +211,22 @@ impl Targets {
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
-    pub(crate) async fn receive_updates<W: TargetsStream + Send + 'static>(
-        &self,
-        targets_stream: W,
-    ) -> Result<(), anyhow::Error> {
+    pub async fn receive_updates<W>(&self, targets_stream: W) -> Result<(), W::Error>
+    where
+        W: TargetsStream + Send + 'static,
+        W::Error: Into<anyhow::Error>,
+    {
         let targets = Arc::clone(&self.targets);
 
-        let mut rx = targets_stream.receive().await?;
+        let mut stream = targets_stream.stream().await?;
 
         // TODO(fergus): stash the handle to this thread somewhere
         tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
+            while let Some(result) = stream.next().await {
                 match result {
                     Ok(new_targets) => {
                         info!("Config file changed, updating targets...");
+                        trace!("{:?}", new_targets);
                         // Copy the new targets to our existing targets map
                         let current_keys: Vec<String> =
                             targets.iter().map(|entry| entry.key().clone()).collect();
@@ -216,7 +247,8 @@ impl Targets {
                         }
                     }
                     Err(e) => {
-                        error!("Failed to reload config: {}", e);
+                        let err: anyhow::Error = e.into();
+                        error!("Failed to reload config: {}", err);
                     }
                 }
             }
@@ -253,9 +285,14 @@ mod tests {
 
     #[async_trait]
     impl TargetsStream for MockConfigWatcher {
-        async fn receive(
+        type Error = anyhow::Error;
+
+        async fn stream(
             &self,
-        ) -> Result<mpsc::Receiver<Result<Targets, anyhow::Error>>, anyhow::Error> {
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<Targets, Self::Error>> + Send>>, Self::Error>
+        {
+            use tokio_stream::wrappers::ReceiverStream;
+
             let (tx, rx) = mpsc::channel(100);
 
             let configs = self.configs.clone();
@@ -270,7 +307,7 @@ mod tests {
                 }
             });
 
-            Ok(rx)
+            Ok(Box::pin(ReceiverStream::new(rx)))
         }
     }
 
