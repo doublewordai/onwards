@@ -3,7 +3,8 @@
 /// forward requests onto.
 use serde::{Deserialize, Serialize};
 
-use crate::target::{Target, Targets};
+use crate::target::Target;
+use std::collections::HashMap;
 
 /// Requests to the /v1/{*} endpoints get forwarded onto OpenAI compatible targets.
 /// The target is chosen based on the model specified in the request body.
@@ -51,12 +52,11 @@ pub(crate) struct ListModelResponse {
 }
 
 impl ListModelResponse {
-    /// Creates a new ListModelResponse from the given Targets.
-    pub(crate) fn from_targets(targets: &Targets) -> Self {
+    /// Creates a new ListModelResponse from a filtered HashMap of targets.
+    pub(crate) fn from_filtered_targets(targets: &HashMap<String, Target>) -> Self {
         let data = targets
-            .targets
             .iter()
-            .map(|item| Model::from_target(item.key(), item.value()))
+            .map(|(key, target)| Model::from_target(key, target))
             .collect::<Vec<_>>();
         ListModelResponse {
             object: "list".into(),
