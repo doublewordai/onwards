@@ -11,6 +11,7 @@ use axum::{
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
+    extract::Request,
 };
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
@@ -210,7 +211,42 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 }
 
-#[instrument(skip(state))]
-pub async fn models<T: HttpClient>(State(state): State<AppState<T>>) -> impl IntoResponse {
-    Json(ListModelResponse::from_targets(&state.targets))
+#[instrument(skip(state, req))]
+pub async fn models<T: HttpClient>(
+    State(state): State<AppState<T>>,
+    req: Request,
+) -> impl IntoResponse {
+    // Extract bearer token from Authorization header
+    let bearer_token = req
+        .headers()
+        .get("authorization")
+        .and_then(|auth_header| auth_header.to_str().ok())
+        .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
+
+    // Filter targets based on bearer token permissions
+    let accessible_targets = state
+        .targets
+        .targets
+        .iter()
+        .filter(|entry| {
+            let target = entry.value();
+            
+            // If target has no keys configured, it's publicly accessible
+            if target.keys.is_none() {
+                return true;
+            }
+            
+            // If target has keys but no bearer token provided, deny access
+            let Some(token) = bearer_token else {
+                return false;
+            };
+            
+            // Validate bearer token against target's keys
+            auth::validate_bearer_token(target.keys.as_ref().unwrap(), token)
+        })
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    // Create filtered response
+    Json(ListModelResponse::from_filtered_targets(&accessible_targets))
 }

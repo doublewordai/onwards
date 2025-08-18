@@ -566,6 +566,124 @@ mod tests {
         assert_eq!(requests.len(), 0);
     }
 
+    #[tokio::test]
+    async fn test_models_endpoint_filters_by_bearer_token() {
+        use crate::auth::ConstantTimeString;
+        use std::collections::HashSet;
+
+        // Create keys for different models
+        let mut gpt4_keys = HashSet::new();
+        gpt4_keys.insert(ConstantTimeString::from("gpt4-token".to_string()));
+        
+        let mut claude_keys = HashSet::new();
+        claude_keys.insert(ConstantTimeString::from("claude-token".to_string()));
+
+        // Create targets with different access keys
+        let targets_map = Arc::new(DashMap::new());
+        
+        // gpt-4: requires gpt4-token
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .keys(gpt4_keys)
+                .build(),
+        );
+        
+        // claude-3: requires claude-token
+        targets_map.insert(
+            "claude-3".to_string(),
+            Target::builder()
+                .url("https://api.anthropic.com".parse().unwrap())
+                .keys(claude_keys)
+                .build(),
+        );
+        
+        // gemini-pro: no keys required (public)
+        targets_map.insert(
+            "gemini-pro".to_string(),
+            Target::builder()
+                .url("https://api.google.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Test 1: No bearer token - should only see public models
+        let response = server.get("/v1/models").await;
+        assert_eq!(response.status_code(), 200);
+        
+        let response_body: serde_json::Value = response.json();
+        let models = response_body["data"].as_array().unwrap();
+        assert_eq!(models.len(), 1); // Only gemini-pro
+        
+        let model_ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert!(model_ids.contains(&"gemini-pro"));
+
+        // Test 2: Valid bearer token for gpt-4 - should see gpt-4 + public models
+        let response = server
+            .get("/v1/models")
+            .add_header("authorization", "Bearer gpt4-token")
+            .await;
+        assert_eq!(response.status_code(), 200);
+        
+        let response_body: serde_json::Value = response.json();
+        let models = response_body["data"].as_array().unwrap();
+        assert_eq!(models.len(), 2); // gpt-4 + gemini-pro
+        
+        let model_ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert!(model_ids.contains(&"gpt-4"));
+        assert!(model_ids.contains(&"gemini-pro"));
+
+        // Test 3: Valid bearer token for claude - should see claude + public models
+        let response = server
+            .get("/v1/models")
+            .add_header("authorization", "Bearer claude-token")
+            .await;
+        assert_eq!(response.status_code(), 200);
+        
+        let response_body: serde_json::Value = response.json();
+        let models = response_body["data"].as_array().unwrap();
+        assert_eq!(models.len(), 2); // claude-3 + gemini-pro
+        
+        let model_ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert!(model_ids.contains(&"claude-3"));
+        assert!(model_ids.contains(&"gemini-pro"));
+
+        // Test 4: Invalid bearer token - should only see public models
+        let response = server
+            .get("/v1/models")
+            .add_header("authorization", "Bearer invalid-token")
+            .await;
+        assert_eq!(response.status_code(), 200);
+        
+        let response_body: serde_json::Value = response.json();
+        let models = response_body["data"].as_array().unwrap();
+        assert_eq!(models.len(), 1); // Only gemini-pro
+        
+        let model_ids: Vec<&str> = models
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert!(model_ids.contains(&"gemini-pro"));
+    }
+
     mod metrics {
         use super::*;
         use axum_test::TestServer;
