@@ -16,7 +16,6 @@ use axum::{
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
 
-const ONWARD_MODEL_HEADER: &str = "onwards-model";
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
@@ -100,14 +99,9 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
-    // Users can specify the onwards value of the model field via a header, or it can be specified in the target
-    // config. If neither is supplied, its left as is.
-    if let Some(rewrite) = req
-        .headers()
-        .get(ONWARD_MODEL_HEADER)
-        .and_then(|x| x.to_str().ok())
-        .map(|x| x.to_owned())
-        .or(target.onwards_model.clone())
+    // Users can specify the onwards value of the model field in the target
+    // config. If not supplied, its left as is.
+    if let Some(rewrite) = target.onwards_model.clone()
         && !body_bytes.is_empty()
     {
         debug!("Rewriting model key to: {}", rewrite);
