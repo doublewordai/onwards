@@ -22,7 +22,7 @@ use url::Url;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitParameters {
     pub requests_per_second: NonZeroU32,
-    pub burst_size: NonZeroU32,
+    pub burst_size: Option<NonZeroU32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -43,7 +43,8 @@ impl From<TargetSpec> for Target {
             onwards_model: value.onwards_model,
             limiter: value.rate_limit.map(|rl| {
                 Arc::new(governor::RateLimiter::direct(
-                    Quota::per_second(rl.requests_per_second).allow_burst(rl.burst_size),
+                    Quota::per_second(rl.requests_per_second)
+                        .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
                 )) as Arc<dyn RateLimiter>
             }),
         }
