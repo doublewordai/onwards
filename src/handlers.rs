@@ -17,7 +17,6 @@ use axum::{
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
 
-
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
 #[instrument(skip(state, req))]

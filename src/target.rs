@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bon::Builder;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
-use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, Quota};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
@@ -42,11 +42,21 @@ impl From<TargetSpec> for Target {
             onwards_key: value.onwards_key,
             onwards_model: value.onwards_model,
             limiter: value.rate_limit.map(|rl| {
-                Arc::new(RateLimiter::direct(
+                Arc::new(governor::RateLimiter::direct(
                     Quota::per_second(rl.requests_per_second).allow_burst(rl.burst_size),
-                ))
+                )) as Arc<dyn RateLimiter>
             }),
         }
+    }
+}
+
+pub trait RateLimiter: std::fmt::Debug + Send + Sync {
+    fn check(&self) -> Result<(), ()>;
+}
+
+impl RateLimiter for DefaultDirectRateLimiter {
+    fn check(&self) -> Result<(), ()> {
+        self.check().map_err(|_| ())
     }
 }
 
@@ -65,7 +75,7 @@ pub struct Target {
     pub keys: Option<KeySet>,
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
-    pub limiter: Option<Arc<DefaultDirectRateLimiter>>,
+    pub limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +609,105 @@ mod tests {
                 .unwrap()
                 .contains(&ConstantTimeString::from("global-key-2".to_string()))
         );
+    }
+
+    #[test]
+    fn test_target_with_rate_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .rate_limit(RateLimitParameters {
+                    requests_per_second: NonZeroU32::new(10).unwrap(),
+                    burst_size: NonZeroU32::new(20).unwrap(),
+                })
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should have rate limiter configured
+        assert!(target.limiter.is_some());
+    }
+
+    #[test]
+    fn test_target_without_rate_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should not have rate limiter
+        assert!(target.limiter.is_none());
+    }
+
+    #[derive(Debug)]
+    struct MockRateLimiter {
+        should_allow: std::sync::Mutex<bool>,
+    }
+
+    impl MockRateLimiter {
+        fn new(should_allow: bool) -> Self {
+            Self {
+                should_allow: std::sync::Mutex::new(should_allow),
+            }
+        }
+
+        fn set_should_allow(&self, allow: bool) {
+            *self.should_allow.lock().unwrap() = allow;
+        }
+    }
+
+    impl RateLimiter for MockRateLimiter {
+        fn check(&self) -> Result<(), ()> {
+            if *self.should_allow.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_allows_requests() {
+        let limiter = MockRateLimiter::new(true);
+        assert!(limiter.check().is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_blocks_requests() {
+        let limiter = MockRateLimiter::new(false);
+        assert!(limiter.check().is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_can_change_state() {
+        let limiter = MockRateLimiter::new(true);
+        assert!(limiter.check().is_ok());
+
+        limiter.set_should_allow(false);
+        assert!(limiter.check().is_err());
+
+        limiter.set_should_allow(true);
+        assert!(limiter.check().is_ok());
     }
 
     #[test]
