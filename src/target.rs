@@ -621,7 +621,7 @@ mod tests {
                 .url("https://api.example.com".parse().unwrap())
                 .rate_limit(RateLimitParameters {
                     requests_per_second: NonZeroU32::new(10).unwrap(),
-                    burst_size: NonZeroU32::new(20).unwrap(),
+                    burst_size: Some(NonZeroU32::new(20).unwrap()),
                 })
                 .build(),
         );

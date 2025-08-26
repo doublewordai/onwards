@@ -98,21 +98,6 @@ curl -X GET http://localhost:3000/v1/organization/usage/embeddings \
   -H "model-override: claude-3"
 ```
 
-### Onwards Model Header
-
-Rewrite the model name in the request body using the `onwards-model` header
-(necessary for forwarding to openAI, for example):
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "onwards-model: gpt-4-turbo" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
 ### Metrics
 
 To enable Prometheus metrics, start the gateway with the `--metrics` flag, then access the metrics endpoint by:
