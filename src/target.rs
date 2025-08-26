@@ -27,12 +27,31 @@ use url::Url;
 /// A target can have a onwards_key and a onwards_model. The key is put into the Authorization:
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[derive(Debug, Clone, Builder)]
 pub struct Target {
     pub url: Url,
     pub keys: Option<KeySet>,
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct TargetSpec {
+    pub url: Url,
+    pub keys: Option<KeySet>,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
+}
+
+impl From<TargetSpec> for Target {
+    fn from(value: TargetSpec) -> Self {
+        Target {
+            url: value.url,
+            keys: value.keys,
+            onwards_key: value.onwards_key,
+            onwards_model: value.onwards_model,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +63,7 @@ pub struct Auth {
 /// The config file contains a map of target names to targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
-    pub targets: HashMap<String, Target>,
+    pub targets: HashMap<String, TargetSpec>,
     pub auth: Option<Auth>,
 }
 
@@ -192,19 +211,19 @@ impl Targets {
         debug!("{} global keys configured", global_keys.len());
 
         let targets = Arc::new(DashMap::new());
-        for (name, mut target) in config_file.targets {
-            if let Some(ref mut keys) = target.keys {
+        for (name, mut target_spec) in config_file.targets {
+            if let Some(ref mut keys) = target_spec.keys {
                 debug!(
                     "Target {}:{:?} has {} keys configured",
-                    target.url,
-                    target.onwards_model,
+                    target_spec.url,
+                    target_spec.onwards_model,
                     keys.len()
                 );
                 keys.extend(global_keys.clone());
             } else if !global_keys.is_empty() {
-                target.keys = Some(global_keys.clone());
+                target_spec.keys = Some(global_keys.clone());
             }
-            targets.insert(name, target);
+            targets.insert(name, target_spec.into());
         }
 
         Ok(Targets { targets })
@@ -473,7 +492,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .keys(target_keys)
@@ -536,7 +555,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .build(),
@@ -577,7 +596,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "model-with-keys".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .keys(target_keys)
@@ -585,7 +604,7 @@ mod tests {
         );
         targets.insert(
             "model-without-keys".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .build(),

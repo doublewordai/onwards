@@ -574,13 +574,13 @@ mod tests {
         // Create keys for different models
         let mut gpt4_keys = HashSet::new();
         gpt4_keys.insert(ConstantTimeString::from("gpt4-token".to_string()));
-        
+
         let mut claude_keys = HashSet::new();
         claude_keys.insert(ConstantTimeString::from("claude-token".to_string()));
 
         // Create targets with different access keys
         let targets_map = Arc::new(DashMap::new());
-        
+
         // gpt-4: requires gpt4-token
         targets_map.insert(
             "gpt-4".to_string(),
@@ -589,7 +589,7 @@ mod tests {
                 .keys(gpt4_keys)
                 .build(),
         );
-        
+
         // claude-3: requires claude-token
         targets_map.insert(
             "claude-3".to_string(),
@@ -598,7 +598,7 @@ mod tests {
                 .keys(claude_keys)
                 .build(),
         );
-        
+
         // gemini-pro: no keys required (public)
         targets_map.insert(
             "gemini-pro".to_string(),
@@ -619,11 +619,11 @@ mod tests {
         // Test 1: No bearer token - should only see public models
         let response = server.get("/v1/models").await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 1); // Only gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -636,11 +636,11 @@ mod tests {
             .add_header("authorization", "Bearer gpt4-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 2); // gpt-4 + gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -654,11 +654,11 @@ mod tests {
             .add_header("authorization", "Bearer claude-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 2); // claude-3 + gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -672,11 +672,11 @@ mod tests {
             .add_header("authorization", "Bearer invalid-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 1); // Only gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())

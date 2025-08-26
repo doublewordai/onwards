@@ -5,13 +5,13 @@ use crate::client::HttpClient;
 use crate::models::ListModelResponse;
 use axum::{
     Json,
+    extract::Request,
     extract::State,
     http::{
         StatusCode, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
-    extract::Request,
 };
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
@@ -230,17 +230,17 @@ pub async fn models<T: HttpClient>(
         .iter()
         .filter(|entry| {
             let target = entry.value();
-            
+
             // If target has no keys configured, it's publicly accessible
             if target.keys.is_none() {
                 return true;
             }
-            
+
             // If target has keys but no bearer token provided, deny access
             let Some(token) = bearer_token else {
                 return false;
             };
-            
+
             // Validate bearer token against target's keys
             auth::validate_bearer_token(target.keys.as_ref().unwrap(), token)
         })
@@ -248,5 +248,7 @@ pub async fn models<T: HttpClient>(
         .collect::<std::collections::HashMap<_, _>>();
 
     // Create filtered response
-    Json(ListModelResponse::from_filtered_targets(&accessible_targets))
+    Json(ListModelResponse::from_filtered_targets(
+        &accessible_targets,
+    ))
 }
