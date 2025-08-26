@@ -10,13 +10,45 @@ use async_trait::async_trait;
 use bon::Builder;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info, trace};
 use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitParameters {
+    pub requests_per_second: NonZeroU32,
+    pub burst_size: NonZeroU32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct TargetSpec {
+    pub url: Url,
+    pub keys: Option<KeySet>,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
+    pub rate_limit: Option<RateLimitParameters>,
+}
+
+impl From<TargetSpec> for Target {
+    fn from(value: TargetSpec) -> Self {
+        Target {
+            url: value.url,
+            keys: value.keys,
+            onwards_key: value.onwards_key,
+            onwards_model: value.onwards_model,
+            limiter: value.rate_limit.map(|rl| {
+                Arc::new(RateLimiter::direct(
+                    Quota::per_second(rl.requests_per_second).allow_burst(rl.burst_size),
+                ))
+            }),
+        }
+    }
+}
 
 /// A target represents a destination for requests, specified by its URL.
 ///
@@ -33,25 +65,7 @@ pub struct Target {
     pub keys: Option<KeySet>,
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
-pub struct TargetSpec {
-    pub url: Url,
-    pub keys: Option<KeySet>,
-    pub onwards_key: Option<String>,
-    pub onwards_model: Option<String>,
-}
-
-impl From<TargetSpec> for Target {
-    fn from(value: TargetSpec) -> Self {
-        Target {
-            url: value.url,
-            keys: value.keys,
-            onwards_key: value.onwards_key,
-            onwards_model: value.onwards_model,
-        }
-    }
+    pub limiter: Option<Arc<DefaultDirectRateLimiter>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

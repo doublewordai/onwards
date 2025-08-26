@@ -76,6 +76,12 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
+    if let Some(ref limiter) = target.limiter {
+        if limiter.check().is_err() {
+            return Err(OnwardsErrorResponse::rate_limited());
+        }
+    }
+
     // Validate API key if target has keys configured
     if let Some(ref keys) = target.keys {
         let bearer_token = req
