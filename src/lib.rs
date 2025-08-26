@@ -15,6 +15,7 @@ use tracing::{info, instrument};
 
 pub mod auth;
 pub mod client;
+pub mod errors;
 pub mod handlers;
 pub mod models;
 pub mod target;
