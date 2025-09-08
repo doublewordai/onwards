@@ -10,13 +10,56 @@ use async_trait::async_trait;
 use bon::Builder;
 use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
+use governor::{DefaultDirectRateLimiter, Quota};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::PathBuf, pin::Pin, sync::Arc};
+use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info, trace};
 use url::Url;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitParameters {
+    pub requests_per_second: NonZeroU32,
+    pub burst_size: Option<NonZeroU32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct TargetSpec {
+    pub url: Url,
+    pub keys: Option<KeySet>,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
+    pub rate_limit: Option<RateLimitParameters>,
+}
+
+impl From<TargetSpec> for Target {
+    fn from(value: TargetSpec) -> Self {
+        Target {
+            url: value.url,
+            keys: value.keys,
+            onwards_key: value.onwards_key,
+            onwards_model: value.onwards_model,
+            limiter: value.rate_limit.map(|rl| {
+                Arc::new(governor::RateLimiter::direct(
+                    Quota::per_second(rl.requests_per_second)
+                        .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
+                )) as Arc<dyn RateLimiter>
+            }),
+        }
+    }
+}
+
+pub trait RateLimiter: std::fmt::Debug + Send + Sync {
+    fn check(&self) -> Result<(), ()>;
+}
+
+impl RateLimiter for DefaultDirectRateLimiter {
+    fn check(&self) -> Result<(), ()> {
+        self.check().map_err(|_| ())
+    }
+}
 
 /// A target represents a destination for requests, specified by its URL.
 ///
@@ -27,12 +70,13 @@ use url::Url;
 /// A target can have a onwards_key and a onwards_model. The key is put into the Authorization:
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
-#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+#[derive(Debug, Clone, Builder)]
 pub struct Target {
     pub url: Url,
     pub keys: Option<KeySet>,
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
+    pub limiter: Option<Arc<dyn RateLimiter>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +88,7 @@ pub struct Auth {
 /// The config file contains a map of target names to targets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
-    pub targets: HashMap<String, Target>,
+    pub targets: HashMap<String, TargetSpec>,
     pub auth: Option<Auth>,
 }
 
@@ -192,19 +236,19 @@ impl Targets {
         debug!("{} global keys configured", global_keys.len());
 
         let targets = Arc::new(DashMap::new());
-        for (name, mut target) in config_file.targets {
-            if let Some(ref mut keys) = target.keys {
+        for (name, mut target_spec) in config_file.targets {
+            if let Some(ref mut keys) = target_spec.keys {
                 debug!(
                     "Target {}:{:?} has {} keys configured",
-                    target.url,
-                    target.onwards_model,
+                    target_spec.url,
+                    target_spec.onwards_model,
                     keys.len()
                 );
                 keys.extend(global_keys.clone());
             } else if !global_keys.is_empty() {
-                target.keys = Some(global_keys.clone());
+                target_spec.keys = Some(global_keys.clone());
             }
-            targets.insert(name, target);
+            targets.insert(name, target_spec.into());
         }
 
         Ok(Targets { targets })
@@ -473,7 +517,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .keys(target_keys)
@@ -536,7 +580,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .build(),
@@ -569,6 +613,105 @@ mod tests {
     }
 
     #[test]
+    fn test_target_with_rate_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .rate_limit(RateLimitParameters {
+                    requests_per_second: NonZeroU32::new(10).unwrap(),
+                    burst_size: Some(NonZeroU32::new(20).unwrap()),
+                })
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should have rate limiter configured
+        assert!(target.limiter.is_some());
+    }
+
+    #[test]
+    fn test_target_without_rate_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should not have rate limiter
+        assert!(target.limiter.is_none());
+    }
+
+    #[derive(Debug)]
+    struct MockRateLimiter {
+        should_allow: std::sync::Mutex<bool>,
+    }
+
+    impl MockRateLimiter {
+        fn new(should_allow: bool) -> Self {
+            Self {
+                should_allow: std::sync::Mutex::new(should_allow),
+            }
+        }
+
+        fn set_should_allow(&self, allow: bool) {
+            *self.should_allow.lock().unwrap() = allow;
+        }
+    }
+
+    impl RateLimiter for MockRateLimiter {
+        fn check(&self) -> Result<(), ()> {
+            if *self.should_allow.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_allows_requests() {
+        let limiter = MockRateLimiter::new(true);
+        assert!(limiter.check().is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_blocks_requests() {
+        let limiter = MockRateLimiter::new(false);
+        assert!(limiter.check().is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_trait_can_change_state() {
+        let limiter = MockRateLimiter::new(true);
+        assert!(limiter.check().is_ok());
+
+        limiter.set_should_allow(false);
+        assert!(limiter.check().is_err());
+
+        limiter.set_should_allow(true);
+        assert!(limiter.check().is_ok());
+    }
+
+    #[test]
     fn test_from_config_no_global_keys() {
         let mut target_keys = HashSet::new();
         target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
@@ -577,7 +720,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "model-with-keys".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .keys(target_keys)
@@ -585,7 +728,7 @@ mod tests {
         );
         targets.insert(
             "model-without-keys".to_string(),
-            Target::builder()
+            TargetSpec::builder()
                 .url("https://api.example.com".parse().unwrap())
                 .onwards_key("test-key".to_string())
                 .build(),

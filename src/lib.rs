@@ -15,6 +15,7 @@ use tracing::{info, instrument};
 
 pub mod auth;
 pub mod client;
+pub mod errors;
 pub mod handlers;
 pub mod models;
 pub mod target;
@@ -574,13 +575,13 @@ mod tests {
         // Create keys for different models
         let mut gpt4_keys = HashSet::new();
         gpt4_keys.insert(ConstantTimeString::from("gpt4-token".to_string()));
-        
+
         let mut claude_keys = HashSet::new();
         claude_keys.insert(ConstantTimeString::from("claude-token".to_string()));
 
         // Create targets with different access keys
         let targets_map = Arc::new(DashMap::new());
-        
+
         // gpt-4: requires gpt4-token
         targets_map.insert(
             "gpt-4".to_string(),
@@ -589,7 +590,7 @@ mod tests {
                 .keys(gpt4_keys)
                 .build(),
         );
-        
+
         // claude-3: requires claude-token
         targets_map.insert(
             "claude-3".to_string(),
@@ -598,7 +599,7 @@ mod tests {
                 .keys(claude_keys)
                 .build(),
         );
-        
+
         // gemini-pro: no keys required (public)
         targets_map.insert(
             "gemini-pro".to_string(),
@@ -619,11 +620,11 @@ mod tests {
         // Test 1: No bearer token - should only see public models
         let response = server.get("/v1/models").await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 1); // Only gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -636,11 +637,11 @@ mod tests {
             .add_header("authorization", "Bearer gpt4-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 2); // gpt-4 + gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -654,11 +655,11 @@ mod tests {
             .add_header("authorization", "Bearer claude-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 2); // claude-3 + gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
@@ -672,16 +673,218 @@ mod tests {
             .add_header("authorization", "Bearer invalid-token")
             .await;
         assert_eq!(response.status_code(), 200);
-        
+
         let response_body: serde_json::Value = response.json();
         let models = response_body["data"].as_array().unwrap();
         assert_eq!(models.len(), 1); // Only gemini-pro
-        
+
         let model_ids: Vec<&str> = models
             .iter()
             .map(|model| model["id"].as_str().unwrap())
             .collect();
         assert!(model_ids.contains(&"gemini-pro"));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_blocks_requests() {
+        use crate::target::{RateLimiter, Target, Targets};
+        use std::sync::Arc;
+
+        // Create a mock rate limiter that blocks requests
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), ()> {
+                Err(()) // Always block
+            }
+        }
+
+        // Create a target with a blocking rate limiter
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "rate-limited-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Make a request to the rate-limited model
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        // Should get 429 Too Many Requests
+        assert_eq!(response.status_code(), 429);
+
+        // Should return proper error structure
+        let response_body: serde_json::Value = response.json();
+        assert_eq!(response_body["type"], "rate_limit_error");
+        assert_eq!(response_body["code"], "rate_limit");
+
+        // Verify no request was made to the upstream (since it was rate limited)
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_allows_requests() {
+        use crate::target::{RateLimiter, Target, Targets};
+        use std::sync::Arc;
+
+        // Create a mock rate limiter that allows requests
+        #[derive(Debug)]
+        struct AllowingRateLimiter;
+
+        impl RateLimiter for AllowingRateLimiter {
+            fn check(&self) -> Result<(), ()> {
+                Ok(()) // Always allow
+            }
+        }
+
+        // Create a target with an allowing rate limiter
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "rate-limited-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Make a request to the rate-limited model
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "rate-limited-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        // Should get 200 OK since rate limiter allows it
+        assert_eq!(response.status_code(), 200);
+
+        // Verify request was made to the upstream
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].uri.contains("api.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiting_with_mixed_targets() {
+        use crate::target::{RateLimiter, Target, Targets};
+        use std::sync::Arc;
+
+        // Create different rate limiters
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), ()> {
+                Err(())
+            }
+        }
+
+        #[derive(Debug)]
+        struct AllowingRateLimiter;
+        impl RateLimiter for AllowingRateLimiter {
+            fn check(&self) -> Result<(), ()> {
+                Ok(())
+            }
+        }
+
+        // Create targets with different rate limiting behavior
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "blocked-model".to_string(),
+            Target::builder()
+                .url("https://blocked.example.com".parse().unwrap())
+                .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                .build(),
+        );
+        targets_map.insert(
+            "allowed-model".to_string(),
+            Target::builder()
+                .url("https://allowed.example.com".parse().unwrap())
+                .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
+                .build(),
+        );
+        targets_map.insert(
+            "unlimited-model".to_string(),
+            Target::builder()
+                .url("https://unlimited.example.com".parse().unwrap())
+                .build(), // No rate limiter
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Test blocked model - should get 429
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "blocked-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 429);
+
+        // Test allowed model - should get 200
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "allowed-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        // Test unlimited model - should get 200
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "unlimited-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        // Verify only allowed and unlimited models made upstream requests
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+
+        let urls: Vec<&str> = requests.iter().map(|r| r.uri.as_str()).collect();
+        assert!(urls.contains(&"https://allowed.example.com/v1/chat/completions"));
+        assert!(urls.contains(&"https://unlimited.example.com/v1/chat/completions"));
+        assert!(!urls.iter().any(|&url| url.contains("blocked.example.com")));
     }
 
     mod metrics {
