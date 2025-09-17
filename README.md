@@ -98,21 +98,6 @@ curl -X GET http://localhost:3000/v1/organization/usage/embeddings \
   -H "model-override: claude-3"
 ```
 
-### Onwards Model Header
-
-Rewrite the model name in the request body using the `onwards-model` header
-(necessary for forwarding to openAI, for example):
-
-```bash
-curl -X POST http://localhost:3000/v1/chat/completions \
-  -H "onwards-model: gpt-4-turbo" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-4",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
 ### Metrics
 
 To enable Prometheus metrics, start the gateway with the `--metrics` flag, then access the metrics endpoint by:
@@ -222,6 +207,57 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   }'
 # Success - no authentication required for this target
 ```
+
+## Rate Limiting
+
+Onwards supports per-target rate limiting using a token bucket algorithm. This
+allows you to control the request rate to each AI provider independently.
+
+### Configuration
+
+Add rate limiting to any target in your `config.json`:
+
+```json
+{
+  "targets": {
+    "rate-limited-model": {
+      "url": "https://api.provider.com",
+      "key": "your-api-key",
+      "rate_limit": {
+        "requests_per_second": 5.0,
+        "burst_size": 10
+      }
+    }
+  }
+}
+```
+
+### How It Works
+
+We use a "Token Bucket Algorithm": Each target gets its own token bucket.Tokens
+are refilled at a rate determined by the "requests_per_second" parameter. The
+maximum number of tokens in the bucket is determined by the "burst_size"
+parameter. When the bucket is empty, requests to that target will be rejected
+with a `429 Too Many Requests` response.
+
+### Examples
+
+```json
+// Allow 1 request per second with burst of 5
+"rate_limit": {
+  "requests_per_second": 1.0,
+  "burst_size": 5
+}
+
+// Allow 100 requests per second with burst of 200  
+"rate_limit": {
+  "requests_per_second": 100.0,
+  "burst_size": 200
+}
+```
+
+Rate limiting is optional - targets without `rate_limit` configuration have no
+rate limiting applied.
 
 ## Testing
 
