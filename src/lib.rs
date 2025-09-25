@@ -11,6 +11,7 @@ use axum_prometheus::{
     metrics_exporter_prometheus::PrometheusHandle,
 };
 use std::borrow::Cow;
+use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub mod auth;
@@ -24,11 +25,30 @@ use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 
+/// Type alias for body transformation function
+/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation
+pub type BodyTransformFn =
+    Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
+
 /// The main application state containing the HTTP client and targets configuration
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
+    pub body_transform_fn: Option<BodyTransformFn>,
+}
+
+impl<T: HttpClient> std::fmt::Debug for AppState<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("http_client", &self.http_client)
+            .field("targets", &self.targets)
+            .field(
+                "body_transform_fn",
+                &self.body_transform_fn.as_ref().map(|_| "<function>"),
+            )
+            .finish()
+    }
 }
 
 impl AppState<HyperClient> {
@@ -38,6 +58,17 @@ impl AppState<HyperClient> {
         Self {
             http_client,
             targets,
+            body_transform_fn: None,
+        }
+    }
+
+    /// Create a new AppState with the default Hyper client and a body transformation function
+    pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
+        let http_client = client::create_hyper_client();
+        Self {
+            http_client,
+            targets,
+            body_transform_fn: Some(body_transform_fn),
         }
     }
 }
@@ -48,6 +79,20 @@ impl<T: HttpClient> AppState<T> {
         Self {
             http_client,
             targets,
+            body_transform_fn: None,
+        }
+    }
+
+    /// Create a new AppState with a custom HTTP client and body transformation function
+    pub fn with_client_and_transform(
+        targets: target::Targets,
+        http_client: T,
+        body_transform_fn: BodyTransformFn,
+    ) -> Self {
+        Self {
+            http_client,
+            targets,
+            body_transform_fn: Some(body_transform_fn),
         }
     }
 }
@@ -1060,5 +1105,360 @@ mod tests {
                 "Metrics should increment by 11 total"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_body_transformation_applied() {
+        use serde_json::json;
+
+        // Create a simple target
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        // Create a body transformation function that adds a "transformed": true field
+        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
+            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                if let Some(obj) = json_body.as_object_mut() {
+                    obj.insert("transformed".to_string(), json!(true));
+                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                        return Some(axum::body::Bytes::from(transformed_bytes));
+                    }
+                }
+            }
+            None
+        });
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state =
+            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Make a request
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Check that the request was transformed before forwarding
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_body["transformed"], true);
+        assert_eq!(forwarded_body["model"], "test-model");
+        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_body_transformation_not_applied_when_none() {
+        use serde_json::json;
+
+        // Create a simple target
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone()); // No transform function
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Make a request
+        let original_body = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&original_body)
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Check that the request was NOT transformed
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(!forwarded_body.get("transformed").is_some());
+        assert_eq!(forwarded_body["model"], "test-model");
+        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_body_transformation_returns_none() {
+        use serde_json::json;
+
+        // Create a simple target
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        // Create a transformation function that always returns None (no transformation)
+        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, _body_bytes| None);
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state =
+            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Make a request
+        let original_body = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&original_body)
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Check that the request was NOT transformed since function returned None
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_body, original_body);
+    }
+
+    #[tokio::test]
+    async fn test_openai_streaming_include_usage_transformation() {
+        use serde_json::json;
+
+        // Create a target for OpenAI
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        // Create a transformation function that forces include_usage for streaming requests
+        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
+            // Only transform requests to OpenAI chat completions endpoint
+            if path == "/v1/chat/completions" {
+                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                    if let Some(obj) = json_body.as_object_mut() {
+                        // Check if this is a streaming request
+                        if let Some(stream) = obj.get("stream") {
+                            if stream.as_bool() == Some(true) {
+                                // Force include_usage to true for streaming requests
+                                obj.insert(
+                                    "stream_options".to_string(),
+                                    json!({
+                                        "include_usage": true
+                                    }),
+                                );
+
+                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                                    return Some(axum::body::Bytes::from(transformed_bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state =
+            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Test streaming request - should add include_usage
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": true
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_body["model"], "gpt-4");
+        assert_eq!(forwarded_body["stream"], true);
+        assert_eq!(forwarded_body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn test_openai_non_streaming_not_transformed() {
+        use serde_json::json;
+
+        // Create a target for OpenAI
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        // Create the same transformation function
+        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
+            if path == "/v1/chat/completions" {
+                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                    if let Some(obj) = json_body.as_object_mut() {
+                        if let Some(stream) = obj.get("stream") {
+                            if stream.as_bool() == Some(true) {
+                                obj.insert(
+                                    "stream_options".to_string(),
+                                    json!({
+                                        "include_usage": true
+                                    }),
+                                );
+
+                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                                    return Some(axum::body::Bytes::from(transformed_bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state =
+            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Test non-streaming request - should NOT be transformed
+        let original_body = json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        });
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&original_body)
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_body, original_body);
+        assert!(!forwarded_body.get("stream_options").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_transformation_path_filtering() {
+        use serde_json::json;
+
+        // Create a target
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+        };
+
+        // Create a transformation function that only transforms specific paths
+        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
+            if path == "/v1/chat/completions" {
+                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                    if let Some(obj) = json_body.as_object_mut() {
+                        obj.insert("path_transformed".to_string(), json!(path));
+                        if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                            return Some(axum::body::Bytes::from(transformed_bytes));
+                        }
+                    }
+                }
+            }
+            None
+        });
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state =
+            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Test matching path - should be transformed
+        let response1 = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "test-model", "test": "data"}))
+            .await;
+        assert_eq!(response1.status_code(), 200);
+
+        // Test non-matching path - should NOT be transformed
+        let response2 = server
+            .post("/v1/embeddings")
+            .json(&json!({"model": "test-model", "test": "data"}))
+            .await;
+        assert_eq!(response2.status_code(), 200);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+
+        // First request should be transformed
+        let forwarded_body1: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_body1["path_transformed"], "/v1/chat/completions");
+
+        // Second request should NOT be transformed
+        let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert!(!forwarded_body2.get("path_transformed").is_some());
     }
 }
