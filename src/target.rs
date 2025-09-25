@@ -85,7 +85,7 @@ pub struct KeyDefinition {
     pub rate_limit: Option<RateLimitParameters>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct Auth {
     /// global keys are merged with the per-target keys.
     global_keys: KeySet,
