@@ -80,9 +80,17 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyDefinition {
+    pub key: String,
+    pub rate_limit: Option<RateLimitParameters>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Auth {
     /// global keys are merged with the per-target keys.
     global_keys: KeySet,
+    /// key definitions with their actual keys and per-key rate limits
+    pub key_definitions: Option<HashMap<String, KeyDefinition>>,
 }
 
 /// The config file contains a map of target names to targets.
@@ -96,6 +104,8 @@ pub struct ConfigFile {
 #[derive(Debug, Clone)]
 pub struct Targets {
     pub targets: Arc<DashMap<String, Target>>,
+    /// Direct rate limiters per actual API key (actual key -> rate limiter)
+    pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
 }
 
 #[async_trait]
@@ -228,12 +238,30 @@ impl Targets {
     }
 
     pub fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
-        let global_keys = config_file
+        let (global_keys, key_definitions) = config_file
             .auth
             .take()
-            .map(|x| x.global_keys)
+            .map(|auth| (auth.global_keys, auth.key_definitions.unwrap_or_default()))
             .unwrap_or_default();
         debug!("{} global keys configured", global_keys.len());
+        debug!("{} key definitions configured", key_definitions.len());
+
+        // Set up rate limiters keyed by actual API keys
+        let key_rate_limiters = Arc::new(DashMap::new());
+
+        for (_key_id, key_def) in key_definitions {
+            if let Some(ref rate_limit) = key_def.rate_limit {
+                let limiter = Arc::new(governor::RateLimiter::direct(
+                    Quota::per_second(rate_limit.requests_per_second).allow_burst(
+                        rate_limit
+                            .burst_size
+                            .unwrap_or(rate_limit.requests_per_second),
+                    ),
+                ));
+                // Map the actual API key to its rate limiter
+                key_rate_limiters.insert(key_def.key, limiter);
+            }
+        }
 
         let targets = Arc::new(DashMap::new());
         for (name, mut target_spec) in config_file.targets {
@@ -251,7 +279,10 @@ impl Targets {
             targets.insert(name, target_spec.into());
         }
 
-        Ok(Targets { targets })
+        Ok(Targets {
+            targets,
+            key_rate_limiters,
+        })
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
@@ -261,6 +292,7 @@ impl Targets {
         W::Error: Into<anyhow::Error>,
     {
         let targets = Arc::clone(&self.targets);
+        let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
 
         let mut stream = targets_stream.stream().await?;
 
@@ -271,15 +303,16 @@ impl Targets {
                     Ok(new_targets) => {
                         info!("Config file changed, updating targets...");
                         trace!("{:?}", new_targets);
-                        // Copy the new targets to our existing targets map
-                        let current_keys: Vec<String> =
+
+                        // Update targets atomically
+                        let current_target_keys: Vec<String> =
                             targets.iter().map(|entry| entry.key().clone()).collect();
 
                         // Do it like this for atomicity (if you delete and recreate, there's a
                         // moment with no targets during which requests can fail)
 
                         // Remove deleted targets
-                        for key in current_keys {
+                        for key in current_target_keys {
                             if !new_targets.targets.contains_key(&key) {
                                 targets.remove(&key);
                             }
@@ -288,6 +321,24 @@ impl Targets {
                         // Insert/update targets
                         for entry in new_targets.targets.iter() {
                             targets.insert(entry.key().clone(), entry.value().clone());
+                        }
+
+                        // Update key rate limiters atomically (same pattern)
+                        let current_rate_limiter_keys: Vec<String> = key_rate_limiters
+                            .iter()
+                            .map(|entry| entry.key().clone())
+                            .collect();
+
+                        // Remove deleted rate limiters
+                        for key in current_rate_limiter_keys {
+                            if !new_targets.key_rate_limiters.contains_key(&key) {
+                                key_rate_limiters.remove(&key);
+                            }
+                        }
+
+                        // Insert/update key rate limiters
+                        for entry in new_targets.key_rate_limiters.iter() {
+                            key_rate_limiters.insert(entry.key().clone(), entry.value().clone());
                         }
                     }
                     Err(e) => {
@@ -368,6 +419,7 @@ mod tests {
         }
         Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         }
     }
 
@@ -426,6 +478,7 @@ mod tests {
         // Create initial empty targets
         let targets = Targets {
             targets: Arc::new(DashMap::new()),
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create sequence of target updates
@@ -485,6 +538,7 @@ mod tests {
         );
         let updated_targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -526,7 +580,10 @@ mod tests {
 
         let config_file = ConfigFile {
             targets,
-            auth: Some(Auth { global_keys }),
+            auth: Some(Auth {
+                global_keys,
+                key_definitions: None,
+            }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -588,7 +645,10 @@ mod tests {
 
         let config_file = ConfigFile {
             targets,
-            auth: Some(Auth { global_keys }),
+            auth: Some(Auth {
+                global_keys,
+                key_definitions: None,
+            }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -709,6 +769,85 @@ mod tests {
 
         limiter.set_should_allow(true);
         assert!(limiter.check().is_ok());
+    }
+
+    #[test]
+    fn test_per_key_rate_limiting_with_actual_key() {
+        use std::collections::HashMap;
+        use std::num::NonZeroU32;
+
+        // Create key definitions with rate limits
+        let mut key_definitions = HashMap::new();
+        key_definitions.insert(
+            "basic_user".to_string(),
+            KeyDefinition {
+                key: "sk-user-123".to_string(),
+                rate_limit: Some(RateLimitParameters {
+                    requests_per_second: NonZeroU32::new(10).unwrap(),
+                    burst_size: Some(NonZeroU32::new(20).unwrap()),
+                }),
+            },
+        );
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // The actual API key should have a rate limiter
+        assert!(targets.key_rate_limiters.contains_key("sk-user-123"));
+
+        // First request should be allowed
+        let limiter = targets.key_rate_limiters.get("sk-user-123").unwrap();
+        assert!(limiter.check().is_ok());
+    }
+
+    #[test]
+    fn test_per_key_rate_limiting_with_literal_key() {
+        use std::collections::HashMap;
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // Literal keys should not have rate limiters
+        assert!(!targets.key_rate_limiters.contains_key("sk-literal-key"));
+    }
+
+    #[test]
+    fn test_per_key_rate_limiting_no_rate_limit_configured() {
+        use std::collections::HashMap;
+
+        // Create key definition without rate limits
+        let mut key_definitions = HashMap::new();
+        key_definitions.insert(
+            "unlimited_user".to_string(),
+            KeyDefinition {
+                key: "sk-unlimited-123".to_string(),
+                rate_limit: None,
+            },
+        );
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // Key without rate limits should not have a rate limiter
+        assert!(!targets.key_rate_limiters.contains_key("sk-unlimited-123"));
     }
 
     #[test]
