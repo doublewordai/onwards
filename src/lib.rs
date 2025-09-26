@@ -1134,6 +1134,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1191,6 +1192,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1236,6 +1238,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -1283,6 +1286,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -1355,6 +1359,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create the same transformation function
@@ -1425,6 +1430,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that only transforms specific paths
