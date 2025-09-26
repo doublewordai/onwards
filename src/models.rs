@@ -1,6 +1,8 @@
-/// Data for the /v1/models endpoint.
-/// This endpoint mimics the openai API's models endpoint. Each 'model' is actually a target to
-/// forward requests onto.
+//! Data models for OpenAI-compatible API endpoints
+//!
+//! This module defines the request and response structures used by the proxy's
+//! API endpoints, particularly the `/v1/models` endpoint which lists available
+//! targets as OpenAI-compatible models.
 use serde::{Deserialize, Serialize};
 
 use crate::target::Target;

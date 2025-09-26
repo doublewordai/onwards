@@ -1,3 +1,8 @@
+//! Error handling and response structures
+//!
+//! This module provides standardized error responses that are compatible with
+//! OpenAI's API format, ensuring consistent error handling across the proxy.
+
 use axum::{
     Json,
     response::{IntoResponse, Response},

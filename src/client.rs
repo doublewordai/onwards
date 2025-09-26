@@ -1,5 +1,8 @@
-/// The hyper client is used to forward requests in the routes.
-/// TODO: Figure out what it means that we're using a 'legacy' client.
+//! HTTP client abstraction for forwarding requests to upstream services
+//!
+//! This module provides a unified interface for making HTTP requests, allowing
+//! different client implementations (hyper, mock clients for testing, etc.) to
+//! be used interchangeably throughout the proxy.
 use async_trait::async_trait;
 use axum::response::IntoResponse;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};

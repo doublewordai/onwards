@@ -1,9 +1,8 @@
-/// 'Targets' are destinations to which the proxy can forward requests. They're continually read
-/// from a config file (currently in JSON format, but open to discussion). When the config file
-/// changes, the list of targets is updated.
-///
-/// Incoming requests are forwarded to one of the targets, based on the 'model' field in the
-/// incoming request.
+//! Target management and configuration
+//!
+//! This module handles the configuration and management of proxy targets - the
+//! upstream services that requests are forwarded to. Targets are dynamically
+//! loaded from configuration files and support hot-reloading when files change.
 use crate::auth::KeySet;
 use anyhow::anyhow;
 use async_trait::async_trait;

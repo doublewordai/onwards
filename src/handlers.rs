@@ -1,5 +1,9 @@
+//! HTTP request handlers for the proxy server
+//!
+//! This module contains the main Axum handlers that process incoming requests,
+//! route them to appropriate targets, and handle authentication and rate limiting.
+
 use crate::AppState;
-/// Axum handlers for the proxy server
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;

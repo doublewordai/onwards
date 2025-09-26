@@ -1,7 +1,33 @@
-//! Onwards - A flexible LLM proxy library
+//! # Onwards - A flexible LLM proxy library
 //!
-//! This library provides the core functionality for proxying requests to various LLM endpoints
-//! with support for authentication, model routing, and dynamic configuration.
+//! Onwards provides core functionality for building LLM proxy services that can route requests
+//! to multiple AI model endpoints with authentication, rate limiting, and request transformation.
+//!
+//! ## Quick Start
+//!
+//! ```no_run
+//! use onwards::{AppState, build_router, target::Targets};
+//! use axum::serve;
+//! use tokio::net::TcpListener;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Load targets from configuration file
+//!     let targets = Targets::from_config_file(&"config.json".into()).await?;
+//!
+//!     // Create application state
+//!     let app_state = AppState::new(targets);
+//!
+//!     // Build router with proxy routes
+//!     let app = build_router(app_state);
+//!
+//!     // Start server
+//!     let listener = TcpListener::bind("0.0.0.0:3000").await?;
+//!     serve(listener, app).await?;
+//!     Ok(())
+//! }
+//! ```
+//!
 
 use axum::Router;
 use axum::http::HeaderMap;
@@ -26,11 +52,84 @@ use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 
 /// Type alias for body transformation function
-/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation
+///
+/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation.
+/// This allows you to modify request bodies before they are forwarded to upstream services.
+///
+/// # Arguments
+///
+/// * `&str` - The request path (e.g., "/v1/chat/completions")
+/// * `&HeaderMap` - HTTP headers from the incoming request
+/// * `&[u8]` - The request body as raw bytes
+///
+/// # Returns
+///
+/// * `Some(Bytes)` - Transformed request body to forward
+/// * `None` - Use original request body unchanged
+///
+/// # Examples
+///
+/// ```
+/// use onwards::BodyTransformFn;
+/// use axum::http::HeaderMap;
+/// use std::sync::Arc;
+/// use serde_json::{json, Value};
+///
+/// // Transform function that adds stream_options to OpenAI streaming requests
+/// let transform: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
+///     if path == "/v1/chat/completions" {
+///         if let Ok(mut json_body) = serde_json::from_slice::<Value>(body_bytes) {
+///             if json_body.get("stream") == Some(&json!(true)) {
+///                 json_body["stream_options"] = json!({"include_usage": true});
+///                 if let Ok(transformed) = serde_json::to_vec(&json_body) {
+///                     return Some(axum::body::Bytes::from(transformed));
+///                 }
+///             }
+///         }
+///     }
+///     None // No transformation
+/// });
+/// ```
 pub type BodyTransformFn =
     Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
 
 /// The main application state containing the HTTP client and targets configuration
+///
+/// This struct holds all the state needed to run the proxy server. It contains:
+/// - An HTTP client for making upstream requests
+/// - The collection of configured targets (destinations)
+/// - An optional body transformation function
+///
+/// # Examples
+///
+/// Basic setup:
+/// ```no_run
+/// use onwards::{AppState, target::Targets};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let app_state = AppState::new(targets);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// With request transformation:
+/// ```no_run
+/// use onwards::{AppState, BodyTransformFn, target::Targets};
+/// use std::sync::Arc;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+///
+/// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
+///     // Custom transformation logic
+///     None
+/// });
+///
+/// let app_state = AppState::with_transform(targets, transform);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone)]
 pub struct AppState<T: HttpClient> {
     pub http_client: T,
@@ -102,6 +201,10 @@ impl<T: HttpClient> AppState<T> {
 /// This function checks for a model override header first, then extracts the model from the JSON body.
 /// This is the same logic used by the proxy handler, extracted for reuse.
 ///
+/// The extraction follows this precedence order:
+/// 1. `model-override` header value
+/// 2. `model` field in JSON request body
+///
 /// # Arguments
 /// * `headers` - The request headers to check for model override
 /// * `body_bytes` - The request body as bytes to parse for model field
@@ -109,6 +212,33 @@ impl<T: HttpClient> AppState<T> {
 /// # Returns
 /// * `Ok(String)` - The extracted model name
 /// * `Err(())` - If no model could be extracted or parsing failed
+///
+/// # Examples
+///
+/// Extract from header:
+/// ```
+/// use onwards::extract_model_from_request;
+/// use axum::http::{HeaderMap, HeaderValue};
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert("model-override", HeaderValue::from_static("gpt-4"));
+/// let body = br#"{"model": "gpt-3.5", "messages": []}"#;
+///
+/// let model = extract_model_from_request(&headers, body).unwrap();
+/// assert_eq!(model, "gpt-4"); // Header takes precedence
+/// ```
+///
+/// Extract from JSON body:
+/// ```
+/// use onwards::extract_model_from_request;
+/// use axum::http::HeaderMap;
+///
+/// let headers = HeaderMap::new();
+/// let body = br#"{"model": "claude-3", "messages": []}"#;
+///
+/// let model = extract_model_from_request(&headers, body).unwrap();
+/// assert_eq!(model, "claude-3");
+/// ```
 pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Result<String, ()> {
     const MODEL_OVERRIDE_HEADER: &str = "model-override";
 
@@ -128,10 +258,39 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Res
 }
 
 /// Build the main router for the proxy
-/// This creates routes for:
-/// - `/models` - Returns available models
-/// - `/v1/models` - Returns available models
+///
+/// This creates the main Axum router with all proxy endpoints configured.
+/// The router handles model listing and request forwarding to configured targets.
+///
+/// # Routes Created
+/// - `/models` - Returns available models (OpenAI-compatible)
+/// - `/v1/models` - Returns available models (OpenAI-compatible)
 /// - `/{*path}` - Forwards all other requests to the appropriate target
+///
+/// # Arguments
+/// * `state` - The application state containing targets and configuration
+///
+/// # Returns
+/// A configured Axum [`Router`] ready to be served
+///
+/// # Examples
+///
+/// Basic usage:
+/// ```no_run
+/// use onwards::{AppState, build_router, target::Targets};
+/// use axum::serve;
+/// use tokio::net::TcpListener;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let app_state = AppState::new(targets);
+/// let router = build_router(app_state);
+///
+/// let listener = TcpListener::bind("0.0.0.0:3000").await?;
+/// serve(listener, router).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[instrument(skip(state))]
 pub fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(state: AppState<T>) -> Router {
     info!("Building router");
@@ -142,7 +301,33 @@ pub fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(state: AppSta
         .with_state(state)
 }
 
-/// Builds a router for the metrics endpoint.
+/// Builds a router for the metrics endpoint
+///
+/// Creates a separate router specifically for serving Prometheus metrics.
+/// This is typically run on a different port from the main proxy for security.
+///
+/// # Arguments
+/// * `handle` - Prometheus handle for rendering metrics
+///
+/// # Returns
+/// A configured Axum [`Router`] serving metrics at `/metrics`
+///
+/// # Examples
+///
+/// ```no_run
+/// use onwards::{build_metrics_router, build_metrics_layer_and_handle};
+/// use axum::serve;
+/// use tokio::net::TcpListener;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let (_metrics_layer, metrics_handle) = build_metrics_layer_and_handle("myapp");
+/// let metrics_router = build_metrics_router(metrics_handle);
+///
+/// let listener = TcpListener::bind("0.0.0.0:9090").await?;
+/// serve(listener, metrics_router).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[instrument(skip(handle))]
 pub fn build_metrics_router(handle: PrometheusHandle) -> Router {
     info!("Building metrics router");
@@ -157,13 +342,53 @@ type MetricsLayerAndHandle = (
     PrometheusHandle,
 );
 
-/// Builds a layer and handle for prometheus metrics collection.
+/// Builds a layer and handle for prometheus metrics collection
 ///
-/// # Parameters
-/// - `prefix`: A string prefix for the metrics, which can be either a string literal or an owned string.
-///   This parameter uses `impl Into<Cow<'static, str>>` to allow flexibility in passing either borrowed
-///   or owned strings. The `'static` lifetime ensures that the prefix is valid for the entire duration
-///   of the program, as required by the Prometheus metrics layer.
+/// Creates both the metrics collection layer (to add to your main router) and a handle
+/// for serving the metrics on a separate endpoint. The layer automatically tracks
+/// HTTP requests, response times, and other useful metrics.
+///
+/// # Arguments
+/// * `prefix` - A string prefix for all metric names (e.g., "myapp" creates "myapp_http_requests_total")
+///
+/// # Returns
+/// A tuple containing:
+/// 1. Metrics layer to add to your main router
+/// 2. Prometheus handle for serving metrics
+///
+/// # Examples
+///
+/// ```no_run
+/// use onwards::{AppState, build_router, build_metrics_router, build_metrics_layer_and_handle, target::Targets};
+/// use axum::serve;
+/// use tokio::net::TcpListener;
+/// use tower::ServiceBuilder;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let app_state = AppState::new(targets);
+///
+/// // Build metrics layer and handle
+/// let (metrics_layer, metrics_handle) = build_metrics_layer_and_handle("myapp");
+///
+/// // Main router with metrics collection
+/// let app = build_router(app_state)
+///     .layer(ServiceBuilder::new().layer(metrics_layer));
+///
+/// // Separate metrics router
+/// let metrics_app = build_metrics_router(metrics_handle);
+///
+/// // Serve both (typically on different ports)
+/// let main_listener = TcpListener::bind("0.0.0.0:3000").await?;
+/// let metrics_listener = TcpListener::bind("0.0.0.0:9090").await?;
+///
+/// tokio::select! {
+///     _ = serve(main_listener, app) => {},
+///     _ = serve(metrics_listener, metrics_app) => {},
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn build_metrics_layer_and_handle(
     prefix: impl Into<Cow<'static, str>>,
 ) -> MetricsLayerAndHandle {

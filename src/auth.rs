@@ -1,4 +1,7 @@
-/// Authentication utilities for secure API key validation
+//! Authentication utilities for secure API key validation
+//!
+//! This module provides secure authentication mechanisms for validating API keys
+//! against timing attacks using constant-time comparison operations.
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};

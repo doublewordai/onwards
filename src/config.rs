@@ -1,4 +1,7 @@
-/// Configuration for the proxy server
+//! Configuration parsing and validation for the proxy server
+//!
+//! This module handles command-line argument parsing and validation using clap.
+//! It defines the main configuration structure used throughout the application.
 use anyhow::anyhow;
 use clap::Parser;
 use std::path::PathBuf;
