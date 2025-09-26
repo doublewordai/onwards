@@ -33,6 +33,15 @@ pub async fn target_message_handler<T: HttpClient>(
                                                                     // this should never fail.
         };
 
+    // Apply body transformation if provided
+    if let Some(ref transform_fn) = state.body_transform_fn {
+        let path = req.uri().path();
+        if let Some(transformed_body) = transform_fn(path, req.headers(), &body_bytes) {
+            debug!("Applied body transformation for path: {}", path);
+            body_bytes = transformed_body;
+        }
+    }
+
     // Log full incoming request details for debugging
     trace!(
         "Incoming request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
