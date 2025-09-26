@@ -362,7 +362,6 @@ type MetricsLayerAndHandle = (
 /// use onwards::{AppState, build_router, build_metrics_router, build_metrics_layer_and_handle, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
-/// use tower::ServiceBuilder;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let targets = Targets::from_config_file(&"config.json".into()).await?;
@@ -373,7 +372,7 @@ type MetricsLayerAndHandle = (
 ///
 /// // Main router with metrics collection
 /// let app = build_router(app_state)
-///     .layer(ServiceBuilder::new().layer(metrics_layer));
+///     .layer(metrics_layer);
 ///
 /// // Separate metrics router
 /// let metrics_app = build_metrics_router(metrics_handle);
