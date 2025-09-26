@@ -259,6 +259,90 @@ with a `429 Too Many Requests` response.
 Rate limiting is optional - targets without `rate_limit` configuration have no
 rate limiting applied.
 
+## Per-API-Key Rate Limiting
+
+In addition to per-target rate limiting, Onwards supports individual rate limits for different API keys. This allows you to provide different service tiers to your users - for example, basic users might have lower limits while premium users get higher limits.
+
+### Configuration
+
+Per-key rate limiting uses a `key_definitions` section in the auth configuration:
+
+```json
+{
+  "auth": {
+    "global_keys": ["fallback-key"],
+    "key_definitions": {
+      "basic_user": {
+        "key": "sk-user-12345",
+        "rate_limit": {
+          "requests_per_second": 10,
+          "burst_size": 20
+        }
+      },
+      "premium_user": {
+        "key": "sk-premium-67890",
+        "rate_limit": {
+          "requests_per_second": 100,
+          "burst_size": 200
+        }
+      },
+      "enterprise_user": {
+        "key": "sk-enterprise-abcdef",
+        "rate_limit": {
+          "requests_per_second": 500,
+          "burst_size": 1000
+        }
+      }
+    }
+  },
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-your-openai-key",
+      "keys": ["basic_user", "premium_user", "enterprise_user", "fallback-key"]
+    }
+  }
+}
+```
+
+### Priority Order
+
+Rate limits are checked in this order:
+
+1. **Per-key rate limits** (if the API key has limits configured)
+2. **Per-target rate limits** (if the target has limits configured)
+
+If either limit is exceeded, the request returns `429 Too Many Requests`.
+
+### Usage Examples
+
+**Basic user request (10/sec limit):**
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-user-12345" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+**Premium user request (100/sec limit):**
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer sk-premium-67890" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+**Legacy key (no per-key limits):**
+
+```bash
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Authorization: Bearer fallback-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
 ## Testing
 
 Run the test suite:

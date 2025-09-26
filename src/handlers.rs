@@ -90,14 +90,15 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     }
 
+    // Extract bearer token for authentication and rate limiting
+    let bearer_token = req
+        .headers()
+        .get("authorization")
+        .and_then(|auth_header| auth_header.to_str().ok())
+        .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
+
     // Validate API key if target has keys configured
     if let Some(ref keys) = target.keys {
-        let bearer_token = req
-            .headers()
-            .get("authorization")
-            .and_then(|auth_header| auth_header.to_str().ok())
-            .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
-
         match bearer_token {
             Some(token) => {
                 trace!("Validating bearer token");
@@ -118,6 +119,16 @@ pub async fn target_message_handler<T: HttpClient>(
             "Target '{}' has no keys configured - allowing request",
             model_name
         );
+    }
+
+    // Check per-key rate limits if bearer token is present
+    if let Some(token) = bearer_token {
+        if let Some(limiter) = state.targets.key_rate_limiters.get(token) {
+            if limiter.check().is_err() {
+                debug!("Per-key rate limit exceeded for token: {}", token);
+                return Err(OnwardsErrorResponse::rate_limited());
+            }
+        }
     }
 
     // Users can specify the onwards value of the model field in the target

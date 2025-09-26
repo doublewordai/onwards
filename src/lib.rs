@@ -310,6 +310,7 @@ mod tests {
         // Create empty targets
         let targets = target::Targets {
             targets: Arc::new(DashMap::new()),
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -349,6 +350,7 @@ mod tests {
 
         let targets = target::Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(
@@ -415,6 +417,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -506,6 +509,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -570,6 +574,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -657,6 +662,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -759,6 +765,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -815,6 +822,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -887,6 +895,7 @@ mod tests {
 
         let targets = Targets {
             targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -951,7 +960,10 @@ mod tests {
         fn get_shared_metrics_servers(
             #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, Target>>,
         ) -> (TestServer, TestServer) {
-            let targets = Targets { targets };
+            let targets = Targets {
+                targets,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
 
