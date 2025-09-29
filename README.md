@@ -121,13 +121,18 @@ Global keys apply to all targets that have authentication enabled:
 ```json
 {
   "auth": {
-    "global_keys": ["global-api-key-1", "global-api-key-2"]
+    "keys": [
+      { "key": "global-api-key-1" },
+      { "key": "global-api-key-2" }
+    ]
   },
   "targets": {
     "gpt-4": {
       "url": "https://api.openai.com",
       "onwards_key": "sk-your-openai-key",
-      "keys": ["target-specific-key"]
+      "keys": [
+        { "key": "target-specific-key" }
+      ]
     }
   }
 }
@@ -143,7 +148,10 @@ You can also specify authentication keys for individual targets:
     "secure-gpt-4": {
       "url": "https://api.openai.com",
       "onwards_key": "sk-your-openai-key",
-      "keys": ["secure-key-1", "secure-key-2"]
+      "keys": [
+        { "key": "secure-key-1" },
+        { "key": "secure-key-2" }
+      ]
     },
     "open-local": {
       "url": "http://localhost:8080"
@@ -226,7 +234,7 @@ Add rate limiting to any target in your `config.json`:
   "targets": {
     "rate-limited-model": {
       "url": "https://api.provider.com",
-      "key": "your-api-key",
+      "onwards_key": "your-api-key",
       "rate_limit": {
         "requests_per_second": 5.0,
         "burst_size": 10
@@ -269,41 +277,40 @@ In addition to per-target rate limiting, Onwards supports individual rate limits
 
 ### Configuration
 
-Per-key rate limiting uses a `key_definitions` section in the auth configuration:
+Per-key rate limiting is configured directly on each key object:
 
 ```json
 {
   "auth": {
-    "global_keys": ["fallback-key"],
-    "key_definitions": {
-      "basic_user": {
+    "keys": [
+      {
         "key": "sk-user-12345",
         "rate_limit": {
           "requests_per_second": 10,
           "burst_size": 20
         }
       },
-      "premium_user": {
+      {
         "key": "sk-premium-67890",
         "rate_limit": {
           "requests_per_second": 100,
           "burst_size": 200
         }
       },
-      "enterprise_user": {
+      {
         "key": "sk-enterprise-abcdef",
         "rate_limit": {
           "requests_per_second": 500,
           "burst_size": 1000
         }
-      }
-    }
+      },
+      { "key": "fallback-key" }
+    ]
   },
   "targets": {
     "gpt-4": {
       "url": "https://api.openai.com",
-      "onwards_key": "sk-your-openai-key",
-      "keys": ["basic_user", "premium_user", "enterprise_user", "fallback-key"]
+      "onwards_key": "sk-your-openai-key"
     }
   }
 }
@@ -338,7 +345,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-**Legacy key (no per-key limits):**
+**Key without rate limits:**
 
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \

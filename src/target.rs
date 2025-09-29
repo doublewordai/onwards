@@ -3,7 +3,7 @@
 //! This module handles the configuration and management of proxy targets - the
 //! upstream services that requests are forwarded to. Targets are dynamically
 //! loaded from configuration files and support hot-reloading when files change.
-use crate::auth::KeySet;
+use crate::auth::{ConstantTimeString, KeySet};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -27,7 +27,7 @@ pub struct RateLimitParameters {
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct TargetSpec {
     pub url: Url,
-    pub keys: Option<KeySet>,
+    pub keys: Option<Vec<ApiKey>>,
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub rate_limit: Option<RateLimitParameters>,
@@ -35,9 +35,17 @@ pub struct TargetSpec {
 
 impl From<TargetSpec> for Target {
     fn from(value: TargetSpec) -> Self {
+        // Convert Vec<ApiKey> to KeySet (HashSet<ConstantTimeString>)
+        let keys = value.keys.map(|keys_vec| {
+            keys_vec
+                .into_iter()
+                .map(|api_key| ConstantTimeString::from(api_key.key))
+                .collect::<KeySet>()
+        });
+
         Target {
             url: value.url,
-            keys: value.keys,
+            keys,
             onwards_key: value.onwards_key,
             onwards_model: value.onwards_model,
             limiter: value.rate_limit.map(|rl| {
@@ -79,7 +87,7 @@ pub struct Target {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyDefinition {
+pub struct ApiKey {
     pub key: String,
     pub rate_limit: Option<RateLimitParameters>,
 }
@@ -87,9 +95,7 @@ pub struct KeyDefinition {
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct Auth {
     /// global keys are merged with the per-target keys.
-    global_keys: KeySet,
-    /// key definitions with their actual keys and per-key rate limits
-    pub key_definitions: Option<HashMap<String, KeyDefinition>>,
+    keys: Option<Vec<ApiKey>>,
 }
 
 /// The config file contains a map of target names to targets.
@@ -237,19 +243,19 @@ impl Targets {
     }
 
     pub fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
-        let (global_keys, key_definitions) = config_file
+        let global_keys = config_file
             .auth
             .take()
-            .map(|auth| (auth.global_keys, auth.key_definitions.unwrap_or_default()))
+            .and_then(|auth| auth.keys)
             .unwrap_or_default();
         debug!("{} global keys configured", global_keys.len());
-        debug!("{} key definitions configured", key_definitions.len());
 
         // Set up rate limiters keyed by actual API keys
         let key_rate_limiters = Arc::new(DashMap::new());
 
-        for (_key_id, key_def) in key_definitions {
-            if let Some(ref rate_limit) = key_def.rate_limit {
+        // Process global keys for rate limiting
+        for key_obj in &global_keys {
+            if let Some(ref rate_limit) = key_obj.rate_limit {
                 let limiter = Arc::new(governor::RateLimiter::direct(
                     Quota::per_second(rate_limit.requests_per_second).allow_burst(
                         rate_limit
@@ -257,24 +263,42 @@ impl Targets {
                             .unwrap_or(rate_limit.requests_per_second),
                     ),
                 ));
-                // Map the actual API key to its rate limiter
-                key_rate_limiters.insert(key_def.key, limiter);
+                key_rate_limiters.insert(key_obj.key.clone(), limiter);
             }
         }
 
         let targets = Arc::new(DashMap::new());
         for (name, mut target_spec) in config_file.targets {
-            if let Some(ref mut keys) = target_spec.keys {
+            // Process target-specific keys for rate limiting
+            if let Some(ref keys) = target_spec.keys {
+                for key_obj in keys {
+                    if let Some(ref rate_limit) = key_obj.rate_limit {
+                        let limiter = Arc::new(governor::RateLimiter::direct(
+                            Quota::per_second(rate_limit.requests_per_second).allow_burst(
+                                rate_limit
+                                    .burst_size
+                                    .unwrap_or(rate_limit.requests_per_second),
+                            ),
+                        ));
+                        key_rate_limiters.insert(key_obj.key.clone(), limiter);
+                    }
+                }
+
                 debug!(
                     "Target {}:{:?} has {} keys configured",
                     target_spec.url,
                     target_spec.onwards_model,
                     keys.len()
                 );
+            }
+
+            // Merge global keys with target keys
+            if let Some(ref mut keys) = target_spec.keys {
                 keys.extend(global_keys.clone());
             } else if !global_keys.is_empty() {
                 target_spec.keys = Some(global_keys.clone());
             }
+
             targets.insert(name, target_spec.into());
         }
 
@@ -357,7 +381,6 @@ mod tests {
     use super::*;
     use crate::auth::ConstantTimeString;
     use dashmap::DashMap;
-    use std::collections::HashSet;
     use std::sync::Arc;
     pub struct MockConfigWatcher {
         configs: Vec<Result<Targets, String>>,
@@ -557,15 +580,35 @@ mod tests {
 
     #[test]
     fn test_from_config_merges_global_keys_with_target_keys() {
-        let mut target_keys = HashSet::new();
-        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
-        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
-        target_keys.insert(ConstantTimeString::from("shared-key".to_string()));
+        let target_keys = vec![
+            ApiKey {
+                key: "target-key-1".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "target-key-2".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "shared-key".to_string(),
+                rate_limit: None,
+            },
+        ];
 
-        let mut global_keys = HashSet::new();
-        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
-        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
-        global_keys.insert(ConstantTimeString::from("shared-key".to_string())); // Duplicate with target
+        let global_keys = vec![
+            ApiKey {
+                key: "global-key-1".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "global-key-2".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "shared-key".to_string(), // Duplicate with target
+                rate_limit: None,
+            },
+        ];
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -580,15 +623,14 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: Some(Auth {
-                global_keys,
-                key_definitions: None,
+                keys: Some(global_keys),
             }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
         let target = targets.targets.get("test-model").unwrap();
 
-        // Target should have both its own keys and global keys (5 unique keys)
+        // Target should have both its own keys and global keys (5 unique keys after HashSet conversion)
         assert_eq!(target.keys.as_ref().unwrap().len(), 5);
         assert!(
             target
@@ -629,9 +671,16 @@ mod tests {
 
     #[test]
     fn test_from_config_target_without_keys_gets_global_keys() {
-        let mut global_keys = HashSet::new();
-        global_keys.insert(ConstantTimeString::from("global-key-1".to_string()));
-        global_keys.insert(ConstantTimeString::from("global-key-2".to_string()));
+        let global_keys = vec![
+            ApiKey {
+                key: "global-key-1".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "global-key-2".to_string(),
+                rate_limit: None,
+            },
+        ];
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -645,8 +694,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: Some(Auth {
-                global_keys,
-                key_definitions: None,
+                keys: Some(global_keys),
             }),
         };
 
@@ -775,25 +823,18 @@ mod tests {
         use std::collections::HashMap;
         use std::num::NonZeroU32;
 
-        // Create key definitions with rate limits
-        let mut key_definitions = HashMap::new();
-        key_definitions.insert(
-            "basic_user".to_string(),
-            KeyDefinition {
-                key: "sk-user-123".to_string(),
-                rate_limit: Some(RateLimitParameters {
-                    requests_per_second: NonZeroU32::new(10).unwrap(),
-                    burst_size: Some(NonZeroU32::new(20).unwrap()),
-                }),
-            },
-        );
+        // Create keys with rate limits
+        let keys = vec![ApiKey {
+            key: "sk-user-123".to_string(),
+            rate_limit: Some(RateLimitParameters {
+                requests_per_second: NonZeroU32::new(10).unwrap(),
+                burst_size: Some(NonZeroU32::new(20).unwrap()),
+            }),
+        }];
 
         let config_file = ConfigFile {
             targets: HashMap::new(),
-            auth: Some(Auth {
-                global_keys: std::collections::HashSet::new(),
-                key_definitions: Some(key_definitions),
-            }),
+            auth: Some(Auth { keys: Some(keys) }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -825,22 +866,15 @@ mod tests {
     fn test_per_key_rate_limiting_no_rate_limit_configured() {
         use std::collections::HashMap;
 
-        // Create key definition without rate limits
-        let mut key_definitions = HashMap::new();
-        key_definitions.insert(
-            "unlimited_user".to_string(),
-            KeyDefinition {
-                key: "sk-unlimited-123".to_string(),
-                rate_limit: None,
-            },
-        );
+        // Create key without rate limits
+        let keys = vec![ApiKey {
+            key: "sk-unlimited-123".to_string(),
+            rate_limit: None,
+        }];
 
         let config_file = ConfigFile {
             targets: HashMap::new(),
-            auth: Some(Auth {
-                global_keys: std::collections::HashSet::new(),
-                key_definitions: Some(key_definitions),
-            }),
+            auth: Some(Auth { keys: Some(keys) }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -851,9 +885,16 @@ mod tests {
 
     #[test]
     fn test_from_config_no_global_keys() {
-        let mut target_keys = HashSet::new();
-        target_keys.insert(ConstantTimeString::from("target-key-1".to_string()));
-        target_keys.insert(ConstantTimeString::from("target-key-2".to_string()));
+        let target_keys = vec![
+            ApiKey {
+                key: "target-key-1".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "target-key-2".to_string(),
+                rate_limit: None,
+            },
+        ];
 
         let mut targets = HashMap::new();
         targets.insert(
