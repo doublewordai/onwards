@@ -114,6 +114,33 @@ curl http://localhost:9090/metrics
 
 Onwards supports bearer token authentication to control access to your AI targets. You can configure authentication keys both globally and per-target.
 
+### Hashed Keys
+
+For enhanced security, Onwards supports SHA256 hashing of API keys. When enabled, all keys in the configuration should be SHA256 hashes, and incoming bearer tokens will be hashed before comparison:
+
+```json
+{
+  "auth": {
+    "hash": "sha256",
+    "keys": [
+      { "key": "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8" },
+      { "key": "6ca13d52ca70c883e0f0bb101e425a89e8624de51db2d2392593af6a84118090" }
+    ]
+  },
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-your-openai-key"
+    }
+  }
+}
+```
+
+To generate SHA256 hashes of your API keys, you can use:
+```bash
+echo -n "your-api-key" | sha256sum
+```
+
 ### Global Authentication Keys
 
 Global keys apply to all targets that have authentication enabled:

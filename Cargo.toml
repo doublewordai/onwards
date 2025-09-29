@@ -45,6 +45,7 @@ bon = "3.6.5"
 subtle = "2.6.1"
 axum-prometheus = "0.8.0"
 governor = "0.10.1"
+sha2 = "0.10.8"
 
 [dev-dependencies]
 axum-test = "17.3.0"

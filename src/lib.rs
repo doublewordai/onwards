@@ -533,6 +533,7 @@ mod tests {
     async fn test_empty_targets_returns_404() {
         // Create empty targets
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -573,6 +574,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -640,6 +642,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -732,6 +735,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -797,6 +801,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -885,6 +890,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -988,6 +994,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1045,6 +1052,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1118,6 +1126,7 @@ mod tests {
         );
 
         let targets = Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1185,6 +1194,7 @@ mod tests {
             #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, Target>>,
         ) -> (TestServer, TestServer) {
             let targets = Targets {
+                hash_algorithm: None,
                 targets,
                 key_rate_limiters: Arc::new(DashMap::new()),
             };
@@ -1357,6 +1367,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1415,6 +1426,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1461,6 +1473,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1509,6 +1522,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1582,6 +1596,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };
@@ -1653,6 +1668,7 @@ mod tests {
         );
 
         let targets = target::Targets {
+            hash_algorithm: None,
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
         };

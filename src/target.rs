@@ -3,7 +3,7 @@
 //! This module handles the configuration and management of proxy targets - the
 //! upstream services that requests are forwarded to. Targets are dynamically
 //! loaded from configuration files and support hot-reloading when files change.
-use crate::auth::{ConstantTimeString, KeySet};
+use crate::auth::{ConstantTimeString, HashAlgorithm, KeySet};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -33,22 +33,26 @@ pub struct TargetSpec {
     pub rate_limit: Option<RateLimitParameters>,
 }
 
-impl From<TargetSpec> for Target {
-    fn from(value: TargetSpec) -> Self {
+impl TargetSpec {
+    fn into_target(self, hash_algorithm: Option<&HashAlgorithm>) -> Target {
         // Convert Vec<ApiKey> to KeySet (HashSet<ConstantTimeString>)
-        let keys = value.keys.map(|keys_vec| {
+        // Apply hashing if configured
+        let keys = self.keys.map(|keys_vec| {
             keys_vec
                 .into_iter()
-                .map(|api_key| ConstantTimeString::from(api_key.key))
+                .map(|api_key| {
+                    let hashed_key = crate::auth::hash_key(&api_key.key, hash_algorithm);
+                    ConstantTimeString::from(hashed_key)
+                })
                 .collect::<KeySet>()
         });
 
         Target {
-            url: value.url,
+            url: self.url,
             keys,
-            onwards_key: value.onwards_key,
-            onwards_model: value.onwards_model,
-            limiter: value.rate_limit.map(|rl| {
+            onwards_key: self.onwards_key,
+            onwards_model: self.onwards_model,
+            limiter: self.rate_limit.map(|rl| {
                 Arc::new(governor::RateLimiter::direct(
                     Quota::per_second(rl.requests_per_second)
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
@@ -96,6 +100,8 @@ pub struct ApiKey {
 pub struct Auth {
     /// global keys are merged with the per-target keys.
     keys: Option<Vec<ApiKey>>,
+    /// Hash algorithm to use for API keys
+    hash: Option<HashAlgorithm>,
 }
 
 /// The config file contains a map of target names to targets.
@@ -111,6 +117,8 @@ pub struct Targets {
     pub targets: Arc<DashMap<String, Target>>,
     /// Direct rate limiters per actual API key (actual key -> rate limiter)
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
+    /// Hash algorithm used for API keys (if configured)
+    pub hash_algorithm: Option<HashAlgorithm>,
 }
 
 #[async_trait]
@@ -243,12 +251,15 @@ impl Targets {
     }
 
     pub fn from_config(mut config_file: ConfigFile) -> Result<Self, anyhow::Error> {
-        let global_keys = config_file
+        let (global_keys, hash_algorithm) = config_file
             .auth
             .take()
-            .and_then(|auth| auth.keys)
+            .map(|auth| (auth.keys.unwrap_or_default(), auth.hash))
             .unwrap_or_default();
         debug!("{} global keys configured", global_keys.len());
+        if let Some(ref hash) = hash_algorithm {
+            debug!("Hash algorithm configured: {:?}", hash);
+        }
 
         // Set up rate limiters keyed by actual API keys
         let key_rate_limiters = Arc::new(DashMap::new());
@@ -299,12 +310,13 @@ impl Targets {
                 target_spec.keys = Some(global_keys.clone());
             }
 
-            targets.insert(name, target_spec.into());
+            targets.insert(name, target_spec.into_target(hash_algorithm.as_ref()));
         }
 
         Ok(Targets {
             targets,
             key_rate_limiters,
+            hash_algorithm,
         })
     }
 
@@ -379,7 +391,7 @@ impl Targets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::ConstantTimeString;
+    use crate::auth::{ConstantTimeString, HashAlgorithm};
     use dashmap::DashMap;
     use std::sync::Arc;
     pub struct MockConfigWatcher {
@@ -442,6 +454,7 @@ mod tests {
         Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            hash_algorithm: None,
         }
     }
 
@@ -501,6 +514,7 @@ mod tests {
         let targets = Targets {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
+            hash_algorithm: None,
         };
 
         // Create sequence of target updates
@@ -561,6 +575,7 @@ mod tests {
         let updated_targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            hash_algorithm: None,
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -624,6 +639,7 @@ mod tests {
             targets,
             auth: Some(Auth {
                 keys: Some(global_keys),
+                hash: None,
             }),
         };
 
@@ -695,6 +711,7 @@ mod tests {
             targets,
             auth: Some(Auth {
                 keys: Some(global_keys),
+                hash: None,
             }),
         };
 
@@ -834,7 +851,10 @@ mod tests {
 
         let config_file = ConfigFile {
             targets: HashMap::new(),
-            auth: Some(Auth { keys: Some(keys) }),
+            auth: Some(Auth {
+                keys: Some(keys),
+                hash: None,
+            }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -874,13 +894,79 @@ mod tests {
 
         let config_file = ConfigFile {
             targets: HashMap::new(),
-            auth: Some(Auth { keys: Some(keys) }),
+            auth: Some(Auth {
+                keys: Some(keys),
+                hash: None,
+            }),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
 
         // Key without rate limits should not have a rate limiter
         assert!(!targets.key_rate_limiters.contains_key("sk-unlimited-123"));
+    }
+
+    #[test]
+    fn test_sha256_hashed_keys() {
+        // Test that keys are properly hashed when SHA256 is configured
+        let keys = vec![
+            ApiKey {
+                key: "test-key-1".to_string(),
+                rate_limit: None,
+            },
+            ApiKey {
+                key: "test-key-2".to_string(),
+                rate_limit: None,
+            },
+        ];
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: Some(Auth {
+                keys: Some(keys),
+                hash: Some(HashAlgorithm::Sha256),
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // The keys should be hashed
+        // SHA256 of "test-key-1" is "d8b9130293b21e91d008b65f9dc33b379e78ca73e8e13428e76a03b6db7c15de"
+        // SHA256 of "test-key-2" is "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" (for "test")
+        // Let's actually compute the correct hashes
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update("test-key-1");
+        let hash1 = format!("{:x}", hasher.finalize());
+
+        let mut hasher = Sha256::new();
+        hasher.update("test-key-2");
+        let hash2 = format!("{:x}", hasher.finalize());
+
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from(hash1))
+        );
+        assert!(
+            target
+                .keys
+                .as_ref()
+                .unwrap()
+                .contains(&ConstantTimeString::from(hash2))
+        );
+        assert_eq!(target.keys.as_ref().unwrap().len(), 2);
     }
 
     #[test]

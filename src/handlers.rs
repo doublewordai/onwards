@@ -89,9 +89,10 @@ pub async fn target_message_handler<T: HttpClient>(
     };
 
     if let Some(ref limiter) = target.limiter
-        && limiter.check().is_err() {
-            return Err(OnwardsErrorResponse::rate_limited());
-        }
+        && limiter.check().is_err()
+    {
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -105,7 +106,7 @@ pub async fn target_message_handler<T: HttpClient>(
         match bearer_token {
             Some(token) => {
                 trace!("Validating bearer token");
-                if auth::validate_bearer_token(keys, token) {
+                if auth::validate_bearer_token(keys, token, state.targets.hash_algorithm.as_ref()) {
                     debug!("Bearer token validation successful");
                 } else {
                     debug!("Bearer token validation failed - token not in key set");
@@ -127,10 +128,11 @@ pub async fn target_message_handler<T: HttpClient>(
     // Check per-key rate limits if bearer token is present
     if let Some(token) = bearer_token
         && let Some(limiter) = state.targets.key_rate_limiters.get(token)
-            && limiter.check().is_err() {
-                debug!("Per-key rate limit exceeded for token: {}", token);
-                return Err(OnwardsErrorResponse::rate_limited());
-            }
+        && limiter.check().is_err()
+    {
+        debug!("Per-key rate limit exceeded for token: {}", token);
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
 
     // Users can specify the onwards value of the model field in the target
     // config. If not supplied, its left as is.
@@ -273,7 +275,11 @@ pub async fn models<T: HttpClient>(
             };
 
             // Validate bearer token against target's keys
-            auth::validate_bearer_token(target.keys.as_ref().unwrap(), token)
+            auth::validate_bearer_token(
+                target.keys.as_ref().unwrap(),
+                token,
+                state.targets.hash_algorithm.as_ref(),
+            )
         })
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect::<std::collections::HashMap<_, _>>();
