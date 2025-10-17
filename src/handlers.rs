@@ -8,18 +8,95 @@ use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
 use crate::models::ListModelResponse;
+use crate::target::Target;
 use axum::{
     Json,
     extract::Request,
     extract::State,
     http::{
         Uri,
+        HeaderMap,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
 };
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
+
+/// Filters and modifies headers before forwarding to upstream
+///
+/// This function implements RFC 7230 compliant proxy behavior by:
+/// - Removing hop-by-hop headers (connection, keep-alive, etc.)
+/// - Stripping authentication headers to prevent credential leakage
+/// - Removing browser-specific context headers (sec-*, origin, referer)
+/// - Adding upstream authentication if configured
+/// - Adding X-Forwarded-* headers for transparency
+fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
+    // Headers to remove: hop-by-hop (RFC 7230), auth, browser context, and routing headers
+    const HEADERS_TO_STRIP: &[&str] = &[
+        // RFC 7230 hop-by-hop headers (MUST remove per spec)
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "upgrade",
+        // Authentication headers (prevent credential leakage to downstream)
+        "authorization",
+        "x-api-key",
+        "api-key",
+        // Browser security context headers (meaningless to upstream APIs)
+        "sec-fetch-site",
+        "sec-fetch-mode",
+        "sec-fetch-dest",
+        "sec-fetch-user",
+        // Browser context leakage
+        "origin",
+        "referer",
+        // Client state (security)
+        "cookie",
+        // HTTP caching (irrelevant since we buffer full responses)
+        "if-modified-since",
+        "if-none-match",
+        "if-match",
+        "if-unmodified-since",
+        "if-range",
+        // Our routing headers (already consumed)
+        "model-override",
+    ];
+
+    for header in HEADERS_TO_STRIP {
+        headers.remove(*header);
+    }
+
+    // Remove all sec-ch-ua* headers (Chrome User-Agent Client Hints)
+    // These have many variants (sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, etc.)
+    let sec_ch_ua_headers: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("sec-ch-ua"))
+        .cloned()
+        .collect();
+    for header in sec_ch_ua_headers {
+        headers.remove(header);
+    }
+
+    // Add Authorization header if target requires authentication to upstream
+    if let Some(key) = &target.onwards_key {
+        debug!("Adding authorization header for upstream {}", target.url);
+        headers.insert("Authorization", format!("Bearer {key}").parse().unwrap());
+    } else {
+        debug!("No upstream authentication configured for target {}", target.url);
+    }
+
+    // Add X-Forwarded headers for transparency (preserve original request context)
+    // Note: We don't have access to the original client IP in this handler,
+    // so we only set X-Forwarded-Proto for now
+    headers.insert(
+        "x-forwarded-proto",
+        "https".parse().unwrap(),
+    );
+}
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
@@ -202,14 +279,6 @@ pub async fn target_message_handler<T: HttpClient>(
             .insert("host", host_value.parse().unwrap());
     }
 
-    if let Some(key) = &target.onwards_key {
-        debug!("Adding authorization header for {}", target.url);
-        req.headers_mut()
-            .insert("Authorization", format!("Bearer {key}").parse().unwrap());
-    } else {
-        debug!("No key configured for target {}", target.url);
-    }
-
     // Always set Content-Length and remove Transfer-Encoding since we buffer the full body
     req.headers_mut().insert(
         CONTENT_LENGTH,
@@ -220,6 +289,9 @@ pub async fn target_message_handler<T: HttpClient>(
             .expect("Content-Length should be valid"),
     );
     req.headers_mut().remove(TRANSFER_ENCODING);
+
+    // Filter headers for upstream forwarding (RFC 7230 compliance, security, etc.)
+    filter_headers_for_upstream(req.headers_mut(), &target);
 
     // Log full outgoing request details for debugging
     trace!(
@@ -285,4 +357,359 @@ pub async fn models<T: HttpClient>(
     Json(ListModelResponse::from_filtered_targets(
         &accessible_targets,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filter_headers_strips_hop_by_hop_headers() {
+        let mut headers = HeaderMap::new();
+
+        // Add hop-by-hop headers that should be removed
+        headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("proxy-authenticate", "Basic".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic abc123".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("trailer", "Expires".parse().unwrap());
+        headers.insert("upgrade", "HTTP/2.0".parse().unwrap());
+
+        // Add a safe header that should be kept
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Verify hop-by-hop headers were removed
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("keep-alive"));
+        assert!(!headers.contains_key("proxy-authenticate"));
+        assert!(!headers.contains_key("proxy-authorization"));
+        assert!(!headers.contains_key("te"));
+        assert!(!headers.contains_key("trailer"));
+        assert!(!headers.contains_key("upgrade"));
+
+        // Verify safe header was kept
+        assert!(headers.contains_key("content-type"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_auth_headers() {
+        let mut headers = HeaderMap::new();
+
+        // Add auth headers that should be removed
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+        headers.insert("x-api-key", "client-api-key".parse().unwrap());
+        headers.insert("api-key", "another-key".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Verify all auth headers were removed (client credentials stripped)
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("x-api-key"));
+        assert!(!headers.contains_key("api-key"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_browser_security_headers() {
+        let mut headers = HeaderMap::new();
+
+        // Add browser security headers
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+        headers.insert("sec-fetch-user", "?1".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Verify all sec-fetch-* headers were removed
+        assert!(!headers.contains_key("sec-fetch-site"));
+        assert!(!headers.contains_key("sec-fetch-mode"));
+        assert!(!headers.contains_key("sec-fetch-dest"));
+        assert!(!headers.contains_key("sec-fetch-user"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_all_sec_ch_ua_variants() {
+        let mut headers = HeaderMap::new();
+
+        // Add various sec-ch-ua headers
+        headers.insert("sec-ch-ua", "\"Chrome\";v=\"120\"".parse().unwrap());
+        headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+        headers.insert("sec-ch-ua-platform", "\"macOS\"".parse().unwrap());
+        headers.insert("sec-ch-ua-arch", "\"arm64\"".parse().unwrap());
+        headers.insert("sec-ch-ua-model", "\"\"".parse().unwrap());
+
+        // Add a safe header
+        headers.insert("user-agent", "Mozilla/5.0...".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Verify all sec-ch-ua* headers were removed
+        assert!(!headers.contains_key("sec-ch-ua"));
+        assert!(!headers.contains_key("sec-ch-ua-mobile"));
+        assert!(!headers.contains_key("sec-ch-ua-platform"));
+        assert!(!headers.contains_key("sec-ch-ua-arch"));
+        assert!(!headers.contains_key("sec-ch-ua-model"));
+
+        // Verify user-agent was kept
+        assert!(headers.contains_key("user-agent"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_browser_context_headers() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert("origin", "http://localhost:3000".parse().unwrap());
+        headers.insert("referer", "http://localhost:3000/chat".parse().unwrap());
+        headers.insert("cookie", "session=abc123".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        assert!(!headers.contains_key("origin"));
+        assert!(!headers.contains_key("referer"));
+        assert!(!headers.contains_key("cookie"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_caching_headers() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        headers.insert("if-none-match", "\"abc123\"".parse().unwrap());
+        headers.insert("if-match", "\"xyz789\"".parse().unwrap());
+        headers.insert("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        headers.insert("if-range", "\"abc123\"".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        assert!(!headers.contains_key("if-modified-since"));
+        assert!(!headers.contains_key("if-none-match"));
+        assert!(!headers.contains_key("if-match"));
+        assert!(!headers.contains_key("if-unmodified-since"));
+        assert!(!headers.contains_key("if-range"));
+    }
+
+    #[test]
+    fn test_filter_headers_strips_model_override_header() {
+        let mut headers = HeaderMap::new();
+
+        headers.insert("model-override", "gpt-4".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // model-override should be removed (already consumed for routing)
+        assert!(!headers.contains_key("model-override"));
+        // content-type should be kept
+        assert!(headers.contains_key("content-type"));
+    }
+
+    #[test]
+    fn test_filter_headers_keeps_safe_headers() {
+        let mut headers = HeaderMap::new();
+
+        // Add headers that should be kept
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.insert("user-agent", "MyClient/1.0".parse().unwrap());
+        headers.insert("accept-language", "en-US,en;q=0.9".parse().unwrap());
+        headers.insert("accept-encoding", "gzip, deflate, br".parse().unwrap());
+        headers.insert("x-stainless-lang", "js".parse().unwrap());
+        headers.insert("x-stainless-os", "macOS".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // All these headers should be kept
+        assert!(headers.contains_key("content-type"));
+        assert!(headers.contains_key("accept"));
+        assert!(headers.contains_key("user-agent"));
+        assert!(headers.contains_key("accept-language"));
+        assert!(headers.contains_key("accept-encoding"));
+        assert!(headers.contains_key("x-stainless-lang"));
+        assert!(headers.contains_key("x-stainless-os"));
+    }
+
+    #[test]
+    fn test_filter_headers_adds_authorization_when_onwards_key_present() {
+        let mut headers = HeaderMap::new();
+
+        // Add client authorization that should be stripped
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .onwards_key("sk-upstream-key".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Client auth should be removed and replaced with onwards_key
+        assert!(headers.contains_key("authorization"));
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer sk-upstream-key"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_no_authorization_when_onwards_key_absent() {
+        let mut headers = HeaderMap::new();
+
+        // Add client authorization
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            // No onwards_key configured
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Client auth should be removed and NOT replaced (no onwards_key)
+        assert!(!headers.contains_key("authorization"));
+    }
+
+    #[test]
+    fn test_filter_headers_adds_x_forwarded_proto() {
+        let mut headers = HeaderMap::new();
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        assert!(headers.contains_key("x-forwarded-proto"));
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_comprehensive_browser_request() {
+        // Simulate a real browser request with all the problematic headers
+        let mut headers = HeaderMap::new();
+
+        // Hop-by-hop
+        headers.insert("connection", "keep-alive".parse().unwrap());
+
+        // Auth (should be stripped)
+        headers.insert("authorization", "Bearer client-secret".parse().unwrap());
+
+        // Browser security
+        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        headers.insert("sec-fetch-mode", "cors".parse().unwrap());
+        headers.insert("sec-fetch-dest", "empty".parse().unwrap());
+        headers.insert("sec-ch-ua", "\"Chrome\";v=\"120\"".parse().unwrap());
+        headers.insert("sec-ch-ua-mobile", "?0".parse().unwrap());
+        headers.insert("sec-ch-ua-platform", "\"macOS\"".parse().unwrap());
+
+        // Browser context
+        headers.insert("origin", "http://localhost:5173".parse().unwrap());
+        headers.insert("referer", "http://localhost:5173/playground".parse().unwrap());
+        headers.insert("cookie", "session=xyz; token=abc".parse().unwrap());
+
+        // Caching
+        headers.insert("if-none-match", "\"abc123\"".parse().unwrap());
+
+        // Safe headers that should be kept
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.insert("user-agent", "Mozilla/5.0...".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.anthropic.com".parse().unwrap())
+            .onwards_key("sk-ant-upstream-key".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Verify all problematic headers were removed
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("sec-fetch-site"));
+        assert!(!headers.contains_key("sec-fetch-mode"));
+        assert!(!headers.contains_key("sec-fetch-dest"));
+        assert!(!headers.contains_key("sec-ch-ua"));
+        assert!(!headers.contains_key("sec-ch-ua-mobile"));
+        assert!(!headers.contains_key("sec-ch-ua-platform"));
+        assert!(!headers.contains_key("origin"));
+        assert!(!headers.contains_key("referer"));
+        assert!(!headers.contains_key("cookie"));
+        assert!(!headers.contains_key("if-none-match"));
+
+        // Verify safe headers were kept
+        assert!(headers.contains_key("content-type"));
+        assert!(headers.contains_key("accept"));
+        assert!(headers.contains_key("user-agent"));
+
+        // Verify Authorization was replaced with upstream key
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "Bearer sk-ant-upstream-key"
+        );
+
+        // Verify X-Forwarded-Proto was added
+        assert_eq!(
+            headers.get("x-forwarded-proto").unwrap().to_str().unwrap(),
+            "https"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_preserves_provider_specific_headers() {
+        let mut headers = HeaderMap::new();
+
+        // Provider-specific headers that should be kept
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        headers.insert("openai-organization", "org-123".parse().unwrap());
+        headers.insert("x-stainless-lang", "js".parse().unwrap());
+        headers.insert("x-stainless-runtime", "browser:chrome".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.anthropic.com".parse().unwrap())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // All provider-specific headers should be kept
+        assert!(headers.contains_key("anthropic-version"));
+        assert!(headers.contains_key("openai-organization"));
+        assert!(headers.contains_key("x-stainless-lang"));
+        assert!(headers.contains_key("x-stainless-runtime"));
+    }
 }
