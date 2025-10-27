@@ -252,9 +252,36 @@ pub async fn target_message_handler<T: HttpClient>(
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or(req.uri().path());
+
+    // Strip duplicate path prefix if the target URL already contains it
+    // For example: target URL is "https://api.openai.com/v1/" and request path is "/v1/chat/completions"
+    // We want to avoid "https://api.openai.com/v1/v1/chat/completions"
+    let target_path = target.url.path().trim_end_matches('/');
+    let request_path = path_and_query.strip_prefix('/').unwrap_or(path_and_query);
+
+    let path_to_join = if !target_path.is_empty() && target_path != "/" {
+        // Target has a non-root path (e.g., "/v1")
+        let target_path_no_slash = &target_path[1..]; // "v1"
+
+        if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+            // Request starts with the same path as target
+            if rest.is_empty() || rest.starts_with('/') {
+                // Either exact match or has a slash after (e.g., "v1/" or "v1")
+                rest.strip_prefix('/').unwrap_or(rest)
+            } else {
+                // Starts with target path but no slash after (e.g., "v1x") - not a real match
+                request_path
+            }
+        } else {
+            request_path
+        }
+    } else {
+        request_path
+    };
+
     let upstream_uri = target
         .url
-        .join(path_and_query.strip_prefix('/').unwrap_or(path_and_query))
+        .join(path_to_join)
         .map_err(|_| OnwardsErrorResponse::internal())?
         .to_string();
     let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
@@ -719,5 +746,185 @@ mod tests {
         assert!(headers.contains_key("openai-organization"));
         assert!(headers.contains_key("x-stainless-lang"));
         assert!(headers.contains_key("x-stainless-runtime"));
+    }
+
+    #[test]
+    fn test_path_stripping_with_duplicate_prefix() {
+        // Test the logic: target URL has "/v1", request path has "/v1/chat/completions"
+        // Should result in "https://api.openai.com/v1/chat/completions" not "/v1/v1/..."
+
+        let target_url = url::Url::parse("https://api.openai.com/v1/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/v1"
+        let request_path = "v1/chat/completions"; // already stripped leading /
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        assert_eq!(
+            result.as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_path_stripping_without_duplicate() {
+        // Test: target URL has no path, request path has "/v1/chat/completions"
+        // Should result in "https://api.openai.com/v1/chat/completions"
+
+        let target_url = url::Url::parse("https://api.openai.com/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/"
+        let request_path = "v1/chat/completions";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        assert_eq!(
+            result.as_str(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_path_stripping_with_actual_duplicate_paths() {
+        // Edge case: API actually has /v1/v1/something
+        // Target has no path, request has "v1/v1/something"
+
+        let target_url = url::Url::parse("https://api.example.com/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/');
+        let request_path = "v1/v1/something";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        assert_eq!(result.as_str(), "https://api.example.com/v1/v1/something");
+    }
+
+    #[test]
+    fn test_path_stripping_with_different_prefix() {
+        // Test: target has "/v2", request has "/v1/chat/completions"
+        // Should not strip, result in "https://api.example.com/v2/v1/chat/completions"
+
+        let target_url = url::Url::parse("https://api.example.com/v2/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/v2"
+        let request_path = "v1/chat/completions";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        assert_eq!(
+            result.as_str(),
+            "https://api.example.com/v2/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_path_stripping_with_query_params() {
+        // Test: path with query parameters should work correctly
+
+        let target_url = url::Url::parse("https://api.openai.com/v1/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/v1"
+        let request_path = "v1/chat/completions?stream=true";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        assert_eq!(
+            result.as_str(),
+            "https://api.openai.com/v1/chat/completions?stream=true"
+        );
+    }
+
+    #[test]
+    fn test_path_stripping_false_positive() {
+        // Test: path starts with target prefix but no slash after (e.g., "v1x")
+        // Should NOT strip since it's not a real path match
+
+        let target_url = url::Url::parse("https://api.example.com/v1/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/v1"
+        let request_path = "v1x/something";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        // Should NOT strip "v1" since "v1x" is not the same as "v1/"
+        assert_eq!(result.as_str(), "https://api.example.com/v1/v1x/something");
     }
 }
