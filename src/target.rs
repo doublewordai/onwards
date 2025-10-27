@@ -33,10 +33,24 @@ pub struct TargetSpec {
     pub rate_limit: Option<RateLimitParameters>,
 }
 
+/// Normalizes a URL to ensure it has a trailing slash
+///
+/// This is critical for correct path joining behavior. The url::Url::join() method
+/// treats URLs without trailing slashes as having a "file" component that gets replaced:
+/// - Without trailing slash: `https://api.example.com/v1` + `messages` = `https://api.example.com/messages` (wrong)
+/// - With trailing slash: `https://api.example.com/v1/` + `messages` = `https://api.example.com/v1/messages` (correct)
+fn normalize_url(mut url: Url) -> Url {
+    let path = url.path();
+    if !path.ends_with('/') {
+        url.set_path(&format!("{}/", path));
+    }
+    url
+}
+
 impl From<TargetSpec> for Target {
     fn from(value: TargetSpec) -> Self {
         Target {
-            url: value.url,
+            url: normalize_url(value.url),
             keys: value.keys,
             onwards_key: value.onwards_key,
             onwards_model: value.onwards_model,
@@ -900,5 +914,56 @@ mod tests {
         // Target without keys should remain None
         let target_without_keys = targets.targets.get("model-without-keys").unwrap();
         assert_eq!(target_without_keys.keys, None);
+    }
+
+    #[test]
+    fn test_normalize_url_adds_trailing_slash() {
+        // URL without trailing slash should get one added
+        let url_without_slash: Url = "https://api.example.com/v1".parse().unwrap();
+        let normalized = super::normalize_url(url_without_slash);
+        assert_eq!(normalized.as_str(), "https://api.example.com/v1/");
+
+        // URL with trailing slash should remain unchanged
+        let url_with_slash: Url = "https://api.example.com/v1/".parse().unwrap();
+        let normalized = super::normalize_url(url_with_slash);
+        assert_eq!(normalized.as_str(), "https://api.example.com/v1/");
+
+        // Root URL without path should get trailing slash
+        let root_url: Url = "https://api.example.com".parse().unwrap();
+        let normalized = super::normalize_url(root_url);
+        assert_eq!(normalized.as_str(), "https://api.example.com/");
+    }
+
+    #[test]
+    fn test_url_joining_after_normalization() {
+        // Test that normalized URLs join correctly with paths
+        let base_url: Url = "https://api.example.com/v1".parse().unwrap();
+        let normalized = super::normalize_url(base_url);
+
+        // Should append path segments correctly
+        let joined = normalized.join("messages").unwrap();
+        assert_eq!(joined.as_str(), "https://api.example.com/v1/messages");
+
+        // Should also work with leading slash
+        let normalized_again: Url = "https://api.example.com/v1".parse().unwrap();
+        let normalized_again = super::normalize_url(normalized_again);
+        let joined_with_slash = normalized_again.join("messages/create").unwrap();
+        assert_eq!(
+            joined_with_slash.as_str(),
+            "https://api.example.com/v1/messages/create"
+        );
+    }
+
+    #[test]
+    fn test_target_spec_conversion_normalizes_url() {
+        let target_spec = TargetSpec::builder()
+            .url("https://api.example.com/v1".parse().unwrap())
+            .onwards_key("test-key".to_string())
+            .build();
+
+        let target: Target = target_spec.into();
+
+        // URL should have trailing slash after conversion
+        assert_eq!(target.url.as_str(), "https://api.example.com/v1/");
     }
 }

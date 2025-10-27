@@ -14,8 +14,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        Uri,
-        HeaderMap,
+        HeaderMap, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -86,16 +85,16 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
         debug!("Adding authorization header for upstream {}", target.url);
         headers.insert("Authorization", format!("Bearer {key}").parse().unwrap());
     } else {
-        debug!("No upstream authentication configured for target {}", target.url);
+        debug!(
+            "No upstream authentication configured for target {}",
+            target.url
+        );
     }
 
     // Add X-Forwarded headers for transparency (preserve original request context)
     // Note: We don't have access to the original client IP in this handler,
     // so we only set X-Forwarded-Proto for now
-    headers.insert(
-        "x-forwarded-proto",
-        "https".parse().unwrap(),
-    );
+    headers.insert("x-forwarded-proto", "https".parse().unwrap());
 }
 
 /// The main handler responsible for forwarding requests to targets
@@ -496,10 +495,16 @@ mod tests {
     fn test_filter_headers_strips_caching_headers() {
         let mut headers = HeaderMap::new();
 
-        headers.insert("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        headers.insert(
+            "if-modified-since",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
         headers.insert("if-none-match", "\"abc123\"".parse().unwrap());
         headers.insert("if-match", "\"xyz789\"".parse().unwrap());
-        headers.insert("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
+        headers.insert(
+            "if-unmodified-since",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
         headers.insert("if-range", "\"abc123\"".parse().unwrap());
 
         let target = Target::builder()
@@ -641,7 +646,10 @@ mod tests {
 
         // Browser context
         headers.insert("origin", "http://localhost:5173".parse().unwrap());
-        headers.insert("referer", "http://localhost:5173/playground".parse().unwrap());
+        headers.insert(
+            "referer",
+            "http://localhost:5173/playground".parse().unwrap(),
+        );
         headers.insert("cookie", "session=xyz; token=abc".parse().unwrap());
 
         // Caching
