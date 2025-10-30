@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/doublewordai/onwards/compare/v0.8.4...v0.9.0) - 2025-10-30
+
+### Added
+
+- configurable auth header names
+
 ## [0.8.4](https://github.com/doublewordai/onwards/compare/v0.8.3...v0.8.4) - 2025-10-27
 
 ### Added
