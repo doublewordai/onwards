@@ -31,6 +31,10 @@ pub struct TargetSpec {
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub rate_limit: Option<RateLimitParameters>,
+    #[serde(default)]
+    pub upstream_auth_header_name: Option<String>,
+    #[serde(default)]
+    pub upstream_auth_header_prefix: Option<String>,
 }
 
 /// Normalizes a URL to ensure it has a trailing slash
@@ -60,6 +64,8 @@ impl From<TargetSpec> for Target {
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
                 )) as Arc<dyn RateLimiter>
             }),
+            upstream_auth_header_name: value.upstream_auth_header_name,
+            upstream_auth_header_prefix: value.upstream_auth_header_prefix,
         }
     }
 }
@@ -90,6 +96,8 @@ pub struct Target {
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub limiter: Option<Arc<dyn RateLimiter>>,
+    pub upstream_auth_header_name: Option<String>,
+    pub upstream_auth_header_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -14,7 +14,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, Uri,
+        HeaderMap, HeaderName, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -82,8 +82,21 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
 
     // Add Authorization header if target requires authentication to upstream
     if let Some(key) = &target.onwards_key {
-        debug!("Adding authorization header for upstream {}", target.url);
-        headers.insert("Authorization", format!("Bearer {key}").parse().unwrap());
+        let header_name_str = target
+            .upstream_auth_header_name
+            .as_deref()
+            .unwrap_or("Authorization");
+        let header_name = HeaderName::from_bytes(header_name_str.as_bytes()).unwrap();
+        let prefix = target
+            .upstream_auth_header_prefix
+            .as_deref()
+            .unwrap_or("Bearer ");
+        let header_value = format!("{}{}", prefix, key);
+        debug!(
+            "Adding {} header for upstream {}: {}",
+            header_name_str, target.url, header_value
+        );
+        headers.insert(header_name, header_value.parse().unwrap());
     } else {
         debug!(
             "No upstream authentication configured for target {}",
@@ -633,6 +646,94 @@ mod tests {
 
         // Client auth should be removed and NOT replaced (no onwards_key)
         assert!(!headers.contains_key("authorization"));
+    }
+
+    #[test]
+    fn test_filter_headers_custom_auth_header_name() {
+        let mut headers = HeaderMap::new();
+
+        // Add client authorization that should be stripped
+        headers.insert("authorization", "Bearer client-token".parse().unwrap());
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .onwards_key("my-api-key-123".to_string())
+            .upstream_auth_header_name("X-API-Key".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Client auth should be removed
+        assert!(!headers.contains_key("authorization"));
+
+        // Custom header should be added with default Bearer prefix
+        assert!(headers.contains_key("x-api-key"));
+        assert_eq!(
+            headers.get("x-api-key").unwrap().to_str().unwrap(),
+            "Bearer my-api-key-123"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_custom_auth_header_prefix() {
+        let mut headers = HeaderMap::new();
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .onwards_key("token-xyz".to_string())
+            .upstream_auth_header_prefix("ApiKey ".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Should use custom prefix with default Authorization header
+        assert!(headers.contains_key("authorization"));
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "ApiKey token-xyz"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_empty_auth_header_prefix() {
+        let mut headers = HeaderMap::new();
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .onwards_key("plain-api-key-456".to_string())
+            .upstream_auth_header_prefix("".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Should use empty prefix (just the key value)
+        assert!(headers.contains_key("authorization"));
+        assert_eq!(
+            headers.get("authorization").unwrap().to_str().unwrap(),
+            "plain-api-key-456"
+        );
+    }
+
+    #[test]
+    fn test_filter_headers_custom_header_name_and_prefix() {
+        let mut headers = HeaderMap::new();
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .onwards_key("secret-key".to_string())
+            .upstream_auth_header_name("X-Custom-Auth".to_string())
+            .upstream_auth_header_prefix("Token ".to_string())
+            .build();
+
+        filter_headers_for_upstream(&mut headers, &target);
+
+        // Should use both custom header name and custom prefix
+        assert!(!headers.contains_key("authorization"));
+        assert!(headers.contains_key("x-custom-auth"));
+        assert_eq!(
+            headers.get("x-custom-auth").unwrap().to_str().unwrap(),
+            "Token secret-key"
+        );
     }
 
     #[test]
