@@ -51,8 +51,8 @@ disable, set the `--watch` flag to false).
   - `requests_per_second`: Number of requests allowed per second
   - `burst_size`: Maximum burst size of requests
 - `pricing`: Configuration for token pricing (optional)
-  - `input_token_price`: Price per input token
-  - `output_token_price`: Price per output token
+  - `input_price_per_token`: Price per input token
+  - `output_price_per_token`: Price per output token
 
 ## Usage
 
