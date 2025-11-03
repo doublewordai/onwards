@@ -24,6 +24,27 @@ pub struct RateLimitParameters {
     pub burst_size: Option<NonZeroU32>,
 }
 
+/// Pricing information for token-based billing
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenPricing {
+    /// Price per input token (e.g., 0.00003 for $0.03 per 1K tokens)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_token: Option<f64>,
+
+    /// Price per output token (e.g., 0.00006 for $0.06 per 1K tokens)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_token: Option<f64>,
+}
+
+impl TokenPricing {
+    /// Calculate cost for a given number of input and output tokens
+    pub fn calculate_cost(&self, input_tokens: u64, output_tokens: u64) -> f64 {
+        let input_cost = self.input_price_per_token.unwrap_or(0.0) * (input_tokens as f64);
+        let output_cost = self.output_price_per_token.unwrap_or(0.0) * (output_tokens as f64);
+        input_cost + output_cost
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct TargetSpec {
     pub url: Url,
@@ -35,6 +56,10 @@ pub struct TargetSpec {
     pub upstream_auth_header_name: Option<String>,
     #[serde(default)]
     pub upstream_auth_header_prefix: Option<String>,
+
+    /// Token-based pricing information for billing/credits
+    #[serde(default)]
+    pub pricing: Option<TokenPricing>,
 }
 
 /// Normalizes a URL to ensure it has a trailing slash
@@ -66,6 +91,7 @@ impl From<TargetSpec> for Target {
             }),
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
+            pricing: value.pricing,
         }
     }
 }
@@ -98,6 +124,8 @@ pub struct Target {
     pub limiter: Option<Arc<dyn RateLimiter>>,
     pub upstream_auth_header_name: Option<String>,
     pub upstream_auth_header_prefix: Option<String>,
+    /// Token-based pricing information
+    pub pricing: Option<TokenPricing>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

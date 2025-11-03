@@ -177,10 +177,13 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    if let Some(ref limiter) = target.limiter {
-        if limiter.check().is_err() {
-            return Err(OnwardsErrorResponse::rate_limited());
-        }
+    // Clone pricing for later use in response extensions
+    let pricing = target.pricing.clone();
+
+    if let Some(ref limiter) = target.limiter
+        && limiter.check().is_err()
+    {
+        return Err(OnwardsErrorResponse::rate_limited());
     }
 
     // Extract bearer token for authentication and rate limiting
@@ -215,15 +218,13 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // Check per-key rate limits if bearer token is present
-    if let Some(token) = bearer_token {
-        if let Some(limiter) = state.targets.key_rate_limiters.get(token) {
-            if limiter.check().is_err() {
-                debug!("Per-key rate limit exceeded for token: {}", token);
-                return Err(OnwardsErrorResponse::rate_limited());
-            }
-        }
+    if let Some(token) = bearer_token
+        && let Some(limiter) = state.targets.key_rate_limiters.get(token)
+        && limiter.check().is_err()
+    {
+        debug!("Per-key rate limit exceeded for token: {}", token);
+        return Err(OnwardsErrorResponse::rate_limited());
     }
-
     // Users can specify the onwards value of the model field in the target
     // config. If not supplied, its left as is.
     if let Some(rewrite) = target.onwards_model.clone()
@@ -345,7 +346,19 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
-        Ok(response) => Ok(response),
+        Ok(mut response) => {
+            // Add pricing to response extensions for downstream handlers
+            if let Some(pricing) = pricing {
+                response.extensions_mut().insert(pricing.clone());
+                debug!(
+                    model = %model_name,
+                    input_price = ?pricing.input_price_per_token,
+                    output_price = ?pricing.output_price_per_token,
+                    "Added pricing to response extensions"
+                );
+            }
+            Ok(response)
+        }
         Err(e) => {
             error!(
                 "Error forwarding request to target url {}: {}",

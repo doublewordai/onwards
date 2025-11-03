@@ -400,7 +400,6 @@ pub fn build_metrics_layer_and_handle(
         .build_pair()
 }
 
-#[cfg(test)]
 pub mod test_utils {
     use super::*;
     use async_trait::async_trait;
@@ -1363,12 +1362,12 @@ mod tests {
 
         // Create a body transformation function that adds a "transformed": true field
         let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
-            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                if let Some(obj) = json_body.as_object_mut() {
-                    obj.insert("transformed".to_string(), json!(true));
-                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                        return Some(axum::body::Bytes::from(transformed_bytes));
-                    }
+            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                obj.insert("transformed".to_string(), json!(true));
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -1442,7 +1441,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
 
         let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(!forwarded_body.get("transformed").is_some());
+        assert!(forwarded_body.get("transformed").is_none());
         assert_eq!(forwarded_body["model"], "test-model");
         assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
     }
@@ -1516,25 +1515,24 @@ mod tests {
         // Create a transformation function that forces include_usage for streaming requests
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
             // Only transform requests to OpenAI chat completions endpoint
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        // Check if this is a streaming request
-                        if let Some(stream) = obj.get("stream") {
-                            if stream.as_bool() == Some(true) {
-                                // Force include_usage to true for streaming requests
-                                obj.insert(
-                                    "stream_options".to_string(),
-                                    json!({
-                                        "include_usage": true
-                                    }),
-                                );
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                // Check if this is a streaming request
+                if let Some(stream) = obj.get("stream")
+                    && stream.as_bool() == Some(true)
+                {
+                    // Force include_usage to true for streaming requests
+                    obj.insert(
+                        "stream_options".to_string(),
+                        json!({
+                            "include_usage": true
+                        }),
+                    );
 
-                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                                    return Some(axum::body::Bytes::from(transformed_bytes));
-                                }
-                            }
-                        }
+                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                        return Some(axum::body::Bytes::from(transformed_bytes));
                     }
                 }
             }
@@ -1588,24 +1586,21 @@ mod tests {
 
         // Create the same transformation function
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        if let Some(stream) = obj.get("stream") {
-                            if stream.as_bool() == Some(true) {
-                                obj.insert(
-                                    "stream_options".to_string(),
-                                    json!({
-                                        "include_usage": true
-                                    }),
-                                );
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+                && let Some(stream) = obj.get("stream")
+                && stream.as_bool() == Some(true)
+            {
+                obj.insert(
+                    "stream_options".to_string(),
+                    json!({
+                        "include_usage": true
+                    }),
+                );
 
-                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                                    return Some(axum::body::Bytes::from(transformed_bytes));
-                                }
-                            }
-                        }
-                    }
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -1636,7 +1631,7 @@ mod tests {
 
         let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(forwarded_body, original_body);
-        assert!(!forwarded_body.get("stream_options").is_some());
+        assert!(forwarded_body.get("stream_options").is_none());
     }
 
     #[tokio::test]
@@ -1659,14 +1654,13 @@ mod tests {
 
         // Create a transformation function that only transforms specific paths
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        obj.insert("path_transformed".to_string(), json!(path));
-                        if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                            return Some(axum::body::Bytes::from(transformed_bytes));
-                        }
-                    }
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                obj.insert("path_transformed".to_string(), json!(path));
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -1701,6 +1695,6 @@ mod tests {
 
         // Second request should NOT be transformed
         let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(!forwarded_body2.get("path_transformed").is_some());
+        assert!(forwarded_body2.get("path_transformed").is_none());
     }
 }

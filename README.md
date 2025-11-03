@@ -47,6 +47,12 @@ disable, set the `--watch` flag to false).
 - `keys`: Array of API keys required for authentication to this target (optional)
 - `upstream_auth_header_name`: Custom header name for upstream authentication (optional, defaults to "Authorization")
 - `upstream_auth_header_prefix`: Custom prefix for upstream authentication header value (optional, defaults to "Bearer ")
+- `rate_limit`: Configuration for per-target rate limiting (optional)
+  - `requests_per_second`: Number of requests allowed per second
+  - `burst_size`: Maximum burst size of requests
+- `pricing`: Configuration for token pricing (optional)
+  - `input_token_price`: Price per input token
+  - `output_token_price`: Price per output token
 
 ## Usage
 
@@ -258,6 +264,7 @@ Some providers use different prefixes or no prefix at all:
 ```
 
 This sends:
+
 - To provider1: `Authorization: ApiKey token-xyz`
 - To provider2: `Authorization: plain-key-456`
 
@@ -430,6 +437,29 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Authorization: Bearer fallback-key" \
   -H "Content-Type: application/json" \
   -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+## Pricing Information
+
+Onwards can include token-based pricing information in the response extensions. This allows downstream applications to action on usage of each request. This is configured per-target.
+
+This means that if you have a dynamic token price when a user's request is accepted the price is then agreed and recorded in the request/response.
+
+Add pricing information to any target in your `config.json`:
+
+```json
+{
+  "targets": {
+    "priced-model": {
+      "url": "https://api.provider.com",
+      "key": "your-api-key",
+      "pricing": {
+        "input_token_price": 0.0001,
+        "output_token_price": 0.0002
+      }
+    }
+  }
+}
 ```
 
 ## Testing
