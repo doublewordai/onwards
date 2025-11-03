@@ -454,8 +454,8 @@ Add pricing information to any target in your `config.json`:
       "url": "https://api.provider.com",
       "key": "your-api-key",
       "pricing": {
-        "input_token_price": 0.0001,
-        "output_token_price": 0.0002
+        "input_price_per_token": 0.0001,
+        "output_price_per_token": 0.0002
       }
     }
   }
