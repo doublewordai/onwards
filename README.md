@@ -441,7 +441,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ## Pricing Information
 
-Onwards can include token-based pricing information in the response extensions. This allows downstream applications to action on usage of each request. This is configured per-target.
+Onwards can include token-based pricing information in the response extensions. This allows downstream applications to take action on usage of each request. This is configured per-target.
 
 This means that if you have a dynamic token price when a user's request is accepted the price is then agreed and recorded in the request/response.
 
