@@ -1697,4 +1697,297 @@ mod tests {
         let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert!(forwarded_body2.get("path_transformed").is_none());
     }
+
+    mod price {
+        use super::*;
+        use target::{Target, Targets, TokenPricing};
+
+        #[tokio::test]
+        async fn test_pricing_added_to_response_headers_when_configured() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: Some(0.00003),
+                        output_price_per_token: Some(0.00006),
+                    })
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(
+                response.header("x-onwards-input-price-per-token"),
+                "0.00003"
+            );
+            assert_eq!(
+                response.header("x-onwards-output-price-per-token"),
+                "0.00006"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_no_pricing_headers_when_not_configured() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "free-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "free-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                response
+                    .maybe_header("x-onwards-input-price-per-token")
+                    .is_none()
+            );
+            assert!(
+                response
+                    .maybe_header("x-onwards-output-price-per-token")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_pricing_preserved_in_error_response_headers() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "error-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: Some(0.00001),
+                        output_price_per_token: Some(0.00002),
+                    })
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error": "Server error"}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "error-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 500);
+            assert_eq!(
+                response.header("x-onwards-input-price-per-token"),
+                "0.00001"
+            );
+            assert_eq!(
+                response.header("x-onwards-output-price-per-token"),
+                "0.00002"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_pricing_headers_with_different_models() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "expensive-model".to_string(),
+                Target::builder()
+                    .url("https://api.expensive.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: Some(0.0001),
+                        output_price_per_token: Some(0.0002),
+                    })
+                    .build(),
+            );
+            targets_map.insert(
+                "cheap-model".to_string(),
+                Target::builder()
+                    .url("https://api.cheap.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: Some(0.000001),
+                        output_price_per_token: Some(0.000002),
+                    })
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            // Test expensive model
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "expensive-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("x-onwards-input-price-per-token"), "0.0001");
+            assert_eq!(
+                response.header("x-onwards-output-price-per-token"),
+                "0.0002"
+            );
+
+            // Test cheap model
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "cheap-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(
+                response.header("x-onwards-input-price-per-token"),
+                "0.000001"
+            );
+            assert_eq!(
+                response.header("x-onwards-output-price-per-token"),
+                "0.000002"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_pricing_header_with_only_input_price() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "input-only-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: Some(0.00005),
+                        output_price_per_token: None,
+                    })
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "input-only-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(
+                response.header("x-onwards-input-price-per-token"),
+                "0.00005"
+            );
+            assert!(
+                response
+                    .maybe_header("x-onwards-output-price-per-token")
+                    .is_none()
+            );
+        }
+
+        #[tokio::test]
+        async fn test_pricing_header_with_only_output_price() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "output-only-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .pricing(TokenPricing {
+                        input_price_per_token: None,
+                        output_price_per_token: Some(0.00008),
+                    })
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "output-only-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                response
+                    .maybe_header("x-onwards-input-price-per-token")
+                    .is_none()
+            );
+            assert_eq!(
+                response.header("x-onwards-output-price-per-token"),
+                "0.00008"
+            );
+        }
+    }
 }

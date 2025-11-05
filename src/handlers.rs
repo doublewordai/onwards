@@ -177,7 +177,7 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // Clone pricing for later use in response extensions
+    // Clone pricing for later use in response headers
     let pricing = target.pricing.clone();
 
     if let Some(ref limiter) = target.limiter
@@ -347,14 +347,25 @@ pub async fn target_message_handler<T: HttpClient>(
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
         Ok(mut response) => {
-            // Add pricing to response extensions for downstream handlers
+            // Add pricing to response headers for client access
             if let Some(pricing) = pricing {
-                response.extensions_mut().insert(pricing.clone());
+                if let Some(input_price) = pricing.input_price_per_token {
+                    response.headers_mut().insert(
+                        "x-onwards-input-price-per-token",
+                        input_price.to_string().parse().unwrap(),
+                    );
+                }
+                if let Some(output_price) = pricing.output_price_per_token {
+                    response.headers_mut().insert(
+                        "x-onwards-output-price-per-token",
+                        output_price.to_string().parse().unwrap(),
+                    );
+                }
                 debug!(
                     model = %model_name,
                     input_price = ?pricing.input_price_per_token,
                     output_price = ?pricing.output_price_per_token,
-                    "Added pricing to response extensions"
+                    "Added pricing to response headers"
                 );
             }
             Ok(response)
