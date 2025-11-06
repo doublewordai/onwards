@@ -1698,21 +1698,23 @@ mod tests {
         assert!(forwarded_body2.get("path_transformed").is_none());
     }
 
-    mod price {
+    mod response_headers_pricing {
         use super::*;
-        use target::{Target, Targets, TokenPricing};
+        use std::collections::HashMap;
+        use target::{Target, Targets};
 
         #[tokio::test]
         async fn test_pricing_added_to_response_headers_when_configured() {
             let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00003".to_string());
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00006".to_string());
+
             targets_map.insert(
                 "gpt-4".to_string(),
                 Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: Some(0.00003),
-                        output_price_per_token: Some(0.00006),
-                    })
+                    .response_headers(response_headers)
                     .build(),
             );
 
@@ -1735,14 +1737,8 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert_eq!(
-                response.header("x-onwards-input-price-per-token"),
-                "0.00003"
-            );
-            assert_eq!(
-                response.header("x-onwards-output-price-per-token"),
-                "0.00006"
-            );
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00003");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00006");
         }
 
         #[tokio::test]
@@ -1774,29 +1770,22 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert!(
-                response
-                    .maybe_header("x-onwards-input-price-per-token")
-                    .is_none()
-            );
-            assert!(
-                response
-                    .maybe_header("x-onwards-output-price-per-token")
-                    .is_none()
-            );
+            assert!(response.maybe_header("Input-Price-Per-Token").is_none());
+            assert!(response.maybe_header("Output-Price-Per-Token").is_none());
         }
 
         #[tokio::test]
         async fn test_pricing_preserved_in_error_response_headers() {
             let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00001".to_string());
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00002".to_string());
+
             targets_map.insert(
                 "error-model".to_string(),
                 Target::builder()
                     .url("https://api.example.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: Some(0.00001),
-                        output_price_per_token: Some(0.00002),
-                    })
+                    .response_headers(response_headers)
                     .build(),
             );
 
@@ -1822,37 +1811,35 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 500);
-            assert_eq!(
-                response.header("x-onwards-input-price-per-token"),
-                "0.00001"
-            );
-            assert_eq!(
-                response.header("x-onwards-output-price-per-token"),
-                "0.00002"
-            );
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00002");
         }
 
         #[tokio::test]
         async fn test_pricing_headers_with_different_models() {
             let targets_map = Arc::new(DashMap::new());
+
+            let mut expensive_headers = HashMap::new();
+            expensive_headers.insert("Input-Price-Per-Token".to_string(), "0.0001".to_string());
+            expensive_headers.insert("Output-Price-Per-Token".to_string(), "0.0002".to_string());
+
             targets_map.insert(
                 "expensive-model".to_string(),
                 Target::builder()
                     .url("https://api.expensive.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: Some(0.0001),
-                        output_price_per_token: Some(0.0002),
-                    })
+                    .response_headers(expensive_headers)
                     .build(),
             );
+
+            let mut cheap_headers = HashMap::new();
+            cheap_headers.insert("Input-Price-Per-Token".to_string(), "0.000001".to_string());
+            cheap_headers.insert("Output-Price-Per-Token".to_string(), "0.000002".to_string());
+
             targets_map.insert(
                 "cheap-model".to_string(),
                 Target::builder()
                     .url("https://api.cheap.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: Some(0.000001),
-                        output_price_per_token: Some(0.000002),
-                    })
+                    .response_headers(cheap_headers)
                     .build(),
             );
 
@@ -1876,11 +1863,8 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert_eq!(response.header("x-onwards-input-price-per-token"), "0.0001");
-            assert_eq!(
-                response.header("x-onwards-output-price-per-token"),
-                "0.0002"
-            );
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.0001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.0002");
 
             // Test cheap model
             let response = server
@@ -1892,27 +1876,21 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert_eq!(
-                response.header("x-onwards-input-price-per-token"),
-                "0.000001"
-            );
-            assert_eq!(
-                response.header("x-onwards-output-price-per-token"),
-                "0.000002"
-            );
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.000001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.000002");
         }
 
         #[tokio::test]
         async fn test_pricing_header_with_only_input_price() {
             let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00005".to_string());
+
             targets_map.insert(
                 "input-only-model".to_string(),
                 Target::builder()
                     .url("https://api.example.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: Some(0.00005),
-                        output_price_per_token: None,
-                    })
+                    .response_headers(response_headers)
                     .build(),
             );
 
@@ -1935,28 +1913,21 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert_eq!(
-                response.header("x-onwards-input-price-per-token"),
-                "0.00005"
-            );
-            assert!(
-                response
-                    .maybe_header("x-onwards-output-price-per-token")
-                    .is_none()
-            );
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00005");
+            assert!(response.maybe_header("Output-Price-Per-Token").is_none());
         }
 
         #[tokio::test]
         async fn test_pricing_header_with_only_output_price() {
             let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00008".to_string());
+
             targets_map.insert(
                 "output-only-model".to_string(),
                 Target::builder()
                     .url("https://api.example.com".parse().unwrap())
-                    .pricing(TokenPricing {
-                        input_price_per_token: None,
-                        output_price_per_token: Some(0.00008),
-                    })
+                    .response_headers(response_headers)
                     .build(),
             );
 
@@ -1979,15 +1950,8 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
-            assert!(
-                response
-                    .maybe_header("x-onwards-input-price-per-token")
-                    .is_none()
-            );
-            assert_eq!(
-                response.header("x-onwards-output-price-per-token"),
-                "0.00008"
-            );
+            assert!(response.maybe_header("Input-Price-Per-Token").is_none());
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00008");
         }
     }
 }

@@ -50,9 +50,7 @@ disable, set the `--watch` flag to false).
 - `rate_limit`: Configuration for per-target rate limiting (optional)
   - `requests_per_second`: Number of requests allowed per second
   - `burst_size`: Maximum burst size of requests
-- `pricing`: Configuration for token pricing (optional)
-  - `input_price_per_token`: Price per input token
-  - `output_price_per_token`: Price per output token
+- `response_header`: Key-value pairs to add or override headers in the response (optional)
 
 ## Usage
 
@@ -439,11 +437,13 @@ curl -X POST http://localhost:3000/v1/chat/completions \
   -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
 
-## Pricing Information
+## Response Headers
 
-Onwards can include token-based pricing information in the response extensions. This allows downstream applications to take action on usage of each request. This is configured per-target.
+Onwards can include custom headers in the response, these can override existing headers or add new ones.
 
-This means that if you have a dynamic token price when a user's request is accepted the price is then agreed and recorded in the request/response.
+### Pricing
+
+One use of this feature is to set pricing information. This means that if you have a dynamic token price when a user's request is accepted the price is then agreed and can be recorded in the HTTP headers.
 
 Add pricing information to any target in your `config.json`:
 
@@ -453,13 +453,10 @@ Add pricing information to any target in your `config.json`:
     "priced-model": {
       "url": "https://api.provider.com",
       "key": "your-api-key",
-      "pricing": {
-        "input_price_per_token": 0.0001,
-        "output_price_per_token": 0.0002
+      "response_headers": {
+        "Input-Price-Per-Token": "0.0001",
+        "Output-Price-Per-Token": "0.0002"
       }
-    }
-  }
-}
 ```
 
 ## Testing

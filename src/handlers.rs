@@ -14,7 +14,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, Uri,
+        HeaderMap, HeaderName, HeaderValue, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -177,8 +177,8 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // Clone pricing for later use in response headers
-    let pricing = target.pricing.clone();
+    // Clone response headers for later use in response
+    let response_headers = target.response_headers.clone();
 
     if let Some(ref limiter) = target.limiter
         && limiter.check().is_err()
@@ -347,25 +347,19 @@ pub async fn target_message_handler<T: HttpClient>(
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
         Ok(mut response) => {
-            // Add pricing to response headers for client access
-            if let Some(pricing) = pricing {
-                if let Some(input_price) = pricing.input_price_per_token {
-                    response.headers_mut().insert(
-                        "x-onwards-input-price-per-token",
-                        input_price.to_string().parse().unwrap(),
-                    );
+            // Add custom response headers for client access
+            if let Some(headers) = response_headers {
+                for (key, value) in headers.iter() {
+                    if let (Ok(header_name), Ok(header_value)) =
+                        (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                    {
+                        response.headers_mut().insert(header_name, header_value);
+                    }
                 }
-                if let Some(output_price) = pricing.output_price_per_token {
-                    response.headers_mut().insert(
-                        "x-onwards-output-price-per-token",
-                        output_price.to_string().parse().unwrap(),
-                    );
-                }
-                debug!(
+                trace!(
                     model = %model_name,
-                    input_price = ?pricing.input_price_per_token,
-                    output_price = ?pricing.output_price_per_token,
-                    "Added pricing to response headers"
+                    headers = ?headers,
+                    "Added custom response headers"
                 );
             }
             Ok(response)
