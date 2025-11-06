@@ -35,6 +35,10 @@ pub struct TargetSpec {
     pub upstream_auth_header_name: Option<String>,
     #[serde(default)]
     pub upstream_auth_header_prefix: Option<String>,
+
+    /// Custom headers to include in responses (e.g., pricing, metadata)
+    #[serde(default)]
+    pub response_headers: Option<HashMap<String, String>>,
 }
 
 /// Normalizes a URL to ensure it has a trailing slash
@@ -66,6 +70,7 @@ impl From<TargetSpec> for Target {
             }),
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
+            response_headers: value.response_headers,
         }
     }
 }
@@ -98,6 +103,8 @@ pub struct Target {
     pub limiter: Option<Arc<dyn RateLimiter>>,
     pub upstream_auth_header_name: Option<String>,
     pub upstream_auth_header_prefix: Option<String>,
+    /// Custom headers to include in responses (e.g., pricing, metadata)
+    pub response_headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
