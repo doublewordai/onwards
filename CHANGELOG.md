@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/doublewordai/onwards/compare/v0.9.0...v0.9.1) - 2025-11-06
+
+### Added
+
+- add response headers ([#29](https://github.com/doublewordai/onwards/pull/29))
+
 ## [0.9.0](https://github.com/doublewordai/onwards/compare/v0.8.4...v0.9.0) - 2025-10-30
 
 ### Added
