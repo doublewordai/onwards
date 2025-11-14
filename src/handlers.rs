@@ -177,11 +177,11 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    if let Some(ref limiter) = target.limiter {
-        if limiter.check().is_err() {
+    // Check target-level rate limit
+    if let Some(ref limiter) = target.limiter
+        && limiter.check().is_err() {
             return Err(OnwardsErrorResponse::rate_limited());
         }
-    }
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -215,14 +215,45 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // Check per-key rate limits if bearer token is present
-    if let Some(token) = bearer_token {
-        if let Some(limiter) = state.targets.key_rate_limiters.get(token) {
-            if limiter.check().is_err() {
+    if let Some(token) = bearer_token
+        && let Some(limiter) = state.targets.key_rate_limiters.get(token)
+            && limiter.check().is_err() {
                 debug!("Per-key rate limit exceeded for token: {}", token);
                 return Err(OnwardsErrorResponse::rate_limited());
             }
+
+    // Acquire concurrency permits (both target-level and per-key)
+    // These guards will be held until the end of the function, ensuring the permit is released
+    let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
+        match limiter.acquire().await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                debug!(
+                    "Target-level concurrency limit exceeded for model: {}",
+                    model_name
+                );
+                return Err(OnwardsErrorResponse::concurrency_limited());
+            }
         }
-    }
+    } else {
+        None
+    };
+
+    let _key_concurrency_guard = if let Some(token) = bearer_token {
+        if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
+            match limiter.acquire().await {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    debug!("Per-key concurrency limit exceeded for token: {}", token);
+                    return Err(OnwardsErrorResponse::concurrency_limited());
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Users can specify the onwards value of the model field in the target
     // config. If not supplied, its left as is.

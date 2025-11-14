@@ -13,7 +13,7 @@ use governor::{DefaultDirectRateLimiter, Quota};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info, trace};
 use url::Url;
@@ -24,6 +24,11 @@ pub struct RateLimitParameters {
     pub burst_size: Option<NonZeroU32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrencyLimitParameters {
+    pub max_concurrent_requests: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct TargetSpec {
     pub url: Url,
@@ -31,6 +36,7 @@ pub struct TargetSpec {
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub rate_limit: Option<RateLimitParameters>,
+    pub concurrency_limit: Option<ConcurrencyLimitParameters>,
     #[serde(default)]
     pub upstream_auth_header_name: Option<String>,
     #[serde(default)]
@@ -64,6 +70,10 @@ impl From<TargetSpec> for Target {
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
                 )) as Arc<dyn RateLimiter>
             }),
+            concurrency_limiter: value.concurrency_limit.map(|cl| {
+                SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
+                    as Arc<dyn ConcurrencyLimiter>
+            }),
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
         }
@@ -77,6 +87,45 @@ pub trait RateLimiter: std::fmt::Debug + Send + Sync {
 impl RateLimiter for DefaultDirectRateLimiter {
     fn check(&self) -> Result<(), ()> {
         self.check().map_err(|_| ())
+    }
+}
+
+/// RAII guard that holds a concurrency permit
+/// When dropped, the permit is automatically released back to the semaphore
+#[derive(Debug)]
+pub struct ConcurrencyGuard {
+    _permit: SemaphorePermit<'static>,
+}
+
+#[async_trait]
+pub trait ConcurrencyLimiter: std::fmt::Debug + Send + Sync {
+    /// Try to acquire a concurrency permit
+    /// Returns Ok(guard) if permit was acquired, Err(()) if at capacity
+    async fn acquire(&self) -> Result<ConcurrencyGuard, ()>;
+}
+
+/// Semaphore-based concurrency limiter
+#[derive(Debug)]
+pub struct SemaphoreConcurrencyLimiter {
+    semaphore: &'static Semaphore,
+}
+
+impl SemaphoreConcurrencyLimiter {
+    pub fn new(max_concurrent: usize) -> Arc<Self> {
+        Arc::new(Self {
+            semaphore: Box::leak(Box::new(Semaphore::new(max_concurrent))),
+        })
+    }
+}
+
+#[async_trait]
+impl ConcurrencyLimiter for SemaphoreConcurrencyLimiter {
+    async fn acquire(&self) -> Result<ConcurrencyGuard, ()> {
+        // Try to acquire without blocking - fail immediately if at capacity
+        match self.semaphore.try_acquire() {
+            Ok(permit) => Ok(ConcurrencyGuard { _permit: permit }),
+            Err(_) => Err(()),
+        }
     }
 }
 
@@ -96,6 +145,7 @@ pub struct Target {
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub limiter: Option<Arc<dyn RateLimiter>>,
+    pub concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
     pub upstream_auth_header_name: Option<String>,
     pub upstream_auth_header_prefix: Option<String>,
 }
@@ -104,6 +154,7 @@ pub struct Target {
 pub struct KeyDefinition {
     pub key: String,
     pub rate_limit: Option<RateLimitParameters>,
+    pub concurrency_limit: Option<ConcurrencyLimitParameters>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -127,6 +178,8 @@ pub struct Targets {
     pub targets: Arc<DashMap<String, Target>>,
     /// Direct rate limiters per actual API key (actual key -> rate limiter)
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
+    /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
+    pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
 }
 
 #[async_trait]
@@ -269,6 +322,7 @@ impl Targets {
 
         // Set up rate limiters keyed by actual API keys
         let key_rate_limiters = Arc::new(DashMap::new());
+        let key_concurrency_limiters = Arc::new(DashMap::new());
 
         for (_key_id, key_def) in key_definitions {
             if let Some(ref rate_limit) = key_def.rate_limit {
@@ -280,7 +334,13 @@ impl Targets {
                     ),
                 ));
                 // Map the actual API key to its rate limiter
-                key_rate_limiters.insert(key_def.key, limiter);
+                key_rate_limiters.insert(key_def.key.clone(), limiter);
+            }
+            if let Some(ref concurrency_limit) = key_def.concurrency_limit {
+                let limiter: Arc<dyn ConcurrencyLimiter> =
+                    SemaphoreConcurrencyLimiter::new(concurrency_limit.max_concurrent_requests);
+                // Map the actual API key to its concurrency limiter
+                key_concurrency_limiters.insert(key_def.key.clone(), limiter);
             }
         }
 
@@ -303,6 +363,7 @@ impl Targets {
         Ok(Targets {
             targets,
             key_rate_limiters,
+            key_concurrency_limiters,
         })
     }
 
@@ -314,6 +375,7 @@ impl Targets {
     {
         let targets = Arc::clone(&self.targets);
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
+        let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
 
         let mut stream = targets_stream.stream().await?;
 
@@ -360,6 +422,26 @@ impl Targets {
                         // Insert/update key rate limiters
                         for entry in new_targets.key_rate_limiters.iter() {
                             key_rate_limiters.insert(entry.key().clone(), entry.value().clone());
+                        }
+
+                        // Update key concurrency limiters atomically (same pattern)
+                        let current_concurrency_limiter_keys: Vec<String> =
+                            key_concurrency_limiters
+                                .iter()
+                                .map(|entry| entry.key().clone())
+                                .collect();
+
+                        // Remove deleted concurrency limiters
+                        for key in current_concurrency_limiter_keys {
+                            if !new_targets.key_concurrency_limiters.contains_key(&key) {
+                                key_concurrency_limiters.remove(&key);
+                            }
+                        }
+
+                        // Insert/update key concurrency limiters
+                        for entry in new_targets.key_concurrency_limiters.iter() {
+                            key_concurrency_limiters
+                                .insert(entry.key().clone(), entry.value().clone());
                         }
                     }
                     Err(e) => {
@@ -441,6 +523,7 @@ mod tests {
         Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         }
     }
 
@@ -500,6 +583,7 @@ mod tests {
         let targets = Targets {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create sequence of target updates
@@ -560,6 +644,7 @@ mod tests {
         let updated_targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -807,6 +892,7 @@ mod tests {
                     requests_per_second: NonZeroU32::new(10).unwrap(),
                     burst_size: Some(NonZeroU32::new(20).unwrap()),
                 }),
+                concurrency_limit: None,
             },
         );
 
@@ -854,6 +940,7 @@ mod tests {
             KeyDefinition {
                 key: "sk-unlimited-123".to_string(),
                 rate_limit: None,
+                concurrency_limit: None,
             },
         );
 
@@ -973,5 +1060,163 @@ mod tests {
 
         // URL should have trailing slash after conversion
         assert_eq!(target.url.as_str(), "https://api.example.com/v1/");
+    }
+
+    #[test]
+    fn test_target_with_concurrency_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .concurrency_limit(ConcurrencyLimitParameters {
+                    max_concurrent_requests: 5,
+                })
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should have concurrency limiter configured
+        assert!(target.concurrency_limiter.is_some());
+    }
+
+    #[test]
+    fn test_target_without_concurrency_limit_config() {
+        let mut targets = HashMap::new();
+        targets.insert(
+            "test-model".to_string(),
+            TargetSpec::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        let config_file = ConfigFile {
+            targets,
+            auth: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+        let target = targets.targets.get("test-model").unwrap();
+
+        // Target should not have concurrency limiter
+        assert!(target.concurrency_limiter.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limiter_allows_requests() {
+        let limiter = SemaphoreConcurrencyLimiter::new(2);
+
+        // First request should succeed
+        let guard1 = limiter.acquire().await;
+        assert!(guard1.is_ok());
+
+        // Second request should succeed
+        let guard2 = limiter.acquire().await;
+        assert!(guard2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limiter_blocks_at_capacity() {
+        let limiter = SemaphoreConcurrencyLimiter::new(2);
+
+        // Acquire all available permits
+        let _guard1 = limiter.acquire().await.unwrap();
+        let _guard2 = limiter.acquire().await.unwrap();
+
+        // Third request should fail
+        let guard3 = limiter.acquire().await;
+        assert!(guard3.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limiter_releases_on_drop() {
+        let limiter = SemaphoreConcurrencyLimiter::new(1);
+
+        {
+            // Acquire the only permit
+            let _guard = limiter.acquire().await.unwrap();
+
+            // Second request should fail while guard is held
+            assert!(limiter.acquire().await.is_err());
+        } // guard drops here
+
+        // After guard is dropped, should be able to acquire again
+        let guard = limiter.acquire().await;
+        assert!(guard.is_ok());
+    }
+
+    #[test]
+    fn test_per_key_concurrency_limiting_configured() {
+        use std::collections::HashMap;
+
+        // Create key definitions with concurrency limits
+        let mut key_definitions = HashMap::new();
+        key_definitions.insert(
+            "limited_user".to_string(),
+            KeyDefinition {
+                key: "sk-limited-123".to_string(),
+                rate_limit: None,
+                concurrency_limit: Some(ConcurrencyLimitParameters {
+                    max_concurrent_requests: 3,
+                }),
+            },
+        );
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // The actual API key should have a concurrency limiter
+        assert!(
+            targets
+                .key_concurrency_limiters
+                .contains_key("sk-limited-123")
+        );
+    }
+
+    #[test]
+    fn test_per_key_concurrency_limiting_not_configured() {
+        use std::collections::HashMap;
+
+        // Create key definition without concurrency limits
+        let mut key_definitions = HashMap::new();
+        key_definitions.insert(
+            "unlimited_user".to_string(),
+            KeyDefinition {
+                key: "sk-unlimited-456".to_string(),
+                rate_limit: None,
+                concurrency_limit: None,
+            },
+        );
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // Key without concurrency limits should not have a concurrency limiter
+        assert!(
+            !targets
+                .key_concurrency_limiters
+                .contains_key("sk-unlimited-456")
+        );
     }
 }

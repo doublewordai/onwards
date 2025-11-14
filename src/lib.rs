@@ -516,6 +516,118 @@ pub mod test_utils {
             Ok((self.response_builder)())
         }
     }
+
+    /// A mock HTTP client that can be controlled with triggers
+    /// Useful for testing concurrency limits with precise control over when requests complete
+    pub struct TriggeredMockHttpClient {
+        pub requests: Arc<Mutex<Vec<MockRequest>>>,
+        response_builder: Arc<dyn Fn() -> axum::response::Response + Send + Sync>,
+        triggers: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
+    }
+
+    impl TriggeredMockHttpClient {
+        pub fn new(status: StatusCode, body: &str) -> Self {
+            let body = body.to_string();
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    axum::response::Response::builder()
+                        .status(status)
+                        .body(axum::body::Body::from(body.clone()))
+                        .unwrap()
+                }),
+                triggers: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        pub fn get_requests(&self) -> Vec<MockRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// Complete the nth request (0-indexed)
+        /// Returns true if the trigger was sent, false if no such request exists
+        pub fn complete_request(&self, index: usize) -> bool {
+            let mut triggers = self.triggers.lock().unwrap();
+            if index < triggers.len() {
+                // Remove and send the trigger
+                let trigger = triggers.remove(index);
+                let _ = trigger.send(());
+                true
+            } else {
+                false
+            }
+        }
+
+        /// Complete all pending requests
+        pub fn complete_all(&self) {
+            let mut triggers = self.triggers.lock().unwrap();
+            while let Some(trigger) = triggers.pop() {
+                let _ = trigger.send(());
+            }
+        }
+    }
+
+    impl std::fmt::Debug for TriggeredMockHttpClient {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TriggeredMockHttpClient")
+                .field("requests", &self.requests)
+                .field("pending_triggers", &self.triggers.lock().unwrap().len())
+                .field("response_builder", &"<closure>")
+                .finish()
+        }
+    }
+
+    impl Clone for TriggeredMockHttpClient {
+        fn clone(&self) -> Self {
+            Self {
+                requests: Arc::clone(&self.requests),
+                response_builder: Arc::clone(&self.response_builder),
+                triggers: Arc::clone(&self.triggers),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HttpClient for TriggeredMockHttpClient {
+        async fn request(
+            &self,
+            req: axum::extract::Request,
+        ) -> Result<axum::response::Response, Box<dyn std::error::Error + Send + Sync>> {
+            // Extract request details
+            let method = req.method().to_string();
+            let uri = req.uri().to_string();
+            let headers = req
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+
+            // Read body
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .to_vec();
+
+            // Store the request
+            let mock_request = MockRequest {
+                method,
+                uri,
+                headers,
+                body,
+            };
+            self.requests.lock().unwrap().push(mock_request);
+
+            // Create a trigger for this request
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.triggers.lock().unwrap().push(tx);
+
+            // Wait for the trigger to be fired
+            let _ = rx.await;
+
+            // Return the configured response
+            Ok((self.response_builder)())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +647,7 @@ mod tests {
         let targets = target::Targets {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -575,6 +688,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(
@@ -642,6 +756,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -734,6 +849,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -799,6 +915,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -887,6 +1004,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -990,6 +1108,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1047,6 +1166,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1120,6 +1240,7 @@ mod tests {
         let targets = Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1167,6 +1288,189 @@ mod tests {
         assert!(!urls.iter().any(|&url| url.contains("blocked.example.com")));
     }
 
+    #[tokio::test]
+    async fn test_concurrency_limiting_below_limits() {
+        use target::SemaphoreConcurrencyLimiter;
+
+        // Create a target with concurrency limit
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "limited-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .concurrency_limiter(SemaphoreConcurrencyLimiter::new(5))
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        // Request should succeed (within concurrency limit)
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "limited-model",
+                "messages": [{"role": "user", "content": "Test"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+
+        // Verify request made it through
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limiting_at_limits() {
+        use std::rc::Rc;
+        use target::SemaphoreConcurrencyLimiter;
+
+        // Create a target with concurrency limit of 1
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "limited-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .concurrency_limiter(SemaphoreConcurrencyLimiter::new(1))
+                .build(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+        };
+
+        let mock_client =
+            test_utils::TriggeredMockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = Rc::new(TestServer::new(router).unwrap());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                // Start first request in background (it will block waiting for trigger)
+                let server_clone = Rc::clone(&server);
+                let handle1 = tokio::task::spawn_local(async move {
+                    server_clone
+                        .post("/v1/chat/completions")
+                        .json(&json!({"model": "limited-model", "messages": []}))
+                        .await
+                });
+
+                // Give it a moment to start and acquire the permit
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // Now send second request - should be rejected immediately since limit is 1
+                let response2 = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({"model": "limited-model", "messages": []}))
+                    .await;
+
+                // Second request should be rejected (concurrency limit exceeded)
+                assert_eq!(response2.status_code(), 429);
+                let body: serde_json::Value = response2.json();
+                assert_eq!(body["code"], "concurrency_limit_exceeded");
+
+                // Complete the first request
+                mock_client.complete_request(0);
+                let response1 = handle1.await.unwrap();
+                assert_eq!(response1.status_code(), 200);
+
+                // Only 1 request made it to the mock client
+                assert_eq!(mock_client.get_requests().len(), 1);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_per_key_concurrency_limiting() {
+        use std::rc::Rc;
+        use target::SemaphoreConcurrencyLimiter;
+
+        // Create a target without concurrency limit
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "test-model".to_string(),
+            Target::builder()
+                .url("https://api.example.com".parse().unwrap())
+                .build(),
+        );
+
+        // Set up per-key concurrency limiter
+        let key_concurrency_limiters = Arc::new(DashMap::new());
+        key_concurrency_limiters.insert(
+            "sk-limited-key".to_string(),
+            SemaphoreConcurrencyLimiter::new(1) as Arc<dyn target::ConcurrencyLimiter>,
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters,
+        };
+
+        let mock_client =
+            test_utils::TriggeredMockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let router = build_router(app_state);
+        let server = Rc::new(TestServer::new(router).unwrap());
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                // Start first request with the limited key (it will block waiting for trigger)
+                let server_clone = Rc::clone(&server);
+                let handle1 = tokio::task::spawn_local(async move {
+                    server_clone
+                        .post("/v1/chat/completions")
+                        .add_header(
+                            axum::http::HeaderName::from_static("authorization"),
+                            axum::http::HeaderValue::from_static("Bearer sk-limited-key"),
+                        )
+                        .json(&json!({"model": "test-model", "messages": []}))
+                        .await
+                });
+
+                // Give it a moment to start and acquire the permit
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+                // Second request with same key should be rejected
+                let response2 = server
+                    .post("/v1/chat/completions")
+                    .add_header(
+                        axum::http::HeaderName::from_static("authorization"),
+                        axum::http::HeaderValue::from_static("Bearer sk-limited-key"),
+                    )
+                    .json(&json!({"model": "test-model", "messages": []}))
+                    .await;
+
+                // Second request should be rejected (per-key concurrency limit exceeded)
+                assert_eq!(response2.status_code(), 429);
+                let body: serde_json::Value = response2.json();
+                assert_eq!(body["code"], "concurrency_limit_exceeded");
+
+                // Complete the first request
+                mock_client.complete_request(0);
+                let response1 = handle1.await.unwrap();
+                assert_eq!(response1.status_code(), 200);
+
+                // Only 1 request made it to the mock client
+                assert_eq!(mock_client.get_requests().len(), 1);
+            })
+            .await;
+    }
+
     mod metrics {
         use super::*;
         use axum_test::TestServer;
@@ -1187,6 +1491,7 @@ mod tests {
             let targets = Targets {
                 targets,
                 key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1359,6 +1664,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1417,6 +1723,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1463,6 +1770,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -1511,6 +1819,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -1584,6 +1893,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create the same transformation function
@@ -1655,6 +1965,7 @@ mod tests {
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
         };
 
         // Create a transformation function that only transforms specific paths

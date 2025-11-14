@@ -52,6 +52,18 @@ impl OnwardsErrorResponse {
         }
     }
 
+    pub fn concurrency_limited() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "Too many concurrent requests. Please wait for some requests to complete before sending more.".to_string(),
+                r#type: "rate_limit_error".to_string(),
+                param: None,
+                code: "concurrency_limit_exceeded".to_string(),
+            }),
+            status: StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+
     pub fn internal() -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
