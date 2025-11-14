@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/doublewordai/onwards/compare/v0.9.1...v0.9.2) - 2025-11-14
+
+### Added
+
+- global and per-key concurrency limits
+
+### Other
+
+- Merge branch 'main' of https://github.com/doublewordai/onwards
+
 ## [0.9.1](https://github.com/doublewordai/onwards/compare/v0.9.0...v0.9.1) - 2025-11-06
 
 ### Added
