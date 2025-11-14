@@ -400,7 +400,6 @@ pub fn build_metrics_layer_and_handle(
         .build_pair()
 }
 
-#[cfg(test)]
 pub mod test_utils {
     use super::*;
     use async_trait::async_trait;
@@ -1669,12 +1668,12 @@ mod tests {
 
         // Create a body transformation function that adds a "transformed": true field
         let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
-            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                if let Some(obj) = json_body.as_object_mut() {
-                    obj.insert("transformed".to_string(), json!(true));
-                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                        return Some(axum::body::Bytes::from(transformed_bytes));
-                    }
+            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                obj.insert("transformed".to_string(), json!(true));
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -1749,7 +1748,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
 
         let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(!forwarded_body.get("transformed").is_some());
+        assert!(forwarded_body.get("transformed").is_none());
         assert_eq!(forwarded_body["model"], "test-model");
         assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
     }
@@ -1825,25 +1824,24 @@ mod tests {
         // Create a transformation function that forces include_usage for streaming requests
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
             // Only transform requests to OpenAI chat completions endpoint
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        // Check if this is a streaming request
-                        if let Some(stream) = obj.get("stream") {
-                            if stream.as_bool() == Some(true) {
-                                // Force include_usage to true for streaming requests
-                                obj.insert(
-                                    "stream_options".to_string(),
-                                    json!({
-                                        "include_usage": true
-                                    }),
-                                );
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                // Check if this is a streaming request
+                if let Some(stream) = obj.get("stream")
+                    && stream.as_bool() == Some(true)
+                {
+                    // Force include_usage to true for streaming requests
+                    obj.insert(
+                        "stream_options".to_string(),
+                        json!({
+                            "include_usage": true
+                        }),
+                    );
 
-                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                                    return Some(axum::body::Bytes::from(transformed_bytes));
-                                }
-                            }
-                        }
+                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                        return Some(axum::body::Bytes::from(transformed_bytes));
                     }
                 }
             }
@@ -1898,24 +1896,21 @@ mod tests {
 
         // Create the same transformation function
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        if let Some(stream) = obj.get("stream") {
-                            if stream.as_bool() == Some(true) {
-                                obj.insert(
-                                    "stream_options".to_string(),
-                                    json!({
-                                        "include_usage": true
-                                    }),
-                                );
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+                && let Some(stream) = obj.get("stream")
+                && stream.as_bool() == Some(true)
+            {
+                obj.insert(
+                    "stream_options".to_string(),
+                    json!({
+                        "include_usage": true
+                    }),
+                );
 
-                                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                                    return Some(axum::body::Bytes::from(transformed_bytes));
-                                }
-                            }
-                        }
-                    }
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -1946,7 +1941,7 @@ mod tests {
 
         let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(forwarded_body, original_body);
-        assert!(!forwarded_body.get("stream_options").is_some());
+        assert!(forwarded_body.get("stream_options").is_none());
     }
 
     #[tokio::test]
@@ -1970,14 +1965,13 @@ mod tests {
 
         // Create a transformation function that only transforms specific paths
         let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions" {
-                if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
-                    if let Some(obj) = json_body.as_object_mut() {
-                        obj.insert("path_transformed".to_string(), json!(path));
-                        if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                            return Some(axum::body::Bytes::from(transformed_bytes));
-                        }
-                    }
+            if path == "/v1/chat/completions"
+                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
+                && let Some(obj) = json_body.as_object_mut()
+            {
+                obj.insert("path_transformed".to_string(), json!(path));
+                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
+                    return Some(axum::body::Bytes::from(transformed_bytes));
                 }
             }
             None
@@ -2012,6 +2006,269 @@ mod tests {
 
         // Second request should NOT be transformed
         let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(!forwarded_body2.get("path_transformed").is_some());
+        assert!(forwarded_body2.get("path_transformed").is_none());
+    }
+
+    mod response_headers_pricing {
+        use super::*;
+        use std::collections::HashMap;
+        use target::{Target, Targets};
+
+        #[tokio::test]
+        async fn test_pricing_added_to_response_headers_when_configured() {
+            let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00003".to_string());
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00006".to_string());
+
+            targets_map.insert(
+                "gpt-4".to_string(),
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .response_headers(response_headers)
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00003");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00006");
+        }
+
+        #[tokio::test]
+        async fn test_no_pricing_headers_when_not_configured() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "free-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "free-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(response.maybe_header("Input-Price-Per-Token").is_none());
+            assert!(response.maybe_header("Output-Price-Per-Token").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_pricing_preserved_in_error_response_headers() {
+            let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00001".to_string());
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00002".to_string());
+
+            targets_map.insert(
+                "error-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .response_headers(response_headers)
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error": "Server error"}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "error-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 500);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00002");
+        }
+
+        #[tokio::test]
+        async fn test_pricing_headers_with_different_models() {
+            let targets_map = Arc::new(DashMap::new());
+
+            let mut expensive_headers = HashMap::new();
+            expensive_headers.insert("Input-Price-Per-Token".to_string(), "0.0001".to_string());
+            expensive_headers.insert("Output-Price-Per-Token".to_string(), "0.0002".to_string());
+
+            targets_map.insert(
+                "expensive-model".to_string(),
+                Target::builder()
+                    .url("https://api.expensive.com".parse().unwrap())
+                    .response_headers(expensive_headers)
+                    .build(),
+            );
+
+            let mut cheap_headers = HashMap::new();
+            cheap_headers.insert("Input-Price-Per-Token".to_string(), "0.000001".to_string());
+            cheap_headers.insert("Output-Price-Per-Token".to_string(), "0.000002".to_string());
+
+            targets_map.insert(
+                "cheap-model".to_string(),
+                Target::builder()
+                    .url("https://api.cheap.com".parse().unwrap())
+                    .response_headers(cheap_headers)
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            // Test expensive model
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "expensive-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.0001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.0002");
+
+            // Test cheap model
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "cheap-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.000001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.000002");
+        }
+
+        #[tokio::test]
+        async fn test_pricing_header_with_only_input_price() {
+            let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Input-Price-Per-Token".to_string(), "0.00005".to_string());
+
+            targets_map.insert(
+                "input-only-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .response_headers(response_headers)
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "input-only-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00005");
+            assert!(response.maybe_header("Output-Price-Per-Token").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_pricing_header_with_only_output_price() {
+            let targets_map = Arc::new(DashMap::new());
+            let mut response_headers = HashMap::new();
+            response_headers.insert("Output-Price-Per-Token".to_string(), "0.00008".to_string());
+
+            targets_map.insert(
+                "output-only-model".to_string(),
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .response_headers(response_headers)
+                    .build(),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "output-only-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(response.maybe_header("Input-Price-Per-Token").is_none());
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.00008");
+        }
     }
 }

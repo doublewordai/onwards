@@ -14,7 +14,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, Uri,
+        HeaderMap, HeaderName, HeaderValue, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -179,9 +179,19 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Check target-level rate limit
     if let Some(ref limiter) = target.limiter
-        && limiter.check().is_err() {
-            return Err(OnwardsErrorResponse::rate_limited());
-        }
+        && limiter.check().is_err()
+    {
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
+
+    if let Some(ref limiter) = target.limiter
+        && limiter.check().is_err()
+    {
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
+
+    // Clone response headers for later use in response
+    let response_headers = target.response_headers.clone();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -217,10 +227,11 @@ pub async fn target_message_handler<T: HttpClient>(
     // Check per-key rate limits if bearer token is present
     if let Some(token) = bearer_token
         && let Some(limiter) = state.targets.key_rate_limiters.get(token)
-            && limiter.check().is_err() {
-                debug!("Per-key rate limit exceeded for token: {}", token);
-                return Err(OnwardsErrorResponse::rate_limited());
-            }
+        && limiter.check().is_err()
+    {
+        debug!("Per-key rate limit exceeded for token: {}", token);
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
 
     // Acquire concurrency permits (both target-level and per-key)
     // These guards will be held until the end of the function, ensuring the permit is released
@@ -376,7 +387,24 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // forward the request to the target, returning the response as-is
     match state.http_client.request(req).await {
-        Ok(response) => Ok(response),
+        Ok(mut response) => {
+            // Add custom response headers for client access
+            if let Some(headers) = response_headers {
+                for (key, value) in headers.iter() {
+                    if let (Ok(header_name), Ok(header_value)) =
+                        (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                    {
+                        response.headers_mut().insert(header_name, header_value);
+                    }
+                }
+                trace!(
+                    model = %model_name,
+                    headers = ?headers,
+                    "Added custom response headers"
+                );
+            }
+            Ok(response)
+        }
         Err(e) => {
             error!(
                 "Error forwarding request to target url {}: {}",

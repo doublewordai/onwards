@@ -49,6 +49,10 @@ disable, set the `--watch` flag to false).
 - `concurrency_limit`: Concurrency limiting configuration with `max_concurrent_requests` (optional)
 - `upstream_auth_header_name`: Custom header name for upstream authentication (optional, defaults to "Authorization")
 - `upstream_auth_header_prefix`: Custom prefix for upstream authentication header value (optional, defaults to "Bearer ")
+- `rate_limit`: Configuration for per-target rate limiting (optional)
+  - `requests_per_second`: Number of requests allowed per second
+  - `burst_size`: Maximum burst size of requests
+- `response_header`: Key-value pairs to add or override headers in the response (optional)
 
 ## Usage
 
@@ -108,7 +112,8 @@ curl -X GET http://localhost:3000/v1/organization/usage/embeddings \
 
 ### Metrics
 
-To enable Prometheus metrics, start the gateway with the `--metrics` flag, then access the metrics endpoint by:
+To enable Prometheus metrics, start the gateway with the `--metrics` flag, then
+access the metrics endpoint by:
 
 ```bash
 curl http://localhost:9090/metrics
@@ -116,7 +121,8 @@ curl http://localhost:9090/metrics
 
 ## Authentication
 
-Onwards supports bearer token authentication to control access to your AI targets. You can configure authentication keys both globally and per-target.
+Onwards supports bearer token authentication to control access to your AI
+targets. You can configure authentication keys both globally and per-target.
 
 ### Global Authentication Keys
 
@@ -161,11 +167,15 @@ In this example:
 - `secure-gpt-4` requires a valid bearer token from the `keys` array
 - `open-local` has no authentication requirements
 
-If both global and local keys are supplied, either global or local keys will be valid for accessing models with local keys.
+If both global and local keys are supplied, either global or local keys will be
+valid for accessing models with local keys.
 
 ### How Authentication Works
 
-When a target has `keys` configured, requests must include a valid `Authorization: Bearer <token>` header where `<token>` matches one of the configured keys. If global keys are configured, they are automatically added to each target's key set.
+When a target has `keys` configured, requests must include a valid
+`Authorization: Bearer <token>` header where `<token>` matches one of the
+configured keys. If global keys are configured, they are automatically added to
+each target's key set.
 
 **Successful authenticated request:**
 
@@ -218,7 +228,10 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ## Upstream Authentication Configuration
 
-By default, Onwards sends upstream API keys using the standard `Authorization: Bearer <key>` header format. However, some AI providers use different authentication header formats. You can customize both the header name and prefix per target.
+By default, Onwards sends upstream API keys using the standard `Authorization:
+Bearer <key>` header format. However, some AI providers use different
+authentication header formats. You can customize both the header name and
+prefix per target.
 
 ### Custom Header Name
 
@@ -260,6 +273,7 @@ Some providers use different prefixes or no prefix at all:
 ```
 
 This sends:
+
 - To provider1: `Authorization: ApiKey token-xyz`
 - To provider2: `Authorization: plain-key-456`
 
@@ -352,7 +366,10 @@ rate limiting applied.
 
 ## Per-API-Key Rate Limiting
 
-In addition to per-target rate limiting, Onwards supports individual rate limits for different API keys. This allows you to provide different service tiers to your users - for example, basic users might have lower limits while premium users get higher limits.
+In addition to per-target rate limiting, Onwards supports individual rate
+limits for different API keys. This allows you to provide different service
+tiers to your users - for example, basic users might have lower limits while
+premium users get higher limits.
 
 ### Configuration
 
@@ -436,7 +453,10 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 ## Concurrency Limiting
 
-In addition to rate limiting (which controls *how fast* requests are made), Onwards supports concurrency limiting to control *how many* requests are processed simultaneously. This is useful for managing resource usage and preventing overload.
+In addition to rate limiting (which controls *how fast* requests are made),
+Onwards supports concurrency limiting to control *how many* requests are
+processed simultaneously. This is useful for managing resource usage and
+preventing overload.
 
 ### Per-Target Concurrency Limiting
 
@@ -456,7 +476,9 @@ Limit the number of concurrent requests to a specific target:
 }
 ```
 
-With this configuration, only 5 requests will be processed concurrently for this target. Additional requests will receive a `429 Too Many Requests` response until an in-flight request completes.
+With this configuration, only 5 requests will be processed concurrently for
+this target. Additional requests will receive a `429 Too Many Requests`
+response until an in-flight request completes.
 
 ### Per-API-Key Concurrency Limiting
 
@@ -521,16 +543,43 @@ You can use both rate limiting and concurrency limiting together:
 ### How It Works
 
 Concurrency limits use a semaphore-based approach:
+
 1. When a request arrives, it tries to acquire a permit
 2. If a permit is available, the request proceeds (holding the permit)
 3. If no permits are available, the request is rejected with `429 Too Many Requests`
 4. When the request completes, the permit is automatically released
 
 The error response distinguishes between rate limiting and concurrency limiting:
+
 - Rate limit: `"code": "rate_limit"`
 - Concurrency limit: `"code": "concurrency_limit_exceeded"`
 
 Both use HTTP 429 status code for consistency.
+
+## Response Headers
+
+Onwards can include custom headers in the response for each target. These can
+override existing headers or add new ones.
+
+### Pricing
+
+One use of this feature is to set pricing information. This means that if you
+have a dynamic token price when a user's request is accepted the price is then
+agreed and can be recorded in the HTTP headers.
+
+Add pricing information to any target in your `config.json`:
+
+```json
+{
+  "targets": {
+    "priced-model": {
+      "url": "https://api.provider.com",
+      "key": "your-api-key",
+      "response_headers": {
+        "Input-Price-Per-Token": "0.0001",
+        "Output-Price-Per-Token": "0.0002"
+      }
+```
 
 ## Testing
 
