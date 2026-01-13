@@ -1228,6 +1228,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "notify",
+ "rand",
  "rstest",
  "serde",
  "serde_json",

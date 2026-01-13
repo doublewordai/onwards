@@ -5,9 +5,6 @@
 //! targets as OpenAI-compatible models.
 use serde::{Deserialize, Serialize};
 
-use crate::target::Target;
-use std::collections::HashMap;
-
 /// Requests to the /v1/{*} endpoints get forwarded onto OpenAI compatible targets.
 /// The target is chosen based on the model specified in the request body.
 #[derive(Debug, Clone, Deserialize)]
@@ -29,20 +26,6 @@ pub(crate) struct Model {
     pub(crate) owned_by: String,
 }
 
-impl Model {
-    /// Models returned by the /v1/models endpoint are each associated with a target.
-    pub(crate) fn from_target(id: &str, _target: &Target) -> Self {
-        Model {
-            id: id.to_owned(),
-            created: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as u32,
-            object: "model".into(),
-            owned_by: "None".into(),
-        }
-    }
-}
 
 /// The response from the /v1/models endpoint, which is a list of models.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -54,11 +37,19 @@ pub(crate) struct ListModelResponse {
 }
 
 impl ListModelResponse {
-    /// Creates a new ListModelResponse from a filtered HashMap of targets.
-    pub(crate) fn from_filtered_targets(targets: &HashMap<String, Target>) -> Self {
-        let data = targets
+    /// Creates a new ListModelResponse from a list of model names.
+    pub(crate) fn from_model_names(model_names: &[String]) -> Self {
+        let data = model_names
             .iter()
-            .map(|(key, target)| Model::from_target(key, target))
+            .map(|name| Model {
+                id: name.clone(),
+                created: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as u32,
+                object: "model".into(),
+                owned_by: "None".into(),
+            })
             .collect::<Vec<_>>();
         ListModelResponse {
             object: "list".into(),
