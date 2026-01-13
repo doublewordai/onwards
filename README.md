@@ -761,6 +761,98 @@ With `priority` strategy, all traffic goes to the first provider. The second
 provider only receives traffic when the first is unavailable or returns a
 fallback status code.
 
+### Fallback Configuration
+
+The `fallback` configuration controls automatic retry behavior when requests fail:
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "fallback": {
+        "enabled": true,
+        "on_status": [429, 502, 503, 5],
+        "on_rate_limit": true
+      },
+      "providers": [
+        { "url": "https://api1.example.com" },
+        { "url": "https://api2.example.com" }
+      ]
+    }
+  }
+}
+```
+
+**Configuration options:**
+
+- `enabled`: Master switch for fallback behavior (default: false)
+- `on_status`: Status codes that trigger fallback. Supports wildcards:
+  - `5` matches all 5xx codes (500-599)
+  - `50` matches 500-509
+  - `502` matches exactly 502
+- `on_rate_limit`: Whether to fallback when hitting local rate limits (pool-level or provider-level)
+
+When fallback is triggered, the next provider is selected based on the configured strategy (weighted random resamples from remaining pool, priority uses definition order).
+
+### Pool-Level Configuration
+
+For advanced configurations, use the pool format with explicit `providers` array. This allows pool-level settings that apply to all providers:
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "keys": ["api-key-1", "api-key-2"],
+      "rate_limit": {
+        "requests_per_second": 100,
+        "burst_size": 200
+      },
+      "concurrency_limit": {
+        "max_concurrent_requests": 50
+      },
+      "strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_status": [5],
+        "on_rate_limit": true
+      },
+      "providers": [
+        {
+          "url": "https://api.openai.com",
+          "onwards_key": "sk-key-1",
+          "weight": 3
+        },
+        {
+          "url": "https://api.openai.com",
+          "onwards_key": "sk-key-2",
+          "weight": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+**Pool-level options:**
+
+- `keys`: Access control keys for this alias (who can call this endpoint)
+- `rate_limit`: Rate limit applied to all requests to this alias
+- `concurrency_limit`: Concurrency limit for all requests to this alias
+- `response_headers`: Default headers added to all responses
+- `strategy`: Load balancing strategy (`weighted_random` or `priority`)
+- `fallback`: Fallback configuration for retrying failed requests
+- `providers`: Array of provider configurations
+
+**Provider-level options:**
+
+- `url`: Provider endpoint URL
+- `onwards_key`: API key for this provider
+- `onwards_model`: Model name override
+- `weight`: Traffic weight (default: 1)
+- `rate_limit`: Provider-specific rate limit
+- `concurrency_limit`: Provider-specific concurrency limit
+- `response_headers`: Provider-specific response headers
+
 ### Use Cases
 
 - **Multiple API Keys**: Distribute load across multiple API keys from the same
