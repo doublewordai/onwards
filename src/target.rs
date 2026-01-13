@@ -1504,4 +1504,154 @@ mod tests {
                 .contains_key("sk-unlimited-456")
         );
     }
+
+    #[test]
+    fn test_fallback_config_wildcard_status_codes() {
+        let config = FallbackConfig {
+            enabled: true,
+            on_status: vec![5, 429], // 5 = all 5xx codes, 429 = exact match
+            on_rate_limit: false,
+        };
+
+        // 5 should match all 5xx codes
+        assert!(config.should_fallback_on_status(500));
+        assert!(config.should_fallback_on_status(502));
+        assert!(config.should_fallback_on_status(503));
+        assert!(config.should_fallback_on_status(599));
+
+        // 429 exact match
+        assert!(config.should_fallback_on_status(429));
+
+        // Should not match other codes
+        assert!(!config.should_fallback_on_status(400));
+        assert!(!config.should_fallback_on_status(404));
+        assert!(!config.should_fallback_on_status(200));
+    }
+
+    #[test]
+    fn test_fallback_config_two_digit_wildcard() {
+        let config = FallbackConfig {
+            enabled: true,
+            on_status: vec![50, 52], // 50 = 500-509, 52 = 520-529
+            on_rate_limit: false,
+        };
+
+        // 50 matches 500-509
+        assert!(config.should_fallback_on_status(500));
+        assert!(config.should_fallback_on_status(504));
+        assert!(config.should_fallback_on_status(509));
+        assert!(!config.should_fallback_on_status(510));
+
+        // 52 matches 520-529
+        assert!(config.should_fallback_on_status(520));
+        assert!(config.should_fallback_on_status(522));
+        assert!(!config.should_fallback_on_status(530));
+    }
+
+    #[test]
+    fn test_fallback_config_disabled_ignores_status() {
+        let config = FallbackConfig {
+            enabled: false,
+            on_status: vec![5, 429],
+            on_rate_limit: true,
+        };
+
+        // Even matching codes should return false when disabled
+        assert!(!config.should_fallback_on_status(500));
+        assert!(!config.should_fallback_on_status(429));
+    }
+
+    #[test]
+    fn test_backwards_compat_single_target_config() {
+        // Old single-target format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com",
+                    "onwards_key": "sk-test"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom); // default
+        assert!(!pool.fallback_enabled());
+    }
+
+    #[test]
+    fn test_backwards_compat_list_format_config() {
+        // Old list format
+        let json = r#"{
+            "targets": {
+                "gpt-4": [
+                    { "url": "https://api1.example.com", "weight": 3 },
+                    { "url": "https://api2.example.com", "weight": 1 }
+                ]
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom); // default
+    }
+
+    #[test]
+    fn test_pool_config_with_strategy() {
+        // New pool format with explicit strategy
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "strategy": "priority",
+                    "fallback": {
+                        "enabled": true,
+                        "on_status": [429, 5],
+                        "on_rate_limit": true
+                    },
+                    "providers": [
+                        { "url": "https://primary.example.com" },
+                        { "url": "https://backup.example.com" }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.strategy(), LoadBalanceStrategy::Priority);
+        assert!(pool.fallback_enabled());
+        assert!(pool.should_fallback_on_status(429));
+        assert!(pool.should_fallback_on_status(500));
+        assert!(pool.should_fallback_on_rate_limit());
+    }
+
+    #[test]
+    fn test_pool_config_weighted_random_strategy() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "strategy": "weighted_random",
+                    "providers": [
+                        { "url": "https://api1.example.com", "weight": 3 },
+                        { "url": "https://api2.example.com", "weight": 1 }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom);
+    }
 }

@@ -371,4 +371,154 @@ mod tests {
         assert_eq!(pool.providers()[0].weight, 1);
         assert_eq!(pool.providers()[1].weight, 2);
     }
+
+    #[test]
+    fn test_select_ordered_priority_strategy() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://primary.example.com"),
+                weight: 1,
+            },
+            Provider {
+                target: create_test_target("https://secondary.example.com"),
+                weight: 10,
+            },
+            Provider {
+                target: create_test_target("https://tertiary.example.com"),
+                weight: 5,
+            },
+        ];
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+        );
+
+        // Priority strategy should always return providers in definition order
+        // regardless of weights
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(order.len(), 3);
+        assert_eq!(order[0].0, 0); // primary first
+        assert_eq!(order[1].0, 1); // secondary second
+        assert_eq!(order[2].0, 2); // tertiary third
+        assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
+        assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+        assert_eq!(order[2].1.url.as_str(), "https://tertiary.example.com/");
+    }
+
+    #[test]
+    fn test_select_ordered_weighted_random_includes_all() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://api1.example.com"),
+                weight: 3,
+            },
+            Provider {
+                target: create_test_target("https://api2.example.com"),
+                weight: 1,
+            },
+        ];
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        // Weighted random should include all providers (order varies)
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(order.len(), 2);
+
+        // Both providers should be present
+        let urls: std::collections::HashSet<_> =
+            order.iter().map(|(_, t)| t.url.as_str()).collect();
+        assert!(urls.contains("https://api1.example.com/"));
+        assert!(urls.contains("https://api2.example.com/"));
+    }
+
+    #[test]
+    fn test_select_ordered_weighted_random_distribution() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://heavy.example.com"),
+                weight: 9,
+            },
+            Provider {
+                target: create_test_target("https://light.example.com"),
+                weight: 1,
+            },
+        ];
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        // Run multiple times and count how often heavy is first
+        let mut heavy_first = 0;
+        for _ in 0..100 {
+            let order: Vec<_> = pool.select_ordered().collect();
+            if order[0].1.url.as_str() == "https://heavy.example.com/" {
+                heavy_first += 1;
+            }
+        }
+
+        // With 9:1 weight ratio, heavy should be first roughly 90% of the time
+        // Allow for variance: should be at least 70% and at most 99%
+        assert!(
+            heavy_first >= 70 && heavy_first <= 99,
+            "Expected heavy to be first ~90% of the time, got {}%",
+            heavy_first
+        );
+    }
+
+    #[test]
+    fn test_select_ordered_empty_pool() {
+        let pool = ProviderPool::new(vec![]);
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_select_ordered_single_provider() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![Provider {
+            target: create_test_target("https://only.example.com"),
+            weight: 1,
+        }];
+
+        // Test both strategies with single provider
+        for strategy in [LoadBalanceStrategy::Priority, LoadBalanceStrategy::WeightedRandom] {
+            let pool = ProviderPool::with_config(
+                providers.clone(),
+                None,
+                None,
+                None,
+                None,
+                strategy,
+            );
+
+            let order: Vec<_> = pool.select_ordered().collect();
+            assert_eq!(order.len(), 1);
+            assert_eq!(order[0].1.url.as_str(), "https://only.example.com/");
+        }
+    }
 }
