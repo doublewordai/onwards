@@ -174,34 +174,6 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // Select a provider from the pool (uses weighted load balancing)
-    let target = match pool.select() {
-        Some(target) => {
-            debug!("Selected target for model '{}': {:?}", model_name, target.url);
-            target
-        }
-        None => {
-            debug!("No available provider in pool for model: {}", model_name);
-            return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        }
-    };
-
-    // Check target-level rate limit
-    if let Some(ref limiter) = target.limiter
-        && limiter.check().is_err()
-    {
-        return Err(OnwardsErrorResponse::rate_limited());
-    }
-
-    if let Some(ref limiter) = target.limiter
-        && limiter.check().is_err()
-    {
-        return Err(OnwardsErrorResponse::rate_limited());
-    }
-
-    // Clone response headers for later use in response
-    let response_headers = target.response_headers.clone();
-
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
         .headers()
@@ -209,11 +181,11 @@ pub async fn target_message_handler<T: HttpClient>(
         .and_then(|auth_header| auth_header.to_str().ok())
         .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
 
-    // Validate API key if target has keys configured
-    if let Some(ref keys) = target.keys {
+    // Validate API key using pool-level keys
+    if let Some(keys) = pool.keys() {
         match bearer_token {
             Some(token) => {
-                trace!("Validating bearer token");
+                trace!("Validating bearer token against pool keys");
                 if auth::validate_bearer_token(keys, token) {
                     debug!("Bearer token validation successful");
                 } else {
@@ -228,10 +200,40 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     } else {
         debug!(
-            "Target '{}' has no keys configured - allowing request",
+            "Pool '{}' has no keys configured - allowing request",
             model_name
         );
     }
+
+    // Check pool-level rate limit before selecting a provider
+    if let Some(limiter) = pool.pool_limiter()
+        && limiter.check().is_err()
+    {
+        debug!("Pool-level rate limit exceeded for model: {}", model_name);
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
+
+    // Select a provider from the pool (uses weighted load balancing)
+    let target = match pool.select() {
+        Some(target) => {
+            debug!("Selected target for model '{}': {:?}", model_name, target.url);
+            target
+        }
+        None => {
+            debug!("No available provider in pool for model: {}", model_name);
+            return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
+        }
+    };
+
+    // Check provider-level rate limit
+    if let Some(ref limiter) = target.limiter
+        && limiter.check().is_err()
+    {
+        return Err(OnwardsErrorResponse::rate_limited());
+    }
+
+    // Clone response headers for later use in response
+    let response_headers = target.response_headers.clone();
 
     // Check per-key rate limits if bearer token is present
     if let Some(token) = bearer_token
@@ -242,14 +244,29 @@ pub async fn target_message_handler<T: HttpClient>(
         return Err(OnwardsErrorResponse::rate_limited());
     }
 
-    // Acquire concurrency permits (both target-level and per-key)
+    // Acquire concurrency permits (pool-level, provider-level, and per-key)
     // These guards will be held until the end of the function, ensuring the permit is released
+    let _pool_concurrency_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
+        match limiter.acquire().await {
+            Ok(guard) => Some(guard),
+            Err(_) => {
+                debug!(
+                    "Pool-level concurrency limit exceeded for model: {}",
+                    model_name
+                );
+                return Err(OnwardsErrorResponse::concurrency_limited());
+            }
+        }
+    } else {
+        None
+    };
+
     let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
         match limiter.acquire().await {
             Ok(guard) => Some(guard),
             Err(_) => {
                 debug!(
-                    "Target-level concurrency limit exceeded for model: {}",
+                    "Provider-level concurrency limit exceeded for model: {}",
                     model_name
                 );
                 return Err(OnwardsErrorResponse::concurrency_limited());
@@ -436,8 +453,7 @@ pub async fn models<T: HttpClient>(
         .and_then(|auth_header| auth_header.to_str().ok())
         .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
 
-    // Filter targets based on bearer token permissions
-    // For a pool, we check the first provider's keys (all providers in a pool share access)
+    // Filter targets based on bearer token permissions using pool-level keys
     let accessible_models: Vec<String> = state
         .targets
         .targets
@@ -445,23 +461,18 @@ pub async fn models<T: HttpClient>(
         .filter(|entry| {
             let pool = entry.value();
 
-            // Get first provider's target for key checking
-            let Some(target) = pool.first_target() else {
-                return false;
+            // If pool has no keys configured, it's publicly accessible
+            let Some(keys) = pool.keys() else {
+                return true;
             };
 
-            // If target has no keys configured, it's publicly accessible
-            if target.keys.is_none() {
-                return true;
-            }
-
-            // If target has keys but no bearer token provided, deny access
+            // If pool has keys but no bearer token provided, deny access
             let Some(token) = bearer_token else {
                 return false;
             };
 
-            // Validate bearer token against target's keys
-            auth::validate_bearer_token(target.keys.as_ref().unwrap(), token)
+            // Validate bearer token against pool's keys
+            auth::validate_bearer_token(keys, token)
         })
         .map(|entry| entry.key().clone())
         .collect();

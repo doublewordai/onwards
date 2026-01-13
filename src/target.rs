@@ -9,7 +9,10 @@
 //! Targets support load balancing across multiple providers. A single alias can
 //! route to multiple downstream providers with different API keys, weights, and
 //! rate limits. The configuration is backwards compatible - a single object is
-//! treated as a list with one provider.
+//! treated as a pool with one provider.
+//!
+//! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
+//! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
 use anyhow::anyhow;
@@ -37,6 +40,56 @@ pub struct ConcurrencyLimitParameters {
     pub max_concurrent_requests: usize,
 }
 
+/// Provider-specific configuration for a single upstream provider.
+/// This is used within a pool to configure individual providers.
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct ProviderSpec {
+    pub url: Url,
+    pub onwards_key: Option<String>,
+    pub onwards_model: Option<String>,
+    pub rate_limit: Option<RateLimitParameters>,
+    pub concurrency_limit: Option<ConcurrencyLimitParameters>,
+    #[serde(default)]
+    pub upstream_auth_header_name: Option<String>,
+    #[serde(default)]
+    pub upstream_auth_header_prefix: Option<String>,
+
+    /// Custom headers to include in responses (e.g., pricing, metadata)
+    #[serde(default)]
+    pub response_headers: Option<HashMap<String, String>>,
+
+    /// Weight for load balancing (higher = more traffic). Defaults to 1.
+    #[serde(default = "default_weight")]
+    #[builder(default = default_weight())]
+    pub weight: u32,
+}
+
+/// Pool-level configuration with shared settings and multiple providers.
+/// This is the recommended format for load balancing configurations.
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct PoolSpec {
+    /// Access control keys for this alias (who can call this endpoint)
+    #[serde(default)]
+    pub keys: Option<KeySet>,
+
+    /// Pool-level rate limit (applies to all requests to this alias)
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitParameters>,
+
+    /// Pool-level concurrency limit (applies to all requests to this alias)
+    #[serde(default)]
+    pub concurrency_limit: Option<ConcurrencyLimitParameters>,
+
+    /// Default response headers for all providers in this pool
+    #[serde(default)]
+    pub response_headers: Option<HashMap<String, String>>,
+
+    /// The list of providers to load balance across
+    pub providers: Vec<ProviderSpec>,
+}
+
+/// Legacy single-provider configuration (backwards compatible).
+/// New configurations should prefer PoolSpec with providers array.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
 pub struct TargetSpec {
     pub url: Url,
@@ -64,24 +117,59 @@ fn default_weight() -> u32 {
     1
 }
 
-/// A target specification that can be either a single provider or a list of providers.
-/// This enables backwards-compatible configuration where a single object is treated
-/// as a list with one provider.
+/// A target specification that supports multiple configuration formats.
+/// This enables backwards-compatible configuration while supporting new pool-based format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TargetSpecOrList {
-    /// Multiple providers for load balancing
+    /// Pool with explicit providers array (recommended for load balancing)
+    Pool(PoolSpec),
+    /// Array of providers (legacy format, still supported)
     List(Vec<TargetSpec>),
     /// Single provider (backwards compatible)
     Single(TargetSpec),
 }
 
 impl TargetSpecOrList {
-    /// Convert to a list of target specs
-    pub fn into_list(self) -> Vec<TargetSpec> {
+    /// Convert to pool-level config and list of provider specs
+    pub fn into_pool_config(self) -> (Option<KeySet>, Option<RateLimitParameters>, Option<ConcurrencyLimitParameters>, Option<HashMap<String, String>>, Vec<ProviderSpec>) {
         match self {
-            TargetSpecOrList::List(list) => list,
-            TargetSpecOrList::Single(spec) => vec![spec],
+            TargetSpecOrList::Pool(pool) => {
+                (pool.keys, pool.rate_limit, pool.concurrency_limit, pool.response_headers, pool.providers)
+            }
+            TargetSpecOrList::List(list) => {
+                // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
+                // Take keys from first provider for backwards compatibility
+                let keys = list.first().and_then(|t| t.keys.clone());
+                let providers = list.into_iter().map(|t| ProviderSpec {
+                    url: t.url,
+                    onwards_key: t.onwards_key,
+                    onwards_model: t.onwards_model,
+                    rate_limit: t.rate_limit,
+                    concurrency_limit: t.concurrency_limit,
+                    upstream_auth_header_name: t.upstream_auth_header_name,
+                    upstream_auth_header_prefix: t.upstream_auth_header_prefix,
+                    response_headers: t.response_headers,
+                    weight: t.weight,
+                }).collect();
+                (keys, None, None, None, providers)
+            }
+            TargetSpecOrList::Single(spec) => {
+                // Single provider: use its keys as pool-level, convert to ProviderSpec
+                let keys = spec.keys.clone();
+                let provider = ProviderSpec {
+                    url: spec.url,
+                    onwards_key: spec.onwards_key,
+                    onwards_model: spec.onwards_model,
+                    rate_limit: spec.rate_limit,
+                    concurrency_limit: spec.concurrency_limit,
+                    upstream_auth_header_name: spec.upstream_auth_header_name,
+                    upstream_auth_header_prefix: spec.upstream_auth_header_prefix,
+                    response_headers: spec.response_headers,
+                    weight: spec.weight,
+                };
+                (keys, None, None, None, vec![provider])
+            }
         }
     }
 }
@@ -105,6 +193,30 @@ impl From<TargetSpec> for Target {
         Target {
             url: normalize_url(value.url),
             keys: value.keys,
+            onwards_key: value.onwards_key,
+            onwards_model: value.onwards_model,
+            limiter: value.rate_limit.map(|rl| {
+                Arc::new(governor::RateLimiter::direct(
+                    Quota::per_second(rl.requests_per_second)
+                        .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
+                )) as Arc<dyn RateLimiter>
+            }),
+            concurrency_limiter: value.concurrency_limit.map(|cl| {
+                SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
+                    as Arc<dyn ConcurrencyLimiter>
+            }),
+            upstream_auth_header_name: value.upstream_auth_header_name,
+            upstream_auth_header_prefix: value.upstream_auth_header_prefix,
+            response_headers: value.response_headers,
+        }
+    }
+}
+
+impl From<ProviderSpec> for Target {
+    fn from(value: ProviderSpec) -> Self {
+        Target {
+            url: normalize_url(value.url),
+            keys: None, // Provider-level targets don't have keys; keys are at pool level
             onwards_key: value.onwards_key,
             onwards_model: value.onwards_model,
             limiter: value.rate_limit.map(|rl| {
@@ -200,8 +312,10 @@ pub struct Target {
 impl Target {
     /// Convert this target into a single-provider pool with weight 1
     /// This is a convenience method for backwards compatibility and testing
+    /// Note: Keys from the target are transferred to the pool level
     pub fn into_pool(self) -> ProviderPool {
-        ProviderPool::single(self, 1)
+        let keys = self.keys.clone();
+        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None)
     }
 }
 
@@ -403,29 +517,56 @@ impl Targets {
 
         let targets = Arc::new(DashMap::new());
         for (name, target_spec_or_list) in config_file.targets {
-            let target_specs = target_spec_or_list.into_list();
-            let mut providers = Vec::with_capacity(target_specs.len());
+            // Extract pool-level config and provider specs
+            let (pool_keys, pool_rate_limit, pool_concurrency_limit, _pool_response_headers, provider_specs) =
+                target_spec_or_list.into_pool_config();
 
-            for mut target_spec in target_specs {
-                // Merge global keys with target-specific keys
-                if let Some(ref mut keys) = target_spec.keys {
-                    debug!(
-                        "Target {}:{:?} has {} keys configured",
-                        target_spec.url,
-                        target_spec.onwards_model,
-                        keys.len()
-                    );
-                    keys.extend(global_keys.clone());
-                } else if !global_keys.is_empty() {
-                    target_spec.keys = Some(global_keys.clone());
-                }
+            // Merge global keys with pool-level keys
+            let merged_keys = if let Some(mut keys) = pool_keys {
+                debug!(
+                    "Pool '{}' has {} keys configured",
+                    name,
+                    keys.len()
+                );
+                keys.extend(global_keys.clone());
+                Some(keys)
+            } else if !global_keys.is_empty() {
+                Some(global_keys.clone())
+            } else {
+                None
+            };
 
-                let weight = target_spec.weight;
-                let target: Target = target_spec.into();
-                providers.push(Provider { target, weight });
-            }
+            // Create pool-level rate limiter
+            let pool_limiter: Option<Arc<dyn RateLimiter>> = pool_rate_limit.map(|rl| {
+                Arc::new(governor::RateLimiter::direct(
+                    Quota::per_second(rl.requests_per_second)
+                        .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
+                )) as Arc<dyn RateLimiter>
+            });
 
-            let pool = ProviderPool::new(providers);
+            // Create pool-level concurrency limiter
+            let pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>> =
+                pool_concurrency_limit.map(|cl| {
+                    SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
+                        as Arc<dyn ConcurrencyLimiter>
+                });
+
+            // Convert provider specs to providers
+            let providers: Vec<Provider> = provider_specs
+                .into_iter()
+                .map(|spec| {
+                    let weight = spec.weight;
+                    let target: Target = spec.into();
+                    Provider { target, weight }
+                })
+                .collect();
+
+            let pool = ProviderPool::with_config(
+                providers,
+                merged_keys,
+                pool_limiter,
+                pool_concurrency_limiter,
+            );
             debug!(
                 "Created provider pool '{}' with {} provider(s)",
                 name,
@@ -774,45 +915,15 @@ mod tests {
 
         let targets = Targets::from_config(config_file).unwrap();
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
 
-        // Target should have both its own keys and global keys (5 unique keys)
-        assert_eq!(target.keys.as_ref().unwrap().len(), 5);
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("target-key-1".to_string()))
-        );
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("target-key-2".to_string()))
-        );
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("global-key-1".to_string()))
-        );
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("global-key-2".to_string()))
-        );
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("shared-key".to_string()))
-        );
+        // Pool should have both its own keys and global keys (5 unique keys)
+        let pool_keys = pool.keys().unwrap();
+        assert_eq!(pool_keys.len(), 5);
+        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-1".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-2".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-1".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-2".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("shared-key".to_string())));
     }
 
     #[test]
@@ -842,24 +953,12 @@ mod tests {
 
         let targets = Targets::from_config(config_file).unwrap();
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
 
-        // Target without keys should get global keys
-        assert_eq!(target.keys.as_ref().unwrap().len(), 2);
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("global-key-1".to_string()))
-        );
-        assert!(
-            target
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("global-key-2".to_string()))
-        );
+        // Pool without explicit keys should get global keys
+        let pool_keys = pool.keys().unwrap();
+        assert_eq!(pool_keys.len(), 2);
+        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-1".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("global-key-2".to_string())));
     }
 
     #[test]
@@ -1082,29 +1181,16 @@ mod tests {
 
         let targets = Targets::from_config(config_file).unwrap();
 
-        // Target with keys should keep them unchanged
+        // Pool with keys should keep them unchanged
         let pool_with_keys = targets.targets.get("model-with-keys").unwrap();
-        let target_with_keys = pool_with_keys.first_target().unwrap();
-        assert_eq!(target_with_keys.keys.as_ref().unwrap().len(), 2);
-        assert!(
-            target_with_keys
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("target-key-1".to_string()))
-        );
-        assert!(
-            target_with_keys
-                .keys
-                .as_ref()
-                .unwrap()
-                .contains(&ConstantTimeString::from("target-key-2".to_string()))
-        );
+        let pool_keys = pool_with_keys.keys().unwrap();
+        assert_eq!(pool_keys.len(), 2);
+        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-1".to_string())));
+        assert!(pool_keys.contains(&ConstantTimeString::from("target-key-2".to_string())));
 
-        // Target without keys should remain None
+        // Pool without keys should remain None
         let pool_without_keys = targets.targets.get("model-without-keys").unwrap();
-        let target_without_keys = pool_without_keys.first_target().unwrap();
-        assert_eq!(target_without_keys.keys, None);
+        assert!(pool_without_keys.keys().is_none());
     }
 
     #[test]

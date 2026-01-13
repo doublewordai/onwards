@@ -3,9 +3,13 @@
 //! This module implements weighted load balancing with rate limit awareness.
 //! Providers can be assigned different weights, and the load balancer will
 //! select providers proportionally while respecting their rate limits.
+//!
+//! Pool-level configuration (keys, rate limits) is shared across all providers.
 
-use crate::target::Target;
+use crate::auth::KeySet;
+use crate::target::{ConcurrencyLimiter, RateLimiter, Target};
 use rand::Rng;
+use std::sync::Arc;
 
 /// A pool of providers that share an alias, with load balancing support
 #[derive(Debug, Clone)]
@@ -14,6 +18,12 @@ pub struct ProviderPool {
     providers: Vec<Provider>,
     /// Total weight of all providers (for weighted random selection)
     total_weight: u32,
+    /// Pool-level access control keys (who can call this alias)
+    keys: Option<KeySet>,
+    /// Pool-level rate limiter (applies to all requests to this alias)
+    pool_limiter: Option<Arc<dyn RateLimiter>>,
+    /// Pool-level concurrency limiter (applies to all requests to this alias)
+    pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
 }
 
 /// A single provider within a pool
@@ -32,6 +42,26 @@ impl ProviderPool {
         Self {
             providers,
             total_weight,
+            keys: None,
+            pool_limiter: None,
+            pool_concurrency_limiter: None,
+        }
+    }
+
+    /// Create a new provider pool with pool-level configuration
+    pub fn with_config(
+        providers: Vec<Provider>,
+        keys: Option<KeySet>,
+        pool_limiter: Option<Arc<dyn RateLimiter>>,
+        pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
+    ) -> Self {
+        let total_weight = providers.iter().map(|p| p.weight).sum();
+        Self {
+            providers,
+            total_weight,
+            keys,
+            pool_limiter,
+            pool_concurrency_limiter,
         }
     }
 
@@ -114,6 +144,21 @@ impl ProviderPool {
     /// Get the first provider's target (useful for getting shared config like keys)
     pub fn first_target(&self) -> Option<&Target> {
         self.providers.first().map(|p| &p.target)
+    }
+
+    /// Get pool-level access control keys
+    pub fn keys(&self) -> Option<&KeySet> {
+        self.keys.as_ref()
+    }
+
+    /// Get pool-level rate limiter
+    pub fn pool_limiter(&self) -> Option<&Arc<dyn RateLimiter>> {
+        self.pool_limiter.as_ref()
+    }
+
+    /// Get pool-level concurrency limiter
+    pub fn pool_concurrency_limiter(&self) -> Option<&Arc<dyn ConcurrencyLimiter>> {
+        self.pool_concurrency_limiter.as_ref()
     }
 }
 
