@@ -64,6 +64,17 @@ pub struct ProviderSpec {
     pub weight: u32,
 }
 
+/// Load balancing strategy for selecting providers
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBalanceStrategy {
+    /// Weighted random selection - distribute traffic proportionally based on weights (default)
+    #[default]
+    WeightedRandom,
+    /// Priority-based selection - always use the first available provider in order
+    Priority,
+}
+
 /// Configuration for fallback behavior when requests fail
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FallbackConfig {
@@ -128,6 +139,10 @@ pub struct PoolSpec {
     #[serde(default)]
     pub fallback: Option<FallbackConfig>,
 
+    /// Load balancing strategy (defaults to weighted_random)
+    #[serde(default)]
+    pub strategy: LoadBalanceStrategy,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -181,6 +196,7 @@ pub struct PoolConfig {
     pub concurrency_limit: Option<ConcurrencyLimitParameters>,
     pub response_headers: Option<HashMap<String, String>>,
     pub fallback: Option<FallbackConfig>,
+    pub strategy: LoadBalanceStrategy,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -194,6 +210,7 @@ impl TargetSpecOrList {
                 concurrency_limit: pool.concurrency_limit,
                 response_headers: pool.response_headers,
                 fallback: pool.fallback,
+                strategy: pool.strategy,
                 providers: pool.providers,
             },
             TargetSpecOrList::List(list) => {
@@ -217,6 +234,7 @@ impl TargetSpecOrList {
                     concurrency_limit: None,
                     response_headers: None,
                     fallback: None,
+                    strategy: LoadBalanceStrategy::default(),
                     providers,
                 }
             }
@@ -240,6 +258,7 @@ impl TargetSpecOrList {
                     concurrency_limit: None,
                     response_headers: None,
                     fallback: None,
+                    strategy: LoadBalanceStrategy::default(),
                     providers: vec![provider],
                 }
             }
@@ -388,7 +407,7 @@ impl Target {
     /// Note: Keys from the target are transferred to the pool level
     pub fn into_pool(self) -> ProviderPool {
         let keys = self.keys.clone();
-        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None, None)
+        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None, None, LoadBalanceStrategy::default())
     }
 }
 
@@ -639,12 +658,14 @@ impl Targets {
                 pool_limiter,
                 pool_concurrency_limiter,
                 pool_config.fallback,
+                pool_config.strategy,
             );
             debug!(
-                "Created provider pool '{}' with {} provider(s), fallback enabled: {}",
+                "Created provider pool '{}' with {} provider(s), fallback enabled: {}, strategy: {:?}",
                 name,
                 pool.len(),
-                pool.fallback_enabled()
+                pool.fallback_enabled(),
+                pool.strategy()
             );
             targets.insert(name, pool);
         }

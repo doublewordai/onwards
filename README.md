@@ -708,6 +708,59 @@ Each provider in a pool can have its own rate and concurrency limits:
 When a provider is rate limited, the load balancer will try to route to other
 available providers in the pool.
 
+### Load Balancing Strategies
+
+Onwards supports two load balancing strategies:
+
+#### Weighted Random (default)
+
+Distributes traffic randomly across providers, weighted by their configured
+weights. When fallback is enabled, subsequent providers are also selected using
+weighted random from the remaining pool.
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "strategy": "weighted_random",
+      "providers": [
+        { "url": "https://api.openai.com", "onwards_key": "sk-key-1", "weight": 3 },
+        { "url": "https://api.openai.com", "onwards_key": "sk-key-2", "weight": 1 }
+      ]
+    }
+  }
+}
+```
+
+#### Priority
+
+Always routes to the first available provider. Only falls through to subsequent
+providers if fallback is enabled and the primary provider fails. Use this for
+primary/backup configurations.
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "strategy": "priority",
+      "fallback": {
+        "enabled": true,
+        "on_status": [429, 5],
+        "on_rate_limit": true
+      },
+      "providers": [
+        { "url": "https://primary.example.com", "onwards_key": "sk-primary" },
+        { "url": "https://backup.example.com", "onwards_key": "sk-backup" }
+      ]
+    }
+  }
+}
+```
+
+With `priority` strategy, all traffic goes to the first provider. The second
+provider only receives traffic when the first is unavailable or returns a
+fallback status code.
+
 ### Use Cases
 
 - **Multiple API Keys**: Distribute load across multiple API keys from the same

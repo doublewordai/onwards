@@ -7,7 +7,7 @@
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
-use crate::target::{ConcurrencyLimiter, FallbackConfig, RateLimiter, Target};
+use crate::target::{ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter, Target};
 use rand::Rng;
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ pub struct ProviderPool {
     pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
     /// Fallback configuration for retrying failed requests
     fallback: Option<FallbackConfig>,
+    /// Load balancing strategy
+    strategy: LoadBalanceStrategy,
 }
 
 /// A single provider within a pool
@@ -48,6 +50,7 @@ impl ProviderPool {
             pool_limiter: None,
             pool_concurrency_limiter: None,
             fallback: None,
+            strategy: LoadBalanceStrategy::default(),
         }
     }
 
@@ -58,6 +61,7 @@ impl ProviderPool {
         pool_limiter: Option<Arc<dyn RateLimiter>>,
         pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
         fallback: Option<FallbackConfig>,
+        strategy: LoadBalanceStrategy,
     ) -> Self {
         let total_weight = providers.iter().map(|p| p.weight).sum();
         Self {
@@ -67,6 +71,7 @@ impl ProviderPool {
             pool_limiter,
             pool_concurrency_limiter,
             fallback,
+            strategy,
         }
     }
 
@@ -188,9 +193,15 @@ impl ProviderPool {
         self.fallback.as_ref().is_some_and(|f| f.enabled && f.on_rate_limit)
     }
 
+    /// Get the load balancing strategy
+    pub fn strategy(&self) -> LoadBalanceStrategy {
+        self.strategy
+    }
+
     /// Select providers in priority order for fallback scenarios.
-    /// Returns an iterator yielding (index, &Target) in weighted priority order.
-    /// First item is the weighted-random selection, followed by others sorted by weight (descending).
+    /// Returns an iterator yielding (index, &Target) based on the configured strategy:
+    /// - WeightedRandom: Repeatedly samples from remaining pool using weighted random
+    /// - Priority: Returns providers in definition order (first provider is primary)
     pub fn select_ordered(&self) -> impl Iterator<Item = (usize, &Target)> {
         let mut order = Vec::with_capacity(self.providers.len());
 
@@ -198,35 +209,45 @@ impl ProviderPool {
             return order.into_iter();
         }
 
-        // First, select using weighted random
-        let selected_idx = if self.providers.len() == 1 {
-            0
-        } else {
-            let mut rng = rand::rng();
-            let random_weight: u32 = rng.random_range(0..self.total_weight);
-            let mut cumulative_weight = 0;
-            let mut idx = 0;
-            for (i, provider) in self.providers.iter().enumerate() {
-                cumulative_weight += provider.weight;
-                if random_weight < cumulative_weight {
-                    idx = i;
-                    break;
+        match self.strategy {
+            LoadBalanceStrategy::Priority => {
+                // Simple: return providers in definition order
+                for (idx, provider) in self.providers.iter().enumerate() {
+                    order.push((idx, &provider.target));
                 }
             }
-            idx
-        };
+            LoadBalanceStrategy::WeightedRandom => {
+                // Repeatedly sample from remaining pool using weighted random
+                let mut remaining: Vec<(usize, u32)> = self
+                    .providers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, p.weight))
+                    .collect();
+                let mut rng = rand::rng();
 
-        // Add the selected provider first
-        order.push((selected_idx, &self.providers[selected_idx].target));
+                while !remaining.is_empty() {
+                    let total: u32 = remaining.iter().map(|(_, w)| w).sum();
+                    let random_weight: u32 = if total > 0 {
+                        rng.random_range(0..total)
+                    } else {
+                        0
+                    };
 
-        // Add remaining providers sorted by weight (descending)
-        let mut remaining: Vec<usize> = (0..self.providers.len())
-            .filter(|&i| i != selected_idx)
-            .collect();
-        remaining.sort_by(|&a, &b| self.providers[b].weight.cmp(&self.providers[a].weight));
+                    let mut cumulative = 0;
+                    let mut selected_pos = 0;
+                    for (pos, (_, weight)) in remaining.iter().enumerate() {
+                        cumulative += weight;
+                        if random_weight < cumulative {
+                            selected_pos = pos;
+                            break;
+                        }
+                    }
 
-        for idx in remaining {
-            order.push((idx, &self.providers[idx].target));
+                    let (idx, _) = remaining.remove(selected_pos);
+                    order.push((idx, &self.providers[idx].target));
+                }
+            }
         }
 
         order.into_iter()
