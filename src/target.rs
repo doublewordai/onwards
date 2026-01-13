@@ -64,6 +64,46 @@ pub struct ProviderSpec {
     pub weight: u32,
 }
 
+/// Configuration for fallback behavior when requests fail
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FallbackConfig {
+    /// Whether fallback is enabled
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Status codes that trigger fallback to the next provider.
+    /// Supports wildcards: 50 matches all 50x codes (500-509), 5 matches all 5xx codes (500-599).
+    /// Common values: [429, 502, 503, 504] or [5] for all 5xx errors.
+    #[serde(default)]
+    pub on_status: Vec<u16>,
+
+    /// Whether to fallback on local rate limits (pool-level and provider-level).
+    /// If true, hitting a local rate limit will try the next provider instead of returning 429.
+    #[serde(default)]
+    pub on_rate_limit: bool,
+}
+
+impl FallbackConfig {
+    /// Check if a status code should trigger fallback
+    pub fn should_fallback_on_status(&self, status: u16) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.on_status.iter().any(|&pattern| {
+            if pattern < 10 {
+                // Single digit: matches all codes starting with that digit (e.g., 5 matches 500-599)
+                status / 100 == pattern
+            } else if pattern < 100 {
+                // Two digits: matches all codes starting with those digits (e.g., 50 matches 500-509)
+                status / 10 == pattern
+            } else {
+                // Full status code: exact match
+                status == pattern
+            }
+        })
+    }
+}
+
 /// Pool-level configuration with shared settings and multiple providers.
 /// This is the recommended format for load balancing configurations.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -83,6 +123,10 @@ pub struct PoolSpec {
     /// Default response headers for all providers in this pool
     #[serde(default)]
     pub response_headers: Option<HashMap<String, String>>,
+
+    /// Fallback configuration for retrying failed requests on other providers
+    #[serde(default)]
+    pub fallback: Option<FallbackConfig>,
 
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
@@ -130,13 +174,28 @@ pub enum TargetSpecOrList {
     Single(TargetSpec),
 }
 
+/// Extracted pool configuration from any target format
+pub struct PoolConfig {
+    pub keys: Option<KeySet>,
+    pub rate_limit: Option<RateLimitParameters>,
+    pub concurrency_limit: Option<ConcurrencyLimitParameters>,
+    pub response_headers: Option<HashMap<String, String>>,
+    pub fallback: Option<FallbackConfig>,
+    pub providers: Vec<ProviderSpec>,
+}
+
 impl TargetSpecOrList {
     /// Convert to pool-level config and list of provider specs
-    pub fn into_pool_config(self) -> (Option<KeySet>, Option<RateLimitParameters>, Option<ConcurrencyLimitParameters>, Option<HashMap<String, String>>, Vec<ProviderSpec>) {
+    pub fn into_pool_config(self) -> PoolConfig {
         match self {
-            TargetSpecOrList::Pool(pool) => {
-                (pool.keys, pool.rate_limit, pool.concurrency_limit, pool.response_headers, pool.providers)
-            }
+            TargetSpecOrList::Pool(pool) => PoolConfig {
+                keys: pool.keys,
+                rate_limit: pool.rate_limit,
+                concurrency_limit: pool.concurrency_limit,
+                response_headers: pool.response_headers,
+                fallback: pool.fallback,
+                providers: pool.providers,
+            },
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
                 // Take keys from first provider for backwards compatibility
@@ -152,7 +211,14 @@ impl TargetSpecOrList {
                     response_headers: t.response_headers,
                     weight: t.weight,
                 }).collect();
-                (keys, None, None, None, providers)
+                PoolConfig {
+                    keys,
+                    rate_limit: None,
+                    concurrency_limit: None,
+                    response_headers: None,
+                    fallback: None,
+                    providers,
+                }
             }
             TargetSpecOrList::Single(spec) => {
                 // Single provider: use its keys as pool-level, convert to ProviderSpec
@@ -168,7 +234,14 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                 };
-                (keys, None, None, None, vec![provider])
+                PoolConfig {
+                    keys,
+                    rate_limit: None,
+                    concurrency_limit: None,
+                    response_headers: None,
+                    fallback: None,
+                    providers: vec![provider],
+                }
             }
         }
     }
@@ -315,7 +388,7 @@ impl Target {
     /// Note: Keys from the target are transferred to the pool level
     pub fn into_pool(self) -> ProviderPool {
         let keys = self.keys.clone();
-        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None)
+        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None, None)
     }
 }
 
@@ -518,11 +591,10 @@ impl Targets {
         let targets = Arc::new(DashMap::new());
         for (name, target_spec_or_list) in config_file.targets {
             // Extract pool-level config and provider specs
-            let (pool_keys, pool_rate_limit, pool_concurrency_limit, _pool_response_headers, provider_specs) =
-                target_spec_or_list.into_pool_config();
+            let pool_config = target_spec_or_list.into_pool_config();
 
             // Merge global keys with pool-level keys
-            let merged_keys = if let Some(mut keys) = pool_keys {
+            let merged_keys = if let Some(mut keys) = pool_config.keys {
                 debug!(
                     "Pool '{}' has {} keys configured",
                     name,
@@ -537,7 +609,7 @@ impl Targets {
             };
 
             // Create pool-level rate limiter
-            let pool_limiter: Option<Arc<dyn RateLimiter>> = pool_rate_limit.map(|rl| {
+            let pool_limiter: Option<Arc<dyn RateLimiter>> = pool_config.rate_limit.map(|rl| {
                 Arc::new(governor::RateLimiter::direct(
                     Quota::per_second(rl.requests_per_second)
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
@@ -546,13 +618,13 @@ impl Targets {
 
             // Create pool-level concurrency limiter
             let pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>> =
-                pool_concurrency_limit.map(|cl| {
+                pool_config.concurrency_limit.map(|cl| {
                     SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
                         as Arc<dyn ConcurrencyLimiter>
                 });
 
             // Convert provider specs to providers
-            let providers: Vec<Provider> = provider_specs
+            let providers: Vec<Provider> = pool_config.providers
                 .into_iter()
                 .map(|spec| {
                     let weight = spec.weight;
@@ -566,11 +638,13 @@ impl Targets {
                 merged_keys,
                 pool_limiter,
                 pool_concurrency_limiter,
+                pool_config.fallback,
             );
             debug!(
-                "Created provider pool '{}' with {} provider(s)",
+                "Created provider pool '{}' with {} provider(s), fallback enabled: {}",
                 name,
-                pool.len()
+                pool.len(),
+                pool.fallback_enabled()
             );
             targets.insert(name, pool);
         }

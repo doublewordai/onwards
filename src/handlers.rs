@@ -213,28 +213,6 @@ pub async fn target_message_handler<T: HttpClient>(
         return Err(OnwardsErrorResponse::rate_limited());
     }
 
-    // Select a provider from the pool (uses weighted load balancing)
-    let target = match pool.select() {
-        Some(target) => {
-            debug!("Selected target for model '{}': {:?}", model_name, target.url);
-            target
-        }
-        None => {
-            debug!("No available provider in pool for model: {}", model_name);
-            return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        }
-    };
-
-    // Check provider-level rate limit
-    if let Some(ref limiter) = target.limiter
-        && limiter.check().is_err()
-    {
-        return Err(OnwardsErrorResponse::rate_limited());
-    }
-
-    // Clone response headers for later use in response
-    let response_headers = target.response_headers.clone();
-
     // Check per-key rate limits if bearer token is present
     if let Some(token) = bearer_token
         && let Some(limiter) = state.targets.key_rate_limiters.get(token)
@@ -244,8 +222,7 @@ pub async fn target_message_handler<T: HttpClient>(
         return Err(OnwardsErrorResponse::rate_limited());
     }
 
-    // Acquire concurrency permits (pool-level, provider-level, and per-key)
-    // These guards will be held until the end of the function, ensuring the permit is released
+    // Acquire pool-level concurrency permit
     let _pool_concurrency_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
         match limiter.acquire().await {
             Ok(guard) => Some(guard),
@@ -261,21 +238,7 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
-        match limiter.acquire().await {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                debug!(
-                    "Provider-level concurrency limit exceeded for model: {}",
-                    model_name
-                );
-                return Err(OnwardsErrorResponse::concurrency_limited());
-            }
-        }
-    } else {
-        None
-    };
-
+    // Acquire per-key concurrency permit
     let _key_concurrency_guard = if let Some(token) = bearer_token {
         if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
             match limiter.acquire().await {
@@ -292,153 +255,223 @@ pub async fn target_message_handler<T: HttpClient>(
         None
     };
 
-    // Users can specify the onwards value of the model field in the target
-    // config. If not supplied, its left as is.
-    if let Some(rewrite) = target.onwards_model.clone()
-        && !body_bytes.is_empty()
-    {
-        debug!("Rewriting model key to: {}", rewrite);
-        let error = OnwardsErrorResponse::bad_request(
-            "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
-            Some("model"),
-        );
-        let mut body_serialized: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-            Ok(value) => value,
-            Err(_) => return Err(error.clone()),
-        };
-        let entry = body_serialized
-            .as_object_mut()
-            .ok_or(error.clone())? // if the body is not an object (we know its not empty), return 400
-            .entry("model");
-        match entry {
-            Entry::Occupied(mut entry) => {
-                // If the model key already exists, we overwrite it
-                entry.insert(serde_json::Value::String(rewrite));
-            }
-            Entry::Vacant(_entry) => {
-                // If the body didn't have a model key, then 400 (header shouldn't have been
-                // provided)
-                return Err(error.clone());
-            }
-        }
-        body_bytes = match serde_json::to_vec(&body_serialized) {
-            Ok(bytes) => axum::body::Bytes::from(bytes),
-            Err(_) => return Err(OnwardsErrorResponse::internal()),
-        };
-    }
-
-    // Build the onwards URI
+    // Extract path info once (used for each provider attempt)
     let path_and_query = req
         .uri()
         .path_and_query()
         .map(|v| v.as_str())
-        .unwrap_or(req.uri().path());
+        .unwrap_or(req.uri().path())
+        .to_string();
 
-    // Strip duplicate path prefix if the target URL already contains it
-    // For example: target URL is "https://api.openai.com/v1/" and request path is "/v1/chat/completions"
-    // We want to avoid "https://api.openai.com/v1/v1/chat/completions"
-    let target_path = target.url.path().trim_end_matches('/');
-    let request_path = path_and_query.strip_prefix('/').unwrap_or(path_and_query);
+    // Prepare original headers and method for potential retries
+    let original_headers = req.headers().clone();
+    let method = req.method().clone();
 
-    let path_to_join = if !target_path.is_empty() && target_path != "/" {
-        // Target has a non-root path (e.g., "/v1")
-        let target_path_no_slash = &target_path[1..]; // "v1"
+    // Track last error for fallback scenarios
+    let mut last_error: Option<OnwardsErrorResponse> = None;
 
-        if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
-            // Request starts with the same path as target
-            if rest.is_empty() || rest.starts_with('/') {
-                // Either exact match or has a slash after (e.g., "v1/" or "v1")
-                rest.strip_prefix('/').unwrap_or(rest)
+    // Iterate through providers (with fallback support)
+    for (_idx, target) in pool.select_ordered() {
+        // Check provider-level rate limit (skip to next if configured for rate limit fallback)
+        if let Some(ref limiter) = target.limiter
+            && limiter.check().is_err()
+        {
+            debug!("Provider rate limited: {:?}", target.url);
+            last_error = Some(OnwardsErrorResponse::rate_limited());
+            if pool.should_fallback_on_rate_limit() {
+                debug!("Fallback on rate limit enabled, trying next provider");
+                continue;
             } else {
-                // Starts with target path but no slash after (e.g., "v1x") - not a real match
+                return Err(OnwardsErrorResponse::rate_limited());
+            }
+        }
+
+        // Acquire provider-level concurrency permit
+        let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
+            match limiter.acquire().await {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    debug!(
+                        "Provider concurrency limit exceeded: {:?}",
+                        target.url
+                    );
+                    last_error = Some(OnwardsErrorResponse::concurrency_limited());
+                    // Concurrency limits are treated like rate limits for fallback purposes
+                    if pool.should_fallback_on_rate_limit() {
+                        debug!("Fallback on rate limit enabled, trying next provider");
+                        continue;
+                    } else {
+                        return Err(OnwardsErrorResponse::concurrency_limited());
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
+        // Clone response headers for later use
+        let response_headers = target.response_headers.clone();
+
+        // Prepare body for this attempt (may need model rewrite)
+        let mut attempt_body = body_bytes.clone();
+
+        // Rewrite model field if configured
+        if let Some(ref rewrite) = target.onwards_model
+            && !attempt_body.is_empty()
+        {
+            debug!("Rewriting model key to: {}", rewrite);
+            let error = OnwardsErrorResponse::bad_request(
+                "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
+                Some("model"),
+            );
+            let mut body_serialized: serde_json::Value = match serde_json::from_slice(&attempt_body) {
+                Ok(value) => value,
+                Err(_) => return Err(error.clone()),
+            };
+            let entry = body_serialized
+                .as_object_mut()
+                .ok_or(error.clone())?
+                .entry("model");
+            match entry {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(serde_json::Value::String(rewrite.clone()));
+                }
+                Entry::Vacant(_entry) => {
+                    return Err(error.clone());
+                }
+            }
+            attempt_body = match serde_json::to_vec(&body_serialized) {
+                Ok(bytes) => axum::body::Bytes::from(bytes),
+                Err(_) => return Err(OnwardsErrorResponse::internal()),
+            };
+        }
+
+        // Build the upstream URI for this target
+        let request_path = path_and_query.strip_prefix('/').unwrap_or(&path_and_query);
+        let target_path = target.url.path().trim_end_matches('/');
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
                 request_path
             }
         } else {
             request_path
-        }
-    } else {
-        request_path
-    };
-
-    let upstream_uri = target
-        .url
-        .join(path_to_join)
-        .map_err(|_| OnwardsErrorResponse::internal())?
-        .to_string();
-    let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
-        Ok(uri) => uri,
-        Err(_) => {
-            error!("Invalid URI: {}", upstream_uri);
-            return Err(OnwardsErrorResponse::internal());
-        }
-    };
-
-    *req.uri_mut() = upstream_uri_parsed.clone();
-
-    // Update the host header to match the target server (otherwise cloudflare gets mad).
-    if let Some(host) = upstream_uri_parsed.host() {
-        let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
-            format!("{host}:{port}")
-        } else {
-            host.to_string()
         };
-        req.headers_mut()
-            .insert("host", host_value.parse().unwrap());
-    }
 
-    // Always set Content-Length and remove Transfer-Encoding since we buffer the full body
-    req.headers_mut().insert(
-        CONTENT_LENGTH,
-        body_bytes
-            .len()
-            .to_string()
-            .parse()
-            .expect("Content-Length should be valid"),
-    );
-    req.headers_mut().remove(TRANSFER_ENCODING);
-
-    // Filter headers for upstream forwarding (RFC 7230 compliance, security, etc.)
-    filter_headers_for_upstream(req.headers_mut(), &target);
-
-    // Log full outgoing request details for debugging
-    trace!(
-        "Outgoing request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
-        req.method(),
-        req.uri(),
-        req.headers(),
-        String::from_utf8_lossy(&body_bytes)
-    );
-
-    *req.body_mut() = axum::body::Body::from(body_bytes);
-
-    // forward the request to the target, returning the response as-is
-    match state.http_client.request(req).await {
-        Ok(mut response) => {
-            // Add custom response headers for client access
-            if let Some(headers) = response_headers {
-                for (key, value) in headers.iter() {
-                    if let (Ok(header_name), Ok(header_value)) =
-                        (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
-                    {
-                        response.headers_mut().insert(header_name, header_value);
-                    }
-                }
-                trace!(
-                    model = %model_name,
-                    headers = ?headers,
-                    "Added custom response headers"
-                );
+        let upstream_uri = match target.url.join(path_to_join) {
+            Ok(url) => url.to_string(),
+            Err(_) => return Err(OnwardsErrorResponse::internal()),
+        };
+        let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
+            Ok(uri) => uri,
+            Err(_) => {
+                error!("Invalid URI: {}", upstream_uri);
+                return Err(OnwardsErrorResponse::internal());
             }
-            Ok(response)
+        };
+
+        // Build request for this provider
+        let mut attempt_headers = original_headers.clone();
+
+        // Update host header
+        if let Some(host) = upstream_uri_parsed.host() {
+            let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            };
+            attempt_headers.insert("host", host_value.parse().unwrap());
         }
-        Err(e) => {
-            error!(
-                "Error forwarding request to target url {}: {}",
-                upstream_uri, e
-            );
-            Err(OnwardsErrorResponse::bad_gateway())
+
+        // Set Content-Length and remove Transfer-Encoding
+        attempt_headers.insert(
+            CONTENT_LENGTH,
+            attempt_body
+                .len()
+                .to_string()
+                .parse()
+                .expect("Content-Length should be valid"),
+        );
+        attempt_headers.remove(TRANSFER_ENCODING);
+
+        // Filter headers for upstream forwarding
+        filter_headers_for_upstream(&mut attempt_headers, target);
+
+        // Build the request
+        let attempt_req = axum::extract::Request::builder()
+            .method(method.clone())
+            .uri(upstream_uri_parsed)
+            .body(axum::body::Body::from(attempt_body))
+            .unwrap();
+        let (mut parts, body) = attempt_req.into_parts();
+        parts.headers = attempt_headers;
+        let attempt_req = axum::extract::Request::from_parts(parts, body);
+
+        trace!(
+            "Outgoing request to provider:\n  URI: {}\n  Headers: {:?}",
+            upstream_uri,
+            attempt_req.headers()
+        );
+
+        // Make the request
+        match state.http_client.request(attempt_req).await {
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+
+                // Check if we should fallback based on status code
+                if pool.should_fallback_on_status(status) {
+                    debug!(
+                        "Provider returned fallback status {}, trying next: {:?}",
+                        status, target.url
+                    );
+                    last_error = Some(OnwardsErrorResponse::bad_gateway());
+                    continue;
+                }
+
+                // Success - add custom response headers and return
+                if let Some(headers) = response_headers {
+                    for (key, value) in headers.iter() {
+                        if let (Ok(header_name), Ok(header_value)) =
+                            (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                        {
+                            response.headers_mut().insert(header_name, header_value);
+                        }
+                    }
+                    trace!(
+                        model = %model_name,
+                        headers = ?headers,
+                        "Added custom response headers"
+                    );
+                }
+                return Ok(response);
+            }
+            Err(e) => {
+                error!(
+                    "Error forwarding request to target url {}: {}",
+                    upstream_uri, e
+                );
+                last_error = Some(OnwardsErrorResponse::bad_gateway());
+
+                // If fallback enabled, try next provider on connection errors
+                if pool.fallback_enabled() {
+                    debug!("Connection error, trying next provider");
+                    continue;
+                } else {
+                    return Err(OnwardsErrorResponse::bad_gateway());
+                }
+            }
         }
     }
+
+    // All providers exhausted
+    Err(last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())))
 }
 
 #[instrument(skip(state, req))]
