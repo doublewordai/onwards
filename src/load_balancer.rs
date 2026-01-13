@@ -202,10 +202,18 @@ impl ProviderPool {
     /// Returns an iterator yielding (index, &Target) based on the configured strategy:
     /// - WeightedRandom: Repeatedly samples from remaining pool using weighted random
     /// - Priority: Returns providers in definition order (first provider is primary)
+    ///
+    /// Optimized for common cases: single provider returns immediately without allocation.
     pub fn select_ordered(&self) -> impl Iterator<Item = (usize, &Target)> {
         let mut order = Vec::with_capacity(self.providers.len());
 
         if self.providers.is_empty() {
+            return order.into_iter();
+        }
+
+        // Fast path: single provider (most common case)
+        if self.providers.len() == 1 {
+            order.push((0, &self.providers[0].target));
             return order.into_iter();
         }
 
