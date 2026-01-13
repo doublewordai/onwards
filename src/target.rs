@@ -3,7 +3,15 @@
 //! This module handles the configuration and management of proxy targets - the
 //! upstream services that requests are forwarded to. Targets are dynamically
 //! loaded from configuration files and support hot-reloading when files change.
+//!
+//! ## Load Balancing
+//!
+//! Targets support load balancing across multiple providers. A single alias can
+//! route to multiple downstream providers with different API keys, weights, and
+//! rate limits. The configuration is backwards compatible - a single object is
+//! treated as a list with one provider.
 use crate::auth::KeySet;
+use crate::load_balancer::{Provider, ProviderPool};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -45,6 +53,37 @@ pub struct TargetSpec {
     /// Custom headers to include in responses (e.g., pricing, metadata)
     #[serde(default)]
     pub response_headers: Option<HashMap<String, String>>,
+
+    /// Weight for load balancing (higher = more traffic). Defaults to 1.
+    #[serde(default = "default_weight")]
+    #[builder(default = default_weight())]
+    pub weight: u32,
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+/// A target specification that can be either a single provider or a list of providers.
+/// This enables backwards-compatible configuration where a single object is treated
+/// as a list with one provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TargetSpecOrList {
+    /// Multiple providers for load balancing
+    List(Vec<TargetSpec>),
+    /// Single provider (backwards compatible)
+    Single(TargetSpec),
+}
+
+impl TargetSpecOrList {
+    /// Convert to a list of target specs
+    pub fn into_list(self) -> Vec<TargetSpec> {
+        match self {
+            TargetSpecOrList::List(list) => list,
+            TargetSpecOrList::Single(spec) => vec![spec],
+        }
+    }
 }
 
 /// Normalizes a URL to ensure it has a trailing slash
@@ -144,6 +183,7 @@ impl ConcurrencyLimiter for SemaphoreConcurrencyLimiter {
 /// Bearer {} header of the request. The onwards_model is used to determine which model to put in
 /// the json body when forwarding the request.
 #[derive(Debug, Clone, Builder)]
+#[builder(derive(Clone))]
 pub struct Target {
     pub url: Url,
     pub keys: Option<KeySet>,
@@ -155,6 +195,14 @@ pub struct Target {
     pub upstream_auth_header_prefix: Option<String>,
     /// Custom headers to include in responses (e.g., pricing, metadata)
     pub response_headers: Option<HashMap<String, String>>,
+}
+
+impl Target {
+    /// Convert this target into a single-provider pool with weight 1
+    /// This is a convenience method for backwards compatibility and testing
+    pub fn into_pool(self) -> ProviderPool {
+        ProviderPool::single(self, 1)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -173,16 +221,18 @@ pub struct Auth {
 }
 
 /// The config file contains a map of target names to targets.
+/// Each target can be a single provider or a list of providers for load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
-    pub targets: HashMap<String, TargetSpec>,
+    pub targets: HashMap<String, TargetSpecOrList>,
     pub auth: Option<Auth>,
 }
 
 /// The live-updating collection of targets.
 #[derive(Debug, Clone)]
 pub struct Targets {
-    pub targets: Arc<DashMap<String, Target>>,
+    /// Map of alias names to provider pools (supports load balancing)
+    pub targets: Arc<DashMap<String, ProviderPool>>,
     /// Direct rate limiters per actual API key (actual key -> rate limiter)
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
     /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
@@ -352,19 +402,36 @@ impl Targets {
         }
 
         let targets = Arc::new(DashMap::new());
-        for (name, mut target_spec) in config_file.targets {
-            if let Some(ref mut keys) = target_spec.keys {
-                debug!(
-                    "Target {}:{:?} has {} keys configured",
-                    target_spec.url,
-                    target_spec.onwards_model,
-                    keys.len()
-                );
-                keys.extend(global_keys.clone());
-            } else if !global_keys.is_empty() {
-                target_spec.keys = Some(global_keys.clone());
+        for (name, target_spec_or_list) in config_file.targets {
+            let target_specs = target_spec_or_list.into_list();
+            let mut providers = Vec::with_capacity(target_specs.len());
+
+            for mut target_spec in target_specs {
+                // Merge global keys with target-specific keys
+                if let Some(ref mut keys) = target_spec.keys {
+                    debug!(
+                        "Target {}:{:?} has {} keys configured",
+                        target_spec.url,
+                        target_spec.onwards_model,
+                        keys.len()
+                    );
+                    keys.extend(global_keys.clone());
+                } else if !global_keys.is_empty() {
+                    target_spec.keys = Some(global_keys.clone());
+                }
+
+                let weight = target_spec.weight;
+                let target: Target = target_spec.into();
+                providers.push(Provider { target, weight });
             }
-            targets.insert(name, target_spec.into());
+
+            let pool = ProviderPool::new(providers);
+            debug!(
+                "Created provider pool '{}' with {} provider(s)",
+                name,
+                pool.len()
+            );
+            targets.insert(name, pool);
         }
 
         Ok(Targets {
@@ -524,7 +591,8 @@ mod tests {
                 Target::builder()
                     .url(url.parse().unwrap())
                     .onwards_key(format!("key-{model}"))
-                    .build(),
+                    .build()
+                    .into_pool(),
             );
         }
         Targets {
@@ -646,7 +714,8 @@ mod tests {
                 .url("https://api.openai.com/v2".parse().unwrap()) // Different URL
                 .onwards_key("new-key".to_string()) // Different key
                 .onwards_model("gpt-4-turbo".to_string()) // Added model_key
-                .build(),
+                .build()
+                .into_pool(),
         );
         let updated_targets = Targets {
             targets: targets_map,
@@ -663,7 +732,9 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify target properties were updated
-        let target = initial_targets.targets.get("gpt-4").unwrap();
+        let pool = initial_targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        // Note: URL normalization only happens during from_config, not direct Target creation
         assert_eq!(target.url.as_str(), "https://api.openai.com/v2");
         assert_eq!(target.onwards_key, Some("new-key".to_string()));
         assert_eq!(target.onwards_model, Some("gpt-4-turbo".to_string()));
@@ -684,11 +755,13 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .onwards_key("test-key".to_string())
-                .keys(target_keys)
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_key("test-key".to_string())
+                    .keys(target_keys)
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -700,7 +773,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target should have both its own keys and global keys (5 unique keys)
         assert_eq!(target.keys.as_ref().unwrap().len(), 5);
@@ -750,10 +824,12 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .onwards_key("test-key".to_string())
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_key("test-key".to_string())
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -765,7 +841,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target without keys should get global keys
         assert_eq!(target.keys.as_ref().unwrap().len(), 2);
@@ -790,13 +867,15 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .rate_limit(RateLimitParameters {
-                    requests_per_second: NonZeroU32::new(10).unwrap(),
-                    burst_size: Some(NonZeroU32::new(20).unwrap()),
-                })
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .rate_limit(RateLimitParameters {
+                        requests_per_second: NonZeroU32::new(10).unwrap(),
+                        burst_size: Some(NonZeroU32::new(20).unwrap()),
+                    })
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -805,7 +884,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target should have rate limiter configured
         assert!(target.limiter.is_some());
@@ -816,9 +896,11 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -827,7 +909,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target should not have rate limiter
         assert!(target.limiter.is_none());
@@ -974,18 +1057,22 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "model-with-keys".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .onwards_key("test-key".to_string())
-                .keys(target_keys)
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_key("test-key".to_string())
+                    .keys(target_keys)
+                    .build(),
+            ),
         );
         targets.insert(
             "model-without-keys".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .onwards_key("test-key".to_string())
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_key("test-key".to_string())
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -996,7 +1083,8 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // Target with keys should keep them unchanged
-        let target_with_keys = targets.targets.get("model-with-keys").unwrap();
+        let pool_with_keys = targets.targets.get("model-with-keys").unwrap();
+        let target_with_keys = pool_with_keys.first_target().unwrap();
         assert_eq!(target_with_keys.keys.as_ref().unwrap().len(), 2);
         assert!(
             target_with_keys
@@ -1014,7 +1102,8 @@ mod tests {
         );
 
         // Target without keys should remain None
-        let target_without_keys = targets.targets.get("model-without-keys").unwrap();
+        let pool_without_keys = targets.targets.get("model-without-keys").unwrap();
+        let target_without_keys = pool_without_keys.first_target().unwrap();
         assert_eq!(target_without_keys.keys, None);
     }
 
@@ -1074,12 +1163,15 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .concurrency_limit(ConcurrencyLimitParameters {
-                    max_concurrent_requests: 5,
-                })
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .concurrency_limit(ConcurrencyLimitParameters {
+                        max_concurrent_requests: 5,
+                    })
+                    .weight(1)
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -1088,7 +1180,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target should have concurrency limiter configured
         assert!(target.concurrency_limiter.is_some());
@@ -1099,9 +1192,12 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "test-model".to_string(),
-            TargetSpec::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build(),
+            TargetSpecOrList::Single(
+                TargetSpec::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .weight(1)
+                    .build(),
+            ),
         );
 
         let config_file = ConfigFile {
@@ -1110,7 +1206,8 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let target = targets.targets.get("test-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
 
         // Target should not have concurrency limiter
         assert!(target.concurrency_limiter.is_none());

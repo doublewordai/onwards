@@ -166,13 +166,22 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let target = match state.targets.targets.get(&model_name) {
+    let pool = match state.targets.targets.get(&model_name) {
+        Some(pool) => pool,
+        None => {
+            debug!("No target found for model: {}", model_name);
+            return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
+        }
+    };
+
+    // Select a provider from the pool (uses weighted load balancing)
+    let target = match pool.select() {
         Some(target) => {
-            debug!("Found target for model '{}': {:?}", model_name, target.url);
+            debug!("Selected target for model '{}': {:?}", model_name, target.url);
             target
         }
         None => {
-            debug!("No target found for model: {}", model_name);
+            debug!("No available provider in pool for model: {}", model_name);
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
@@ -428,12 +437,18 @@ pub async fn models<T: HttpClient>(
         .and_then(|auth_value| auth_value.strip_prefix("Bearer "));
 
     // Filter targets based on bearer token permissions
-    let accessible_targets = state
+    // For a pool, we check the first provider's keys (all providers in a pool share access)
+    let accessible_models: Vec<String> = state
         .targets
         .targets
         .iter()
         .filter(|entry| {
-            let target = entry.value();
+            let pool = entry.value();
+
+            // Get first provider's target for key checking
+            let Some(target) = pool.first_target() else {
+                return false;
+            };
 
             // If target has no keys configured, it's publicly accessible
             if target.keys.is_none() {
@@ -448,13 +463,11 @@ pub async fn models<T: HttpClient>(
             // Validate bearer token against target's keys
             auth::validate_bearer_token(target.keys.as_ref().unwrap(), token)
         })
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
-        .collect::<std::collections::HashMap<_, _>>();
+        .map(|entry| entry.key().clone())
+        .collect();
 
     // Create filtered response
-    Json(ListModelResponse::from_filtered_targets(
-        &accessible_targets,
-    ))
+    Json(ListModelResponse::from_model_names(&accessible_models))
 }
 
 #[cfg(test)]

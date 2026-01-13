@@ -581,6 +581,143 @@ Add pricing information to any target in your `config.json`:
       }
 ```
 
+## Load Balancing
+
+Onwards supports load balancing across multiple downstream providers that share
+a single alias. This allows you to distribute traffic across multiple API keys,
+providers, or regions for improved reliability and performance.
+
+### Basic Configuration
+
+To configure load balancing, provide an array of providers instead of a single
+provider object:
+
+```json
+{
+  "targets": {
+    "gpt-4": [
+      {
+        "url": "https://api.openai.com",
+        "onwards_key": "sk-key-1",
+        "weight": 2
+      },
+      {
+        "url": "https://api.openai.com",
+        "onwards_key": "sk-key-2",
+        "weight": 1
+      }
+    ]
+  }
+}
+```
+
+In this example, requests to "gpt-4" will be distributed between two providers
+with a 2:1 ratio (the first provider receives roughly twice as much traffic).
+
+### Backwards Compatibility
+
+The configuration is backwards compatible. A single provider object is treated
+as a list with one provider:
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-your-key"
+    }
+  }
+}
+```
+
+This is equivalent to:
+
+```json
+{
+  "targets": {
+    "gpt-4": [
+      {
+        "url": "https://api.openai.com",
+        "onwards_key": "sk-your-key",
+        "weight": 1
+      }
+    ]
+  }
+}
+```
+
+### Weighted Distribution
+
+Each provider can have a `weight` that determines how much traffic it receives
+relative to other providers in the pool. Higher weights receive proportionally
+more traffic. The weight defaults to 1 if not specified.
+
+```json
+{
+  "targets": {
+    "claude": [
+      {
+        "url": "https://api.anthropic.com",
+        "onwards_key": "sk-primary",
+        "weight": 3
+      },
+      {
+        "url": "https://api.anthropic.com",
+        "onwards_key": "sk-secondary",
+        "weight": 1
+      }
+    ]
+  }
+}
+```
+
+With these weights, the primary provider receives approximately 75% of traffic
+and the secondary receives 25%.
+
+### Per-Provider Rate Limits
+
+Each provider in a pool can have its own rate and concurrency limits:
+
+```json
+{
+  "targets": {
+    "gpt-4": [
+      {
+        "url": "https://api.openai.com",
+        "onwards_key": "sk-limited-key",
+        "weight": 1,
+        "rate_limit": {
+          "requests_per_second": 10,
+          "burst_size": 20
+        }
+      },
+      {
+        "url": "https://api.openai.com",
+        "onwards_key": "sk-high-limit-key",
+        "weight": 2,
+        "rate_limit": {
+          "requests_per_second": 100,
+          "burst_size": 200
+        }
+      }
+    ]
+  }
+}
+```
+
+When a provider is rate limited, the load balancer will try to route to other
+available providers in the pool.
+
+### Use Cases
+
+- **Multiple API Keys**: Distribute load across multiple API keys from the same
+  provider to increase throughput
+- **Failover**: Configure multiple providers with different weights for
+  redundancy
+- **Geographic Distribution**: Route to different regional endpoints
+- **Cost Optimization**: Mix high-cost and low-cost providers with appropriate
+  weights
+
 ## Testing
 
 Run the test suite:
