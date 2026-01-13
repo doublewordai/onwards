@@ -473,7 +473,8 @@ mod tests {
 
         // Run multiple times and count how often heavy is first
         let mut heavy_first = 0;
-        for _ in 0..100 {
+        let iterations = 1000;
+        for _ in 0..iterations {
             let order: Vec<_> = pool.select_ordered().collect();
             if order[0].1.url.as_str() == "https://heavy.example.com/" {
                 heavy_first += 1;
@@ -481,11 +482,14 @@ mod tests {
         }
 
         // With 9:1 weight ratio, heavy should be first roughly 90% of the time
-        // Allow for variance: should be at least 70% and at most 99%
+        // With 1000 iterations, allow for reasonable variance (80-98%)
+        let percentage = (heavy_first * 100) / iterations;
         assert!(
-            heavy_first >= 70 && heavy_first <= 99,
-            "Expected heavy to be first ~90% of the time, got {}%",
-            heavy_first
+            percentage >= 80 && percentage <= 98,
+            "Expected heavy to be first ~90% of the time, got {}% ({}/{})",
+            percentage,
+            heavy_first,
+            iterations
         );
     }
 
