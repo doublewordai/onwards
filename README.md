@@ -583,146 +583,21 @@ Add pricing information to any target in your `config.json`:
 
 ## Load Balancing
 
-Onwards supports load balancing across multiple downstream providers that share
-a single alias. This allows you to distribute traffic across multiple API keys,
-providers, or regions for improved reliability and performance.
+Onwards supports load balancing across multiple providers for a single alias,
+with automatic failover, weighted distribution, and configurable retry behavior.
 
-### Basic Configuration
-
-To configure load balancing, provide an array of providers instead of a single
-provider object:
-
-```json
-{
-  "targets": {
-    "gpt-4": [
-      {
-        "url": "https://api.openai.com",
-        "onwards_key": "sk-key-1",
-        "weight": 2
-      },
-      {
-        "url": "https://api.openai.com",
-        "onwards_key": "sk-key-2",
-        "weight": 1
-      }
-    ]
-  }
-}
-```
-
-In this example, requests to "gpt-4" will be distributed between two providers
-with a 2:1 ratio (the first provider receives roughly twice as much traffic).
-
-### Backwards Compatibility
-
-The configuration is backwards compatible. A single provider object is treated
-as a list with one provider:
-
-```json
-{
-  "targets": {
-    "gpt-4": {
-      "url": "https://api.openai.com",
-      "onwards_key": "sk-your-key"
-    }
-  }
-}
-```
-
-This is equivalent to:
-
-```json
-{
-  "targets": {
-    "gpt-4": [
-      {
-        "url": "https://api.openai.com",
-        "onwards_key": "sk-your-key",
-        "weight": 1
-      }
-    ]
-  }
-}
-```
-
-### Weighted Distribution
-
-Each provider can have a `weight` that determines how much traffic it receives
-relative to other providers in the pool. Higher weights receive proportionally
-more traffic. The weight defaults to 1 if not specified.
-
-```json
-{
-  "targets": {
-    "claude": [
-      {
-        "url": "https://api.anthropic.com",
-        "onwards_key": "sk-primary",
-        "weight": 3
-      },
-      {
-        "url": "https://api.anthropic.com",
-        "onwards_key": "sk-secondary",
-        "weight": 1
-      }
-    ]
-  }
-}
-```
-
-With these weights, the primary provider receives approximately 75% of traffic
-and the secondary receives 25%.
-
-### Per-Provider Rate Limits
-
-Each provider in a pool can have its own rate and concurrency limits:
-
-```json
-{
-  "targets": {
-    "gpt-4": [
-      {
-        "url": "https://api.openai.com",
-        "onwards_key": "sk-limited-key",
-        "weight": 1,
-        "rate_limit": {
-          "requests_per_second": 10,
-          "burst_size": 20
-        }
-      },
-      {
-        "url": "https://api.openai.com",
-        "onwards_key": "sk-high-limit-key",
-        "weight": 2,
-        "rate_limit": {
-          "requests_per_second": 100,
-          "burst_size": 200
-        }
-      }
-    ]
-  }
-}
-```
-
-When a provider is rate limited, the load balancer will try to route to other
-available providers in the pool.
-
-### Load Balancing Strategies
-
-Onwards supports two load balancing strategies:
-
-#### Weighted Random (default)
-
-Distributes traffic randomly across providers, weighted by their configured
-weights. When fallback is enabled, subsequent providers are also selected using
-weighted random from the remaining pool.
+### Configuration
 
 ```json
 {
   "targets": {
     "gpt-4": {
       "strategy": "weighted_random",
+      "fallback": {
+        "enabled": true,
+        "on_status": [429, 5],
+        "on_rate_limit": true
+      },
       "providers": [
         { "url": "https://api.openai.com", "onwards_key": "sk-key-1", "weight": 3 },
         { "url": "https://api.openai.com", "onwards_key": "sk-key-2", "weight": 1 }
@@ -732,22 +607,65 @@ weighted random from the remaining pool.
 }
 ```
 
-#### Priority
+### Strategy
 
-Always routes to the first available provider. Only falls through to subsequent
-providers if fallback is enabled and the primary provider fails. Use this for
-primary/backup configurations.
+- **`weighted_random`** (default): Distributes traffic randomly based on weights.
+  A provider with `weight: 3` receives ~3x the traffic of `weight: 1`.
+- **`priority`**: Always routes to the first provider. Falls through to subsequent
+  providers only when fallback is triggered.
+
+### Fallback
+
+Controls automatic retry on other providers when requests fail:
+
+- `enabled`: Master switch (default: false)
+- `on_status`: Status codes that trigger fallback. Supports wildcards:
+  - `5` → all 5xx (500-599)
+  - `50` → 500-509
+  - `502` → exact match
+- `on_rate_limit`: Fallback when hitting local rate limits (default: false)
+
+When fallback triggers, the next provider is selected based on strategy
+(weighted random resamples from remaining pool; priority uses definition order).
+
+### Pool-Level Options
+
+Settings that apply to the entire alias:
+
+| Option | Description |
+|--------|-------------|
+| `keys` | Access control keys for this alias |
+| `rate_limit` | Rate limit for all requests to this alias |
+| `concurrency_limit` | Max concurrent requests to this alias |
+| `response_headers` | Headers added to all responses |
+| `strategy` | `weighted_random` or `priority` |
+| `fallback` | Retry configuration (see above) |
+| `providers` | Array of provider configurations |
+
+### Provider-Level Options
+
+Settings specific to each provider:
+
+| Option | Description |
+|--------|-------------|
+| `url` | Provider endpoint URL |
+| `onwards_key` | API key for this provider |
+| `onwards_model` | Model name override |
+| `weight` | Traffic weight (default: 1) |
+| `rate_limit` | Provider-specific rate limit |
+| `concurrency_limit` | Provider-specific concurrency limit |
+| `response_headers` | Provider-specific headers |
+
+### Examples
+
+**Primary/backup failover:**
 
 ```json
 {
   "targets": {
     "gpt-4": {
       "strategy": "priority",
-      "fallback": {
-        "enabled": true,
-        "on_status": [429, 5],
-        "on_rate_limit": true
-      },
+      "fallback": { "enabled": true, "on_status": [5], "on_rate_limit": true },
       "providers": [
         { "url": "https://primary.example.com", "onwards_key": "sk-primary" },
         { "url": "https://backup.example.com", "onwards_key": "sk-backup" }
@@ -757,19 +675,29 @@ primary/backup configurations.
 }
 ```
 
-With `priority` strategy, all traffic goes to the first provider. The second
-provider only receives traffic when the first is unavailable or returns a
-fallback status code.
+**Multiple API keys with pool-level rate limit:**
 
-### Use Cases
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "rate_limit": { "requests_per_second": 100, "burst_size": 200 },
+      "providers": [
+        { "url": "https://api.openai.com", "onwards_key": "sk-key-1" },
+        { "url": "https://api.openai.com", "onwards_key": "sk-key-2" }
+      ]
+    }
+  }
+}
+```
 
-- **Multiple API Keys**: Distribute load across multiple API keys from the same
-  provider to increase throughput
-- **Failover**: Configure multiple providers with different weights for
-  redundancy
-- **Geographic Distribution**: Route to different regional endpoints
-- **Cost Optimization**: Mix high-cost and low-cost providers with appropriate
-  weights
+### Backwards Compatibility
+
+Single-provider configs still work unchanged:
+
+```json
+{ "targets": { "gpt-4": { "url": "https://api.openai.com", "onwards_key": "sk-key" } } }
+```
 
 ## Testing
 
