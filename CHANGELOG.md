@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/doublewordai/onwards/compare/v0.9.2...v0.10.0) - 2026-01-13
+
+### Added
+
+- Add load balancing for multiple downstream providers ([#47](https://github.com/doublewordai/onwards/pull/47))
+
+### Other
+
+- *(deps)* update rust crate hyper to v1.8.1 ([#46](https://github.com/doublewordai/onwards/pull/46))
+- add fallback and pool-level configuration documentation ([#48](https://github.com/doublewordai/onwards/pull/48))
+- *(deps)* update rust crate anyhow to v1.0.100 ([#34](https://github.com/doublewordai/onwards/pull/34))
+- *(deps)* update rust crate async-trait to v0.1.89 ([#35](https://github.com/doublewordai/onwards/pull/35))
+- Add renovate.json ([#32](https://github.com/doublewordai/onwards/pull/32))
+
 ## [0.9.2](https://github.com/doublewordai/onwards/compare/v0.9.1...v0.9.2) - 2025-11-14
 
 ### Added
