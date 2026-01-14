@@ -13,6 +13,7 @@ categories = ["web-programming", "api-bindings"]
 
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
+async-openai = { version = "0.32", default-features = false, features = ["types"] }
 async-trait = "0.1.88"
 axum = "0.8.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }

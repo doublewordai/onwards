@@ -46,6 +46,7 @@ pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
 pub mod models;
+pub mod response_sanitizer;
 pub mod target;
 
 use client::{HttpClient, HyperClient};
@@ -94,12 +95,54 @@ use models::ExtractedModel;
 pub type BodyTransformFn =
     Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
 
+/// Type alias for response transformation function
+///
+/// Takes (path, headers, body_bytes, original_model) and returns transformed body_bytes or None if no transformation.
+/// This allows you to sanitize and modify response bodies before they are returned to clients.
+///
+/// # Arguments
+///
+/// * `&str` - The request path (e.g., "/v1/chat/completions")
+/// * `&HeaderMap` - HTTP response headers from the upstream provider
+/// * `&[u8]` - The response body as raw bytes
+/// * `Option<&str>` - The original model requested by the client (for rewriting)
+///
+/// # Returns
+///
+/// * `Ok(Some(Bytes))` - Transformed response body to return
+/// * `Ok(None)` - Use original response body unchanged
+/// * `Err(String)` - Transformation failed with error message
+///
+/// # Examples
+///
+/// ```
+/// use onwards::ResponseTransformFn;
+/// use axum::http::HeaderMap;
+/// use std::sync::Arc;
+///
+/// // Transform function that sanitizes OpenAI responses
+/// let transform: ResponseTransformFn = Arc::new(|path, _headers, body_bytes, _model| {
+///     if path.contains("/v1/chat/completions") {
+///         // Sanitization logic here
+///         Ok(Some(axum::body::Bytes::from(body_bytes.to_vec())))
+///     } else {
+///         Ok(None)
+///     }
+/// });
+/// ```
+pub type ResponseTransformFn = Arc<
+    dyn Fn(&str, &HeaderMap, &[u8], Option<&str>) -> Result<Option<axum::body::Bytes>, String>
+        + Send
+        + Sync,
+>;
+
 /// The main application state containing the HTTP client and targets configuration
 ///
 /// This struct holds all the state needed to run the proxy server. It contains:
 /// - An HTTP client for making upstream requests
 /// - The collection of configured targets (destinations)
 /// - An optional body transformation function
+/// - An optional response transformation function
 ///
 /// # Examples
 ///
@@ -136,6 +179,7 @@ pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
     pub body_transform_fn: Option<BodyTransformFn>,
+    pub response_transform_fn: Option<ResponseTransformFn>,
 }
 
 impl<T: HttpClient> std::fmt::Debug for AppState<T> {
@@ -146,6 +190,10 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field(
                 "body_transform_fn",
                 &self.body_transform_fn.as_ref().map(|_| "<function>"),
+            )
+            .field(
+                "response_transform_fn",
+                &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
             .finish()
     }
@@ -159,6 +207,7 @@ impl AppState<HyperClient> {
             http_client,
             targets,
             body_transform_fn: None,
+            response_transform_fn: None,
         }
     }
 
@@ -169,6 +218,7 @@ impl AppState<HyperClient> {
             http_client,
             targets,
             body_transform_fn: Some(body_transform_fn),
+            response_transform_fn: None,
         }
     }
 }
@@ -180,6 +230,7 @@ impl<T: HttpClient> AppState<T> {
             http_client,
             targets,
             body_transform_fn: None,
+            response_transform_fn: None,
         }
     }
 
@@ -193,7 +244,14 @@ impl<T: HttpClient> AppState<T> {
             http_client,
             targets,
             body_transform_fn: Some(body_transform_fn),
+            response_transform_fn: None,
         }
+    }
+
+    /// Set the response transformation function (builder pattern)
+    pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
+        self.response_transform_fn = Some(transform_fn);
+        self
     }
 }
 
@@ -256,6 +314,40 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Res
             Ok(extracted.model.to_string())
         }
     }
+}
+
+/// Creates the default OpenAI response sanitization function
+///
+/// This function creates a response transformer that:
+/// - Enforces strict OpenAI API schema compliance
+/// - Removes provider-specific fields
+/// - Rewrites the model field to match the client's original request
+///
+/// The sanitizer only applies to `/v1/chat/completions` endpoint and supports
+/// both streaming (SSE) and non-streaming responses.
+///
+/// # Returns
+/// A [`ResponseTransformFn`] that can be used with [`AppState::with_response_transform`]
+///
+/// # Examples
+///
+/// ```no_run
+/// use onwards::{AppState, create_openai_sanitizer, target::Targets};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let app_state = AppState::new(targets)
+///     .with_response_transform(create_openai_sanitizer());
+/// # Ok(())
+/// # }
+/// ```
+pub fn create_openai_sanitizer() -> ResponseTransformFn {
+    Arc::new(|path, headers, body, original_model| {
+        let sanitizer = response_sanitizer::ResponseSanitizer {
+            original_model: original_model.map(String::from),
+        };
+        sanitizer.sanitize(path, headers, body)
+    })
 }
 
 /// Build the main router for the proxy
@@ -428,6 +520,7 @@ pub mod test_utils {
                 response_builder: Arc::new(move || {
                     axum::response::Response::builder()
                         .status(status)
+                        .header("content-type", "application/json")
                         .body(axum::body::Body::from(body.clone()))
                         .unwrap()
                 }),
@@ -533,6 +626,7 @@ pub mod test_utils {
                 response_builder: Arc::new(move || {
                     axum::response::Response::builder()
                         .status(status)
+                        .header("content-type", "application/json")
                         .body(axum::body::Body::from(body.clone()))
                         .unwrap()
                 }),
@@ -2445,6 +2539,424 @@ mod tests {
             let requests = mock_client.get_requests();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri.contains("api.single.com"));
+        }
+    }
+
+    mod response_sanitization {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_sanitize_non_streaming_removes_unknown_fields() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Response with provider-specific fields
+            let mock_response = r#"{
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 2,
+                    "total_tokens": 11
+                },
+                "custom_provider_field": "should be removed",
+                "another_unknown_field": 12345
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body: serde_json::Value = response.json();
+            // Verify standard fields are present
+            assert!(body.get("id").is_some());
+            assert!(body.get("choices").is_some());
+            assert!(body.get("usage").is_some());
+
+            // Verify unknown fields are removed
+            assert!(body.get("custom_provider_field").is_none());
+            assert!(body.get("another_unknown_field").is_none());
+        }
+
+        #[tokio::test]
+        async fn test_sanitize_rewrites_model_field() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .onwards_model("gpt-4-turbo-2024-04-09".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Response from upstream has the turbo model
+            let mock_response = r#"{
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4-turbo-2024-04-09",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 2,
+                    "total_tokens": 11
+                }
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body: serde_json::Value = response.json();
+            // Verify model field was rewritten to match client request
+            assert_eq!(body["model"], "gpt-4");
+        }
+
+        #[tokio::test]
+        async fn test_sanitize_streaming_removes_unknown_fields() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let streaming_chunks = vec![
+                r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}],"custom_field":"remove_me"}
+
+"#
+                    .to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ];
+
+            let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": true
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body = response.text();
+            // Verify [DONE] marker is preserved
+            assert!(body.contains("data: [DONE]"));
+            // Verify custom field is removed
+            assert!(!body.contains("custom_field"));
+            assert!(!body.contains("remove_me"));
+        }
+
+        #[tokio::test]
+        async fn test_sanitize_streaming_rewrites_model() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .onwards_model("gpt-4-turbo".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let streaming_chunks = vec![
+                r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gpt-4-turbo","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+"#
+                    .to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ];
+
+            let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": true
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body = response.text();
+            // Verify model was rewritten
+            assert!(body.contains(r#""model":"gpt-4""#));
+            assert!(!body.contains(r#""model":"gpt-4-turbo""#));
+        }
+
+        #[tokio::test]
+        async fn test_sanitization_disabled_passes_through() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(false) // Explicitly disabled
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Response with provider-specific fields
+            let mock_response = r#"{
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "gpt-4",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "Hello!"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "custom_provider_field": "should be preserved"
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body: serde_json::Value = response.json();
+            // Verify custom field is preserved when sanitization is disabled
+            assert!(body.get("custom_provider_field").is_some());
+            assert_eq!(body["custom_provider_field"], "should be preserved");
+        }
+
+        #[tokio::test]
+        async fn test_sanitization_only_applies_to_chat_completions() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Response from a different endpoint (e.g., embeddings)
+            let mock_response = r#"{
+                "object": "list",
+                "data": [{"embedding": [0.1, 0.2]}],
+                "model": "text-embedding-ada-002",
+                "usage": {"prompt_tokens": 8, "total_tokens": 8},
+                "custom_field": "preserved"
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/embeddings")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "input": "Hello"
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            let body: serde_json::Value = response.json();
+            // Verify response is not sanitized for non-chat-completion endpoints
+            assert!(body.get("custom_field").is_some());
+        }
+
+        #[tokio::test]
+        async fn test_pool_level_sanitization_applies_to_all_providers() {
+            use crate::load_balancer::ProviderPool;
+
+            // Create a pool with sanitization enabled at pool level
+            let provider1 = Target::builder()
+                .url("https://api1.com".parse().unwrap())
+                .onwards_key("key1".to_string())
+                .build();
+
+            let provider2 = Target::builder()
+                .url("https://api2.com".parse().unwrap())
+                .onwards_key("key2".to_string())
+                .sanitize_response(false) // Provider overrides pool setting
+                .build();
+
+            let pool =
+                ProviderPool::new(vec![
+                    crate::load_balancer::Provider {
+                        target: provider1,
+                        weight: 1,
+                    },
+                    crate::load_balancer::Provider {
+                        target: provider2,
+                        weight: 1,
+                    },
+                ]);
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), pool);
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_response = r#"{
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1677652288,
+                "model": "test-model",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "Hello!"},
+                    "finish_reason": "stop"
+                }],
+                "custom_field": "value"
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
         }
     }
 }

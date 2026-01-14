@@ -22,6 +22,12 @@ use axum::{
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
 
+/// Stores the original model name requested by the client
+///
+/// This is used to rewrite the model field in responses when `onwards_model` is configured
+#[derive(Clone, Debug)]
+struct OriginalModel(String);
+
 /// Filters and modifies headers before forwarding to upstream
 ///
 /// This function implements RFC 7230 compliant proxy behavior by:
@@ -154,6 +160,9 @@ pub async fn target_message_handler<T: HttpClient>(
             ));
         }
     };
+
+    // Store original model in request extensions for response sanitization
+    req.extensions_mut().insert(OriginalModel(model_name.clone()));
 
     trace!("Received request for model: {}", model_name);
     trace!(
@@ -435,7 +444,104 @@ pub async fn target_message_handler<T: HttpClient>(
                     continue;
                 }
 
-                // Success - add custom response headers and return
+                // Success - apply response transformation if configured
+                // Only sanitize successful responses (2xx status codes)
+                if let Some(ref transform_fn) = state.response_transform_fn
+                    && target.sanitize_response.unwrap_or(false)
+                    && status >= 200 && status < 300 {
+                        debug!(
+                            "Attempting response sanitization for status {}, path {}",
+                            status,
+                            path_and_query
+                        );
+
+                        // Extract original model from request extensions
+                        let original_model = req
+                            .extensions()
+                            .get::<OriginalModel>()
+                            .map(|m| m.0.as_str());
+
+                        // Check if response is suitable for sanitization
+                        // Clone content_type to avoid borrow issues
+                        let content_type = response
+                            .headers()
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // Buffer response body for transformation
+                        let response_body = axum::body::to_bytes(
+                            std::mem::take(response.body_mut()),
+                            usize::MAX,
+                        )
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to buffer response body: {}", e);
+                            OnwardsErrorResponse::internal()
+                        })?;
+
+                        debug!(
+                            "Response body buffered: {} bytes, content-type: {}",
+                            response_body.len(),
+                            content_type
+                        );
+                        trace!("Response body content: {}", String::from_utf8_lossy(&response_body));
+
+                        // Apply transformation
+                        match transform_fn(
+                            &path_and_query,
+                            response.headers(),
+                            &response_body,
+                            original_model,
+                        ) {
+                            Ok(Some(transformed_body)) => {
+                                // Update response with sanitized body
+                                let content_length = transformed_body.len();
+                                debug!(
+                                    "Sanitization successful: {} bytes -> {} bytes",
+                                    response_body.len(),
+                                    content_length
+                                );
+                                trace!(
+                                    "Sanitized body: {}",
+                                    String::from_utf8_lossy(&transformed_body)
+                                );
+                                *response.body_mut() =
+                                    axum::body::Body::from(transformed_body);
+
+                                // Remove transfer-encoding since we're setting content-length
+                                response.headers_mut().remove(TRANSFER_ENCODING);
+                                response.headers_mut().insert(
+                                    CONTENT_LENGTH,
+                                    HeaderValue::from(content_length),
+                                );
+                            }
+                            Ok(None) => {
+                                // No transformation applied, restore original body
+                                debug!(
+                                    "Sanitization returned None, restoring original {} bytes",
+                                    response_body.len()
+                                );
+                                let content_length = response_body.len();
+                                *response.body_mut() =
+                                    axum::body::Body::from(response_body);
+
+                                // Ensure proper headers even when not transforming
+                                response.headers_mut().remove(TRANSFER_ENCODING);
+                                response.headers_mut().insert(
+                                    CONTENT_LENGTH,
+                                    HeaderValue::from(content_length),
+                                );
+                            }
+                            Err(e) => {
+                                error!("Response sanitization failed: {}", e);
+                                return Err(OnwardsErrorResponse::internal());
+                            }
+                        }
+                    }
+
+                // Add custom response headers
                 if let Some(headers) = response_headers {
                     for (key, value) in headers.iter() {
                         if let (Ok(header_name), Ok(header_value)) =
@@ -450,6 +556,11 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Added custom response headers"
                     );
                 }
+                debug!(
+                    "Returning response with status {}, content-length: {:?}",
+                    response.status(),
+                    response.headers().get(CONTENT_LENGTH)
+                );
                 return Ok(response);
             }
             Err(e) => {
