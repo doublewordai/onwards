@@ -102,7 +102,10 @@ impl ResponseSanitizer {
             .iter()
             .map(|choice| {
                 let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let message = choice.get("message").cloned().unwrap_or(serde_json::json!({}));
+                let message = choice
+                    .get("message")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 let finish_reason = choice
                     .get("finish_reason")
                     .and_then(|v| v.as_str())
@@ -160,15 +163,15 @@ impl ResponseSanitizer {
     /// Sanitizes a streaming Server-Sent Events (SSE) response
     ///
     /// SSE format: `data: {...}\n\ndata: {...}\n\ndata: [DONE]\n\n`
-    fn sanitize_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
+    pub fn sanitize_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
         let body_str = std::str::from_utf8(body)
             .map_err(|e| format!("Invalid UTF-8 in streaming response: {}", e))?;
 
         let mut sanitized_lines = Vec::new();
 
         for line in body_str.lines() {
-            if line.starts_with("data: ") {
-                let data_part = &line[6..]; // Skip "data: " prefix
+            if let Some(data_part) = line.strip_prefix("data: ") {
+                // Skip "data: " prefix
 
                 if data_part.trim() == "[DONE]" {
                     // Preserve [DONE] marker as-is
@@ -334,7 +337,10 @@ mod tests {
         let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
 
         let mut headers = HeaderMap::new();
-        headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
 
         let result = sanitizer
             .sanitize("/v1/chat/completions", &headers, sse_response.as_bytes())
@@ -353,9 +359,7 @@ mod tests {
         };
 
         let headers = HeaderMap::new();
-        let result = sanitizer
-            .sanitize("/v1/models", &headers, b"test")
-            .unwrap();
+        let result = sanitizer.sanitize("/v1/models", &headers, b"test").unwrap();
 
         assert!(result.is_none());
     }
@@ -446,7 +450,11 @@ mod tests {
 
         let headers = HeaderMap::new();
         let result = sanitizer
-            .sanitize("/v1/chat/completions", &headers, openrouter_response.as_bytes())
+            .sanitize(
+                "/v1/chat/completions",
+                &headers,
+                openrouter_response.as_bytes(),
+            )
             .unwrap()
             .unwrap();
 
@@ -466,7 +474,12 @@ mod tests {
         assert_eq!(choices[0]["index"], 0);
         assert_eq!(choices[0]["finish_reason"], "stop");
         assert_eq!(choices[0]["message"]["role"], "assistant");
-        assert!(choices[0]["message"]["content"].as_str().unwrap().starts_with("Hello!"));
+        assert!(
+            choices[0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("Hello!")
+        );
 
         // Verify provider-specific fields are removed
         assert!(sanitized.get("provider").is_none());

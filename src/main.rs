@@ -3,8 +3,8 @@ mod config;
 use clap::Parser as _;
 use config::Config;
 use onwards::{
-    create_openai_sanitizer, AppState, build_metrics_layer_and_handle, build_metrics_router,
-    build_router,
+    AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
+    create_openai_sanitizer,
     target::{Targets, WatchedFile},
 };
 use tokio::{net::TcpListener, task::JoinSet};

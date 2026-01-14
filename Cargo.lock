@@ -1324,6 +1324,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "governor",
+ "http-body-util",
  "hyper",
  "hyper-tls",
  "hyper-util",

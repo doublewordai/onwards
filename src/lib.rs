@@ -772,17 +772,21 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            pool(target::Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .onwards_key("sk-test-key".to_string())
-                .build()),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test-key".to_string())
+                    .build(),
+            ),
         );
         targets_map.insert(
             "claude-3".to_string(),
-            pool(target::Target::builder()
-                .url("https://api.anthropic.com".parse().unwrap())
-                .onwards_key("sk-ant-test-key".to_string())
-                .build()),
+            pool(
+                target::Target::builder()
+                    .url("https://api.anthropic.com".parse().unwrap())
+                    .onwards_key("sk-ant-test-key".to_string())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -847,10 +851,12 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .onwards_key("test-api-key".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .onwards_key("test-api-key".to_string())
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -933,17 +939,21 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "header-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.header.com".parse().unwrap())
-                .onwards_key("header-key".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.header.com".parse().unwrap())
+                    .onwards_key("header-key".to_string())
+                    .build(),
+            ),
         );
         targets_map.insert(
             "body-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.body.com".parse().unwrap())
-                .onwards_key("body-key".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.body.com".parse().unwrap())
+                    .onwards_key("body-key".to_string())
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -992,24 +1002,30 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            pool(Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .onwards_key("sk-openai-key".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-openai-key".to_string())
+                    .build(),
+            ),
         );
         targets_map.insert(
             "claude-3".to_string(),
-            pool(Target::builder()
-                .url("https://api.anthropic.com".parse().unwrap())
-                .onwards_key("sk-ant-key".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.anthropic.com".parse().unwrap())
+                    .onwards_key("sk-ant-key".to_string())
+                    .build(),
+            ),
         );
         targets_map.insert(
             "gemini-pro".to_string(),
-            pool(Target::builder()
-                .url("https://api.google.com".parse().unwrap())
-                .onwards_model("gemini-1.5-pro".to_string())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.google.com".parse().unwrap())
+                    .onwards_model("gemini-1.5-pro".to_string())
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1078,27 +1094,33 @@ mod tests {
         // gpt-4: requires gpt4-token
         targets_map.insert(
             "gpt-4".to_string(),
-            pool(Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .keys(gpt4_keys)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(gpt4_keys)
+                    .build(),
+            ),
         );
 
         // claude-3: requires claude-token
         targets_map.insert(
             "claude-3".to_string(),
-            pool(Target::builder()
-                .url("https://api.anthropic.com".parse().unwrap())
-                .keys(claude_keys)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.anthropic.com".parse().unwrap())
+                    .keys(claude_keys)
+                    .build(),
+            ),
         );
 
         // gemini-pro: no keys required (public)
         targets_map.insert(
             "gemini-pro".to_string(),
-            pool(Target::builder()
-                .url("https://api.google.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.google.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1199,10 +1221,12 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "rate-limited-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1257,10 +1281,12 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "rate-limited-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1318,23 +1344,29 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "blocked-model".to_string(),
-            pool(Target::builder()
-                .url("https://blocked.example.com".parse().unwrap())
-                .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://blocked.example.com".parse().unwrap())
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
         );
         targets_map.insert(
             "allowed-model".to_string(),
-            pool(Target::builder()
-                .url("https://allowed.example.com".parse().unwrap())
-                .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://allowed.example.com".parse().unwrap())
+                    .limiter(Arc::new(AllowingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
         );
         targets_map.insert(
             "unlimited-model".to_string(),
-            pool(Target::builder()
-                .url("https://unlimited.example.com".parse().unwrap())
-                .build()), // No rate limiter
+            pool(
+                Target::builder()
+                    .url("https://unlimited.example.com".parse().unwrap())
+                    .build(),
+            ), // No rate limiter
         );
 
         let targets = Targets {
@@ -1396,10 +1428,12 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "limited-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .concurrency_limiter(SemaphoreConcurrencyLimiter::new(5))
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .concurrency_limiter(SemaphoreConcurrencyLimiter::new(5))
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1438,10 +1472,12 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "limited-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .concurrency_limiter(SemaphoreConcurrencyLimiter::new(1))
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .concurrency_limiter(SemaphoreConcurrencyLimiter::new(1))
+                    .build(),
+            ),
         );
 
         let targets = Targets {
@@ -1502,9 +1538,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         // Set up per-key concurrency limiter
@@ -1756,9 +1794,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -1815,9 +1855,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -1862,9 +1904,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -1911,9 +1955,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            pool(Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -1984,9 +2030,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
-            pool(Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -2053,9 +2101,11 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "test-model".to_string(),
-            pool(Target::builder()
-                .url("https://api.example.com".parse().unwrap())
-                .build()),
+            pool(
+                Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .build(),
+            ),
         );
 
         let targets = target::Targets {
@@ -2124,10 +2174,12 @@ mod tests {
 
             targets_map.insert(
                 "gpt-4".to_string(),
-                pool(Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .response_headers(response_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .response_headers(response_headers)
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2159,9 +2211,11 @@ mod tests {
             let targets_map = Arc::new(DashMap::new());
             targets_map.insert(
                 "free-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.example.com".parse().unwrap())
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2197,10 +2251,12 @@ mod tests {
 
             targets_map.insert(
                 "error-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .response_headers(response_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.example.com".parse().unwrap())
+                        .response_headers(response_headers)
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2240,10 +2296,12 @@ mod tests {
 
             targets_map.insert(
                 "expensive-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.expensive.com".parse().unwrap())
-                    .response_headers(expensive_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.expensive.com".parse().unwrap())
+                        .response_headers(expensive_headers)
+                        .build(),
+                ),
             );
 
             let mut cheap_headers = HashMap::new();
@@ -2252,10 +2310,12 @@ mod tests {
 
             targets_map.insert(
                 "cheap-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.cheap.com".parse().unwrap())
-                    .response_headers(cheap_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.cheap.com".parse().unwrap())
+                        .response_headers(cheap_headers)
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2304,10 +2364,12 @@ mod tests {
 
             targets_map.insert(
                 "input-only-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .response_headers(response_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.example.com".parse().unwrap())
+                        .response_headers(response_headers)
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2342,10 +2404,12 @@ mod tests {
 
             targets_map.insert(
                 "output-only-model".to_string(),
-                pool(Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .response_headers(response_headers)
-                    .build()),
+                pool(
+                    Target::builder()
+                        .url("https://api.example.com".parse().unwrap())
+                        .response_headers(response_headers)
+                        .build(),
+                ),
             );
 
             let targets = Targets {
@@ -2908,17 +2972,16 @@ mod tests {
                 .sanitize_response(false) // Provider overrides pool setting
                 .build();
 
-            let pool =
-                ProviderPool::new(vec![
-                    crate::load_balancer::Provider {
-                        target: provider1,
-                        weight: 1,
-                    },
-                    crate::load_balancer::Provider {
-                        target: provider2,
-                        weight: 1,
-                    },
-                ]);
+            let pool = ProviderPool::new(vec![
+                crate::load_balancer::Provider {
+                    target: provider1,
+                    weight: 1,
+                },
+                crate::load_balancer::Provider {
+                    target: provider2,
+                    weight: 1,
+                },
+            ]);
 
             let targets_map = Arc::new(DashMap::new());
             targets_map.insert("test-model".to_string(), pool);

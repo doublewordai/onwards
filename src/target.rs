@@ -232,18 +232,21 @@ impl TargetSpecOrList {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
                 // Take keys from first provider for backwards compatibility
                 let keys = list.first().and_then(|t| t.keys.clone());
-                let providers = list.into_iter().map(|t| ProviderSpec {
-                    url: t.url,
-                    onwards_key: t.onwards_key,
-                    onwards_model: t.onwards_model,
-                    rate_limit: t.rate_limit,
-                    concurrency_limit: t.concurrency_limit,
-                    upstream_auth_header_name: t.upstream_auth_header_name,
-                    upstream_auth_header_prefix: t.upstream_auth_header_prefix,
-                    response_headers: t.response_headers,
-                    weight: t.weight,
-                    sanitize_response: t.sanitize_response,
-                }).collect();
+                let providers = list
+                    .into_iter()
+                    .map(|t| ProviderSpec {
+                        url: t.url,
+                        onwards_key: t.onwards_key,
+                        onwards_model: t.onwards_model,
+                        rate_limit: t.rate_limit,
+                        concurrency_limit: t.concurrency_limit,
+                        upstream_auth_header_name: t.upstream_auth_header_name,
+                        upstream_auth_header_prefix: t.upstream_auth_header_prefix,
+                        response_headers: t.response_headers,
+                        weight: t.weight,
+                        sanitize_response: t.sanitize_response,
+                    })
+                    .collect();
                 PoolConfig {
                     keys,
                     rate_limit: None,
@@ -430,7 +433,17 @@ impl Target {
     /// Note: Keys from the target are transferred to the pool level
     pub fn into_pool(self) -> ProviderPool {
         let keys = self.keys.clone();
-        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None, None, LoadBalanceStrategy::default())
+        ProviderPool::with_config(
+            vec![Provider {
+                target: self,
+                weight: 1,
+            }],
+            keys,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+        )
     }
 }
 
@@ -637,11 +650,7 @@ impl Targets {
 
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
-                debug!(
-                    "Pool '{}' has {} keys configured",
-                    name,
-                    keys.len()
-                );
+                debug!("Pool '{}' has {} keys configured", name, keys.len());
                 keys.extend(global_keys.clone());
                 Some(keys)
             } else if !global_keys.is_empty() {
@@ -668,7 +677,8 @@ impl Targets {
             // Convert provider specs to providers
             // If pool-level sanitize_response is set, apply it to providers that don't have it
             let pool_sanitize = pool_config.sanitize_response;
-            let providers: Vec<Provider> = pool_config.providers
+            let providers: Vec<Provider> = pool_config
+                .providers
                 .into_iter()
                 .map(|mut spec| {
                     let weight = spec.weight;
