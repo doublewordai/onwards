@@ -174,6 +174,12 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
+    // Check if pool has no providers (e.g., composite model with no components)
+    if pool.is_empty() {
+        debug!("Pool for model '{}' has no providers", model_name);
+        return Err(OnwardsErrorResponse::bad_gateway());
+    }
+
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
         .headers()
