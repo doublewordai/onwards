@@ -647,7 +647,7 @@ When `sanitize_response: true` and a client requests `model: gpt-4`:
 
 **Third-party providers** (e.g., OpenRouter, Together AI) often add extra fields:
 
-- `provider`, `native_finish_reason`, `cost`, `logprobs`, etc.
+- `provider`, `native_finish_reason`, `cost`, etc.
 
 **Provider comparison** - normalize responses from different providers for consistent handling
 
