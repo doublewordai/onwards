@@ -1,10 +1,38 @@
+//! Response sanitization module for OpenAI-compatible API responses
+//!
+//! This module provides functionality to sanitize chat completion responses from various
+//! LLM providers, ensuring they conform to the strict OpenAI API schema. It handles both
+//! streaming (Server-Sent Events) and non-streaming (JSON) responses.
+//!
+//! ## Features
+//!
+//! - **Field filtering**: Removes provider-specific fields (e.g., `provider`, `cost`, `logprobs`)
+//! - **Model rewriting**: Replaces the upstream model name with the client's requested model
+//! - **Lenient parsing**: Handles missing fields with sensible defaults
+//! - **Streaming support**: Processes SSE chunks in real-time without buffering
+//!
+//! ## Example
+//!
+//! ```rust
+//! use onwards::response_sanitizer::ResponseSanitizer;
+//!
+//! let sanitizer = ResponseSanitizer {
+//!     original_model: Some("gpt-4".to_string()),
+//! };
+//!
+//! // Sanitize a response (removes extra fields, rewrites model to "gpt-4")
+//! // let sanitized = sanitizer.sanitize(path, headers, body)?;
+//! ```
+
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-/// Lenient wrapper for OpenAI chat completion responses
-/// Deserializes with defaults for missing fields and ignores extra provider-specific fields
+/// Lenient wrapper for OpenAI chat completion responses.
+///
+/// Deserializes with defaults for missing fields and ignores extra provider-specific fields.
+/// Uses `#[serde(flatten)]` to capture unknown fields and `skip_serializing` to drop them.
 #[derive(Debug, Deserialize, Serialize)]
 struct LenientChatCompletion {
     #[serde(default = "default_id")]
