@@ -1,5 +1,104 @@
 use axum::body::Bytes;
 use axum::http::HeaderMap;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Lenient wrapper for OpenAI chat completion responses
+/// Deserializes with defaults for missing fields and ignores extra provider-specific fields
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientChatCompletion {
+    #[serde(default = "default_id")]
+    id: String,
+    #[serde(default = "default_object")]
+    object: String,
+    #[serde(default = "default_created")]
+    created: u32,
+    model: String,
+    choices: Vec<LenientChoice>,
+    #[serde(default)]
+    usage: Option<LenientUsage>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientChoice {
+    #[serde(default)]
+    index: u64,
+    message: serde_json::Value,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientStreamChunk {
+    #[serde(default = "default_id")]
+    id: String,
+    #[serde(default = "default_stream_object")]
+    object: String,
+    #[serde(default = "default_created")]
+    created: u32,
+    model: String,
+    choices: Vec<LenientStreamChoice>,
+    #[serde(default)]
+    usage: Option<LenientUsage>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientStreamChoice {
+    #[serde(default)]
+    index: u64,
+    #[serde(default)]
+    delta: Option<serde_json::Value>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+fn default_id() -> String {
+    "chatcmpl-unknown".to_string()
+}
+
+fn default_object() -> String {
+    "chat.completion".to_string()
+}
+
+fn default_stream_object() -> String {
+    "chat.completion.chunk".to_string()
+}
+
+fn default_created() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+}
 
 /// Response sanitizer for OpenAI chat completion responses
 ///
@@ -53,108 +152,17 @@ impl ResponseSanitizer {
 
     /// Sanitizes a non-streaming JSON response
     fn sanitize_non_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
-        // First parse as generic JSON to handle provider-specific fields
-        let raw_json: serde_json::Value = serde_json::from_slice(body)
+        // Deserialize using lenient types that ignore unknown fields and provide defaults
+        let mut completion: LenientChatCompletion = serde_json::from_slice(body)
             .map_err(|e| format!("Failed to parse response as JSON: {}", e))?;
 
-        // Extract fields, providing defaults for missing required fields
-        let id = raw_json
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("chatcmpl-unknown")
-            .to_string();
-
-        let object = raw_json
-            .get("object")
-            .and_then(|v| v.as_str())
-            .unwrap_or("chat.completion")
-            .to_string();
-
-        let created = raw_json
-            .get("created")
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-            }) as u32;
-
-        // Use original model if provided, otherwise use model from response
-        let model = if let Some(ref original) = self.original_model {
-            original.clone()
-        } else {
-            raw_json
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string()
-        };
-
-        // Extract choices - this is the most complex part
-        let choices = raw_json
-            .get("choices")
-            .and_then(|v| v.as_array())
-            .ok_or("Response missing 'choices' array")?;
-
-        // Convert to OpenAI format, keeping only standard fields
-        let sanitized_choices: Result<Vec<serde_json::Value>, String> = choices
-            .iter()
-            .map(|choice| {
-                let index = choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                let message = choice
-                    .get("message")
-                    .cloned()
-                    .unwrap_or(serde_json::json!({}));
-                let finish_reason = choice
-                    .get("finish_reason")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                Ok(serde_json::json!({
-                    "index": index,
-                    "message": message,
-                    "finish_reason": finish_reason
-                }))
-            })
-            .collect();
-
-        let sanitized_choices = sanitized_choices?;
-
-        // Extract and sanitize optional usage field (only standard OpenAI fields)
-        let usage = raw_json.get("usage").map(|u| {
-            serde_json::json!({
-                "prompt_tokens": u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                "completion_tokens": u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                "total_tokens": u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-            })
-        });
-
-        // Extract optional system_fingerprint
-        let system_fingerprint = raw_json
-            .get("system_fingerprint")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Construct sanitized response with only OpenAI fields
-        let mut sanitized = serde_json::json!({
-            "id": id,
-            "object": object,
-            "created": created,
-            "model": model,
-            "choices": sanitized_choices
-        });
-
-        // Add optional fields if present
-        if let Some(usage) = usage {
-            sanitized["usage"] = usage;
-        }
-        if let Some(fp) = system_fingerprint {
-            sanitized["system_fingerprint"] = serde_json::Value::String(fp);
+        // Rewrite model field if original model provided
+        if let Some(ref original) = self.original_model {
+            completion.model = original.clone();
         }
 
-        // Serialize the sanitized response
-        let sanitized_bytes = serde_json::to_vec(&sanitized)
+        // Serialize back to clean JSON (unknown fields are automatically dropped)
+        let sanitized_bytes = serde_json::to_vec(&completion)
             .map_err(|e| format!("Failed to serialize sanitized response: {}", e))?;
 
         Ok(Some(Bytes::from(sanitized_bytes)))
@@ -177,100 +185,17 @@ impl ResponseSanitizer {
                     // Preserve [DONE] marker as-is
                     sanitized_lines.push(line.to_string());
                 } else {
-                    // Parse as generic JSON first
-                    let raw_chunk: serde_json::Value = serde_json::from_str(data_part)
+                    // Deserialize using lenient types that ignore unknown fields and provide defaults
+                    let mut chunk: LenientStreamChunk = serde_json::from_str(data_part)
                         .map_err(|e| format!("Failed to parse stream chunk: {}", e))?;
 
-                    // Extract and sanitize chunk fields
-                    let id = raw_chunk
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("chatcmpl-unknown")
-                        .to_string();
-
-                    let object = raw_chunk
-                        .get("object")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("chat.completion.chunk")
-                        .to_string();
-
-                    let created = raw_chunk
-                        .get("created")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_secs()
-                        }) as u32;
-
-                    // Use original model if provided
-                    let model = if let Some(ref original) = self.original_model {
-                        original.clone()
-                    } else {
-                        raw_chunk
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string()
-                    };
-
-                    // Extract choices (keep only standard fields)
-                    let choices = raw_chunk
-                        .get("choices")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|choice| {
-                                    let index =
-                                        choice.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
-                                    let delta = choice.get("delta").cloned();
-                                    let finish_reason = choice
-                                        .get("finish_reason")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
-
-                                    let mut sanitized_choice = serde_json::json!({
-                                        "index": index
-                                    });
-
-                                    if let Some(delta) = delta {
-                                        sanitized_choice["delta"] = delta;
-                                    }
-                                    if let Some(fr) = finish_reason {
-                                        sanitized_choice["finish_reason"] =
-                                            serde_json::Value::String(fr);
-                                    }
-
-                                    sanitized_choice
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-
-                    // Build sanitized chunk
-                    let mut sanitized_chunk = serde_json::json!({
-                        "id": id,
-                        "object": object,
-                        "created": created,
-                        "model": model,
-                        "choices": choices
-                    });
-
-                    // Include optional fields if present (sanitize usage to only standard fields)
-                    if let Some(usage) = raw_chunk.get("usage") {
-                        sanitized_chunk["usage"] = serde_json::json!({
-                            "prompt_tokens": usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                            "completion_tokens": usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                            "total_tokens": usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
-                        });
-                    }
-                    if let Some(fp) = raw_chunk.get("system_fingerprint") {
-                        sanitized_chunk["system_fingerprint"] = fp.clone();
+                    // Rewrite model field if original model provided
+                    if let Some(ref original) = self.original_model {
+                        chunk.model = original.clone();
                     }
 
-                    // Serialize the sanitized chunk
-                    let sanitized_json = serde_json::to_string(&sanitized_chunk)
+                    // Serialize the sanitized chunk (unknown fields are automatically dropped)
+                    let sanitized_json = serde_json::to_string(&chunk)
                         .map_err(|e| format!("Failed to serialize stream chunk: {}", e))?;
 
                     sanitized_lines.push(format!("data: {}", sanitized_json));
