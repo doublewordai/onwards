@@ -635,20 +635,13 @@ Add `sanitize_response: true` to any target or provider in your `config.json`:
 
 When `sanitize_response: true` and a client requests `model: gpt-4`:
 
-1. **Request sent upstream** with `model: gpt-4-turbo-2024-04-09` (if `onwards_model` is configured)
+1. **Request sent upstream** with `model: gpt-4`
 2. **Upstream responds** with custom fields and `model: gpt-4-turbo-2024-04-09`
 3. **Onwards sanitizes**:
    - Parses response using OpenAI schema (removes unknown fields)
    - Rewrites `model` field to `gpt-4` (matches original request)
    - Reserializes clean response
 4. **Client receives** standard OpenAI response with `model: gpt-4`
-
-### Performance Impact
-
-- **Non-streaming responses**: ~1-2ms additional latency when enabled
-- **Streaming responses**: Negligible per-chunk overhead when enabled
-- **Disabled by default**: Zero overhead - sanitization is skipped unless `sanitize_response: true`
-- **Hot-reload friendly**: Can enable/disable per-target without restarting
 
 ### Common Use Cases
 
