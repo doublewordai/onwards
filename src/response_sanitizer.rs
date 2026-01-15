@@ -273,7 +273,24 @@ impl ResponseSanitizer {
             // Ignore other lines (comments, etc.)
         }
 
-        let sanitized_body = sanitized_lines.join("\n");
+        // Join with \n and ensure the output preserves trailing newlines from input
+        // SSE format requires messages to end with \n\n
+        let mut sanitized_body = sanitized_lines.join("\n");
+
+        // .lines() strips trailing newlines, so we need to restore them
+        // Count trailing newlines in both input and current output
+        let input_trailing = body_str.chars().rev().take_while(|&c| c == '\n').count();
+        let output_trailing = sanitized_body
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\n')
+            .count();
+
+        // Add the difference to match input's trailing newlines
+        for _ in output_trailing..input_trailing {
+            sanitized_body.push('\n');
+        }
+
         Ok(Some(Bytes::from(sanitized_body)))
     }
 }
@@ -341,6 +358,61 @@ mod tests {
         let result_str = std::str::from_utf8(&result).unwrap();
         assert!(result_str.contains("\"model\":\"gpt-4\""));
         assert!(result_str.contains("data: [DONE]"));
+
+        // Verify SSE format: should end with \n\n for proper message termination
+        assert!(
+            result_str.ends_with("\n\n"),
+            "SSE response should end with \\n\\n, got: {:?}",
+            &result_str[result_str.len().saturating_sub(10)..]
+        );
+
+        // Verify messages are separated by \n\n
+        assert!(
+            result_str.contains("}\n\ndata:"),
+            "SSE messages should be separated by \\n\\n"
+        );
+
+        // Verify exactly 2 trailing newlines (not 3 or more)
+        let trailing_count = result_str.chars().rev().take_while(|&c| c == '\n').count();
+        assert_eq!(
+            trailing_count, 2,
+            "Should have exactly 2 trailing newlines, got {}",
+            trailing_count
+        );
+    }
+
+    #[test]
+    fn test_streaming_multiple_chunks() {
+        let sanitizer = ResponseSanitizer {
+            original_model: Some("gpt-4".to_string()),
+        };
+
+        // Multiple chunks with proper SSE format
+        let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652289,\"model\":\"gpt-4-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" World\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            HeaderValue::from_static("text/event-stream"),
+        );
+
+        let result = sanitizer
+            .sanitize("/v1/chat/completions", &headers, sse_response.as_bytes())
+            .unwrap()
+            .unwrap();
+
+        let result_str = std::str::from_utf8(&result).unwrap();
+
+        // All chunks should have model rewritten
+        let chunk_count = result_str.matches("\"model\":\"gpt-4\"").count();
+        assert_eq!(chunk_count, 2, "Both chunks should have model rewritten");
+
+        // Should end with \n\n
+        assert!(result_str.ends_with("\n\n"));
+
+        // Should have three messages (2 chunks + [DONE])
+        let message_count = result_str.matches("data:").count();
+        assert_eq!(message_count, 3);
     }
 
     #[test]

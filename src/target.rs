@@ -1699,4 +1699,41 @@ mod tests {
         let pool = targets.targets.get("gpt-4").unwrap();
         assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom);
     }
+
+    #[test]
+    fn test_into_pool_preserves_sanitize_response() {
+        // Create a target with sanitize_response enabled
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .sanitize_response(true)
+            .build();
+
+        // Convert to pool
+        let pool = target.into_pool();
+
+        // Verify the target's sanitize_response is accessible through the pool
+        let (_, first_target) = pool.select_ordered().next().unwrap();
+        assert!(
+            first_target.sanitize_response,
+            "into_pool should preserve sanitize_response setting"
+        );
+    }
+
+    #[test]
+    fn test_into_pool_preserves_sanitize_response_disabled() {
+        // Create a target with sanitize_response disabled (default)
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        // Convert to pool
+        let pool = target.into_pool();
+
+        // Verify the target's sanitize_response is accessible through the pool
+        let (_, first_target) = pool.select_ordered().next().unwrap();
+        assert!(
+            !first_target.sanitize_response,
+            "into_pool should preserve default sanitize_response setting"
+        );
+    }
 }
