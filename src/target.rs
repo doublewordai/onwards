@@ -148,9 +148,11 @@ pub struct PoolSpec {
     #[serde(default)]
     pub strategy: LoadBalanceStrategy,
 
-    /// Enable response sanitization for all providers in this pool
+    /// Enable response sanitization for all providers in this pool.
+    /// Individual providers can override this setting. Defaults to false.
     #[serde(default)]
-    pub sanitize_response: Option<bool>,
+    #[builder(default)]
+    pub sanitize_response: bool,
 
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
@@ -180,9 +182,11 @@ pub struct TargetSpec {
     #[builder(default = default_weight())]
     pub weight: u32,
 
-    /// Enable response sanitization to enforce strict OpenAI schema compliance
+    /// Enable response sanitization to enforce strict OpenAI schema compliance.
+    /// Defaults to false.
     #[serde(default)]
-    pub sanitize_response: Option<bool>,
+    #[builder(default)]
+    pub sanitize_response: bool,
 }
 
 fn default_weight() -> u32 {
@@ -210,7 +214,7 @@ pub struct PoolConfig {
     pub response_headers: Option<HashMap<String, String>>,
     pub fallback: Option<FallbackConfig>,
     pub strategy: LoadBalanceStrategy,
-    pub sanitize_response: Option<bool>,
+    pub sanitize_response: bool,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -244,7 +248,7 @@ impl TargetSpecOrList {
                         upstream_auth_header_prefix: t.upstream_auth_header_prefix,
                         response_headers: t.response_headers,
                         weight: t.weight,
-                        sanitize_response: t.sanitize_response,
+                        sanitize_response: Some(t.sanitize_response),
                     })
                     .collect();
                 PoolConfig {
@@ -254,13 +258,14 @@ impl TargetSpecOrList {
                     response_headers: None,
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
-                    sanitize_response: None,
+                    sanitize_response: false,
                     providers,
                 }
             }
             TargetSpecOrList::Single(spec) => {
                 // Single provider: use its keys as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
+                let sanitize_response = spec.sanitize_response;
                 let provider = ProviderSpec {
                     url: spec.url,
                     onwards_key: spec.onwards_key,
@@ -271,7 +276,7 @@ impl TargetSpecOrList {
                     upstream_auth_header_prefix: spec.upstream_auth_header_prefix,
                     response_headers: spec.response_headers,
                     weight: spec.weight,
-                    sanitize_response: spec.sanitize_response,
+                    sanitize_response: None, // Inherit from pool
                 };
                 PoolConfig {
                     keys,
@@ -280,7 +285,7 @@ impl TargetSpecOrList {
                     response_headers: None,
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
-                    sanitize_response: None,
+                    sanitize_response,
                     providers: vec![provider],
                 }
             }
@@ -347,7 +352,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
-            sanitize_response: value.sanitize_response,
+            sanitize_response: value.sanitize_response.unwrap_or(false),
         }
     }
 }
@@ -424,7 +429,8 @@ pub struct Target {
     /// Custom headers to include in responses (e.g., pricing, metadata)
     pub response_headers: Option<HashMap<String, String>>,
     /// Enable response sanitization to enforce strict OpenAI schema compliance
-    pub sanitize_response: Option<bool>,
+    #[builder(default)]
+    pub sanitize_response: bool,
 }
 
 impl Target {
@@ -684,7 +690,7 @@ impl Targets {
                     let weight = spec.weight;
                     // Apply pool-level sanitize_response if provider doesn't specify it
                     if spec.sanitize_response.is_none() {
-                        spec.sanitize_response = pool_sanitize;
+                        spec.sanitize_response = Some(pool_sanitize);
                     }
                     let target: Target = spec.into();
                     Provider { target, weight }

@@ -49,6 +49,7 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
     let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
     let mut router = build_router(app_state);
     // If we have a metrics layer, add it to the router.

@@ -298,7 +298,7 @@ impl<T: HttpClient> AppState<T> {
 /// let model = extract_model_from_request(&headers, body).unwrap();
 /// assert_eq!(model, "claude-3");
 /// ```
-pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Result<String, ()> {
+pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Option<String> {
     const MODEL_OVERRIDE_HEADER: &str = "model-override";
 
     // Order of precedence for the model:
@@ -306,12 +306,12 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Res
     // 2. Available in the request body as JSON
     match headers.get(MODEL_OVERRIDE_HEADER) {
         Some(header_value) => {
-            let model_str = header_value.to_str().map_err(|_| ())?;
-            Ok(model_str.to_string())
+            let model_str = header_value.to_str().ok()?;
+            Some(model_str.to_string())
         }
         None => {
-            let extracted: ExtractedModel = serde_json::from_slice(body_bytes).map_err(|_| ())?;
-            Ok(extracted.model.to_string())
+            let extracted: ExtractedModel = serde_json::from_slice(body_bytes).ok()?;
+            Some(extracted.model.to_string())
         }
     }
 }

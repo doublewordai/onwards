@@ -645,9 +645,10 @@ When `sanitize_response: true` and a client requests `model: gpt-4`:
 
 ### Performance Impact
 
-- **Non-streaming responses**: ~1-2ms additional latency
-- **Streaming responses**: Negligible per-chunk overhead
-- **Disabled by default**: No performance impact unless explicitly enabled
+- **Non-streaming responses**: ~1-2ms additional latency when enabled
+- **Streaming responses**: Negligible per-chunk overhead when enabled
+- **Disabled by default**: Zero overhead - sanitization is skipped unless `sanitize_response: true`
+- **Hot-reload friendly**: Can enable/disable per-target without restarting
 
 ### Common Use Cases
 

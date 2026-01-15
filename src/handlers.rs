@@ -152,8 +152,8 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract the model using the shared function
     let model_name = match crate::extract_model_from_request(req.headers(), &body_bytes) {
-        Ok(model) => model,
-        Err(_) => {
+        Some(model) => model,
+        None => {
             return Err(OnwardsErrorResponse::bad_request(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
@@ -444,9 +444,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
 
                 // Success - apply response transformation if configured
-                // Only sanitize successful responses (2xx status codes)
+                // Per-target opt-in via sanitize_response flag, only for 2xx responses
                 if let Some(ref transform_fn) = state.response_transform_fn
-                    && target.sanitize_response.unwrap_or(false)
+                    && target.sanitize_response
                     && (200..300).contains(&status)
                 {
                     debug!(
