@@ -47,6 +47,8 @@ struct LenientChatCompletion {
     usage: Option<LenientUsage>,
     #[serde(default)]
     system_fingerprint: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -59,6 +61,8 @@ struct LenientChoice {
     message: serde_json::Value,
     #[serde(default)]
     finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<serde_json::Value>,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -72,6 +76,36 @@ struct LenientUsage {
     completion_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    audio_tokens: u64,
+    /// Catch-all for unknown fields (ignored during serialization)
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+    #[serde(default)]
+    audio_tokens: u64,
+    #[serde(default)]
+    accepted_prediction_tokens: u64,
+    #[serde(default)]
+    rejected_prediction_tokens: u64,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -91,6 +125,8 @@ struct LenientStreamChunk {
     usage: Option<LenientUsage>,
     #[serde(default)]
     system_fingerprint: Option<String>,
+    #[serde(default)]
+    service_tier: Option<String>,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -104,6 +140,8 @@ struct LenientStreamChoice {
     delta: Option<serde_json::Value>,
     #[serde(default)]
     finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<serde_json::Value>,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -437,7 +475,10 @@ mod tests {
         // Verify provider-specific fields are removed
         assert!(sanitized.get("provider").is_none());
         assert!(choices[0].get("native_finish_reason").is_none());
-        assert!(choices[0].get("logprobs").is_none());
+
+        // Verify logprobs is preserved (it's a valid OpenAI field, even when null)
+        assert!(choices[0].get("logprobs").is_some());
+        assert_eq!(choices[0]["logprobs"], serde_json::Value::Null);
 
         // Verify usage is preserved (but sanitized)
         assert!(sanitized.get("usage").is_some());
@@ -450,5 +491,19 @@ mod tests {
         assert!(usage.get("cost").is_none());
         assert!(usage.get("is_byok").is_none());
         assert!(usage.get("cost_details").is_none());
+
+        // Verify OpenAI token detail fields are preserved
+        assert!(usage.get("prompt_tokens_details").is_some());
+        assert!(usage.get("completion_tokens_details").is_some());
+
+        // Verify the nested details contain valid OpenAI fields (invalid ones like video_tokens, image_tokens are removed)
+        let prompt_details = &usage["prompt_tokens_details"];
+        assert_eq!(prompt_details["cached_tokens"], 0);
+        assert_eq!(prompt_details["audio_tokens"], 0);
+        assert!(prompt_details.get("video_tokens").is_none()); // OpenRouter-specific, should be removed
+
+        let completion_details = &usage["completion_tokens_details"];
+        assert_eq!(completion_details["reasoning_tokens"], 0);
+        assert!(completion_details.get("image_tokens").is_none()); // OpenRouter-specific, should be removed
     }
 }
