@@ -65,8 +65,9 @@ pub struct ProviderSpec {
 
     /// Enable response sanitization to enforce strict OpenAI schema compliance.
     /// Removes provider-specific fields and rewrites the model field.
+    /// Defaults to false.
     #[serde(default)]
-    pub sanitize_response: Option<bool>,
+    pub sanitize_response: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -248,7 +249,7 @@ impl TargetSpecOrList {
                         upstream_auth_header_prefix: t.upstream_auth_header_prefix,
                         response_headers: t.response_headers,
                         weight: t.weight,
-                        sanitize_response: Some(t.sanitize_response),
+                        sanitize_response: t.sanitize_response,
                     })
                     .collect();
                 PoolConfig {
@@ -276,7 +277,7 @@ impl TargetSpecOrList {
                     upstream_auth_header_prefix: spec.upstream_auth_header_prefix,
                     response_headers: spec.response_headers,
                     weight: spec.weight,
-                    sanitize_response: None, // Inherit from pool
+                    sanitize_response: false, // Will be OR'd with pool-level setting
                 };
                 PoolConfig {
                     keys,
@@ -352,7 +353,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
-            sanitize_response: value.sanitize_response.unwrap_or(false),
+            sanitize_response: value.sanitize_response,
         }
     }
 }
@@ -681,17 +682,15 @@ impl Targets {
                 });
 
             // Convert provider specs to providers
-            // If pool-level sanitize_response is set, apply it to providers that don't have it
+            // Pool-level sanitize_response enables sanitization for all providers
             let pool_sanitize = pool_config.sanitize_response;
             let providers: Vec<Provider> = pool_config
                 .providers
                 .into_iter()
                 .map(|mut spec| {
                     let weight = spec.weight;
-                    // Apply pool-level sanitize_response if provider doesn't specify it
-                    if spec.sanitize_response.is_none() {
-                        spec.sanitize_response = Some(pool_sanitize);
-                    }
+                    // Enable sanitization if either pool or provider level is true
+                    spec.sanitize_response = pool_sanitize || spec.sanitize_response;
                     let target: Target = spec.into();
                     Provider { target, weight }
                 })

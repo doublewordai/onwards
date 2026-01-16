@@ -197,8 +197,8 @@ impl ResponseSanitizer {
         headers: &HeaderMap,
         body: &[u8],
     ) -> Result<Option<Bytes>, String> {
-        // Only apply to /v1/chat/completions endpoint
-        if !path.contains("/v1/chat/completions") {
+        // Only apply to chat completions endpoint (with or without /v1 prefix)
+        if !path.contains("/chat/completions") {
             return Ok(None);
         }
 
