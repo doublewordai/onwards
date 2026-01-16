@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/doublewordai/onwards/compare/v0.10.1...v0.11.0) - 2026-01-16
+
+### Added
+
+- [**breaking**] chat completion sanitisation ([#59](https://github.com/doublewordai/onwards/pull/59))
+
 ## [0.10.1](https://github.com/doublewordai/onwards/compare/v0.10.0...v0.10.1) - 2026-01-15
 
 ### Added
