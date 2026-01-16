@@ -190,7 +190,9 @@ impl ProviderPool {
 
     /// Check if local rate limits should trigger fallback
     pub fn should_fallback_on_rate_limit(&self) -> bool {
-        self.fallback.as_ref().is_some_and(|f| f.enabled && f.on_rate_limit)
+        self.fallback
+            .as_ref()
+            .is_some_and(|f| f.enabled && f.on_rate_limit)
     }
 
     /// Get the load balancing strategy
@@ -280,9 +282,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn create_test_target(url: &str) -> Target {
-        Target::builder()
-            .url(url.parse().unwrap())
-            .build()
+        Target::builder().url(url.parse().unwrap()).build()
     }
 
     #[test]
@@ -493,7 +493,7 @@ mod tests {
         // With 1000 iterations, allow for reasonable variance (80-98%)
         let percentage = (heavy_first * 100) / iterations;
         assert!(
-            percentage >= 80 && percentage <= 98,
+            (80..=98).contains(&percentage),
             "Expected heavy to be first ~90% of the time, got {}% ({}/{})",
             percentage,
             heavy_first,
@@ -518,15 +518,12 @@ mod tests {
         }];
 
         // Test both strategies with single provider
-        for strategy in [LoadBalanceStrategy::Priority, LoadBalanceStrategy::WeightedRandom] {
-            let pool = ProviderPool::with_config(
-                providers.clone(),
-                None,
-                None,
-                None,
-                None,
-                strategy,
-            );
+        for strategy in [
+            LoadBalanceStrategy::Priority,
+            LoadBalanceStrategy::WeightedRandom,
+        ] {
+            let pool =
+                ProviderPool::with_config(providers.clone(), None, None, None, None, strategy);
 
             let order: Vec<_> = pool.select_ordered().collect();
             assert_eq!(order.len(), 1);

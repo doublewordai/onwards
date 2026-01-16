@@ -26,7 +26,6 @@ pub(crate) struct Model {
     pub(crate) owned_by: String,
 }
 
-
 /// The response from the /v1/models endpoint, which is a list of models.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub(crate) struct ListModelResponse {

@@ -4,6 +4,7 @@ use clap::Parser as _;
 use config::Config;
 use onwards::{
     AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
+    create_openai_sanitizer,
     target::{Targets, WatchedFile},
 };
 use tokio::{net::TcpListener, task::JoinSet};
@@ -48,7 +49,8 @@ pub async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let app_state = AppState::new(targets);
+    // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
+    let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
     let mut router = build_router(app_state);
     // If we have a metrics layer, add it to the router.
     if let Some(prometheus_layer) = prometheus_layer {

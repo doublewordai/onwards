@@ -22,6 +22,12 @@ use axum::{
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
 
+/// Stores the original model name requested by the client
+///
+/// This is used to rewrite the model field in responses when `onwards_model` is configured
+#[derive(Clone, Debug)]
+struct OriginalModel(String);
+
 /// Filters and modifies headers before forwarding to upstream
 ///
 /// This function implements RFC 7230 compliant proxy behavior by:
@@ -146,14 +152,18 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract the model using the shared function
     let model_name = match crate::extract_model_from_request(req.headers(), &body_bytes) {
-        Ok(model) => model,
-        Err(_) => {
+        Some(model) => model,
+        None => {
             return Err(OnwardsErrorResponse::bad_request(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             ));
         }
     };
+
+    // Store original model in request extensions for response sanitization
+    req.extensions_mut()
+        .insert(OriginalModel(model_name.clone()));
 
     trace!("Received request for model: {}", model_name);
     trace!(
@@ -297,10 +307,7 @@ pub async fn target_message_handler<T: HttpClient>(
             match limiter.acquire().await {
                 Ok(guard) => Some(guard),
                 Err(_) => {
-                    debug!(
-                        "Provider concurrency limit exceeded: {:?}",
-                        target.url
-                    );
+                    debug!("Provider concurrency limit exceeded: {:?}", target.url);
                     last_error = Some(OnwardsErrorResponse::concurrency_limited());
                     // Concurrency limits are treated like rate limits for fallback purposes
                     if pool.should_fallback_on_rate_limit() {
@@ -330,7 +337,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             );
-            let mut body_serialized: serde_json::Value = match serde_json::from_slice(&attempt_body) {
+            let mut body_serialized: serde_json::Value = match serde_json::from_slice(&attempt_body)
+            {
                 Ok(value) => value,
                 Err(_) => return Err(error.clone()),
             };
@@ -441,7 +449,144 @@ pub async fn target_message_handler<T: HttpClient>(
                     continue;
                 }
 
-                // Success - add custom response headers and return
+                // Success - apply response transformation if configured
+                // Per-target opt-in via sanitize_response flag, only for 2xx responses
+                if let Some(ref transform_fn) = state.response_transform_fn
+                    && target.sanitize_response
+                    && (200..300).contains(&status)
+                {
+                    debug!(
+                        "Attempting response sanitization for status {}, path {}",
+                        status, path_and_query
+                    );
+
+                    // Extract original model from request extensions
+                    let original_model = req
+                        .extensions()
+                        .get::<OriginalModel>()
+                        .map(|m| m.0.to_string());
+
+                    // Check if response is suitable for sanitization
+                    // Clone content_type to avoid borrow issues
+                    let content_type = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let is_streaming = content_type.contains("text/event-stream");
+
+                    if is_streaming {
+                        // Streaming SSE response - transform chunk-by-chunk
+                        debug!("Applying streaming sanitization");
+
+                        let sanitizer = crate::response_sanitizer::ResponseSanitizer {
+                            original_model: original_model.clone(),
+                        };
+
+                        use futures_util::StreamExt;
+
+                        let body_stream = http_body_util::BodyExt::into_data_stream(
+                            std::mem::take(response.body_mut()),
+                        );
+                        let transformed_stream = body_stream.map(move |chunk_result| {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    // Sanitize this chunk
+                                    match sanitizer.sanitize_streaming(&chunk) {
+                                        Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
+                                        Ok(None) => Ok(chunk),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to sanitize streaming chunk: {}",
+                                                e
+                                            );
+                                            Ok(chunk) // Pass through on error
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Stream error: {}", e);
+                                    Err(std::io::Error::other(e))
+                                }
+                            }
+                        });
+
+                        *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
+                    } else {
+                        // Non-streaming response - buffer and transform
+                        debug!("Applying non-streaming sanitization");
+
+                        let response_body =
+                            axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to buffer response body: {}", e);
+                                    OnwardsErrorResponse::internal()
+                                })?;
+
+                        debug!(
+                            "Response body buffered: {} bytes, content-type: {}",
+                            response_body.len(),
+                            content_type
+                        );
+                        trace!(
+                            "Response body content: {}",
+                            String::from_utf8_lossy(&response_body)
+                        );
+
+                        // Apply transformation
+                        match transform_fn(
+                            &path_and_query,
+                            response.headers(),
+                            &response_body,
+                            original_model.as_deref(),
+                        ) {
+                            Ok(Some(transformed_body)) => {
+                                // Update response with sanitized body
+                                let content_length = transformed_body.len();
+                                debug!(
+                                    "Sanitization successful: {} bytes -> {} bytes",
+                                    response_body.len(),
+                                    content_length
+                                );
+                                trace!(
+                                    "Sanitized body: {}",
+                                    String::from_utf8_lossy(&transformed_body)
+                                );
+                                *response.body_mut() = axum::body::Body::from(transformed_body);
+
+                                // Remove transfer-encoding since we're setting content-length
+                                response.headers_mut().remove(TRANSFER_ENCODING);
+                                response
+                                    .headers_mut()
+                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+                            }
+                            Ok(None) => {
+                                // No transformation applied, restore original body
+                                debug!(
+                                    "Sanitization returned None, restoring original {} bytes",
+                                    response_body.len()
+                                );
+                                let content_length = response_body.len();
+                                *response.body_mut() = axum::body::Body::from(response_body);
+
+                                // Ensure proper headers even when not transforming
+                                response.headers_mut().remove(TRANSFER_ENCODING);
+                                response
+                                    .headers_mut()
+                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+                            }
+                            Err(e) => {
+                                error!("Response sanitization failed: {}", e);
+                                return Err(OnwardsErrorResponse::internal());
+                            }
+                        }
+                    }
+                }
+
+                // Add custom response headers
                 if let Some(headers) = response_headers {
                     for (key, value) in headers.iter() {
                         if let (Ok(header_name), Ok(header_value)) =
@@ -456,6 +601,11 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Added custom response headers"
                     );
                 }
+                debug!(
+                    "Returning response with status {}, content-length: {:?}",
+                    response.status(),
+                    response.headers().get(CONTENT_LENGTH)
+                );
                 return Ok(response);
             }
             Err(e) => {

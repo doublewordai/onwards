@@ -62,6 +62,12 @@ pub struct ProviderSpec {
     #[serde(default = "default_weight")]
     #[builder(default = default_weight())]
     pub weight: u32,
+
+    /// Enable response sanitization to enforce strict OpenAI schema compliance.
+    /// Removes provider-specific fields and rewrites the model field.
+    /// Defaults to false.
+    #[serde(default)]
+    pub sanitize_response: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -143,6 +149,12 @@ pub struct PoolSpec {
     #[serde(default)]
     pub strategy: LoadBalanceStrategy,
 
+    /// Enable response sanitization for all providers in this pool.
+    /// Individual providers can override this setting. Defaults to false.
+    #[serde(default)]
+    #[builder(default)]
+    pub sanitize_response: bool,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -170,6 +182,12 @@ pub struct TargetSpec {
     #[serde(default = "default_weight")]
     #[builder(default = default_weight())]
     pub weight: u32,
+
+    /// Enable response sanitization to enforce strict OpenAI schema compliance.
+    /// Defaults to false.
+    #[serde(default)]
+    #[builder(default)]
+    pub sanitize_response: bool,
 }
 
 fn default_weight() -> u32 {
@@ -197,6 +215,7 @@ pub struct PoolConfig {
     pub response_headers: Option<HashMap<String, String>>,
     pub fallback: Option<FallbackConfig>,
     pub strategy: LoadBalanceStrategy,
+    pub sanitize_response: bool,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -211,23 +230,28 @@ impl TargetSpecOrList {
                 response_headers: pool.response_headers,
                 fallback: pool.fallback,
                 strategy: pool.strategy,
+                sanitize_response: pool.sanitize_response,
                 providers: pool.providers,
             },
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
                 // Take keys from first provider for backwards compatibility
                 let keys = list.first().and_then(|t| t.keys.clone());
-                let providers = list.into_iter().map(|t| ProviderSpec {
-                    url: t.url,
-                    onwards_key: t.onwards_key,
-                    onwards_model: t.onwards_model,
-                    rate_limit: t.rate_limit,
-                    concurrency_limit: t.concurrency_limit,
-                    upstream_auth_header_name: t.upstream_auth_header_name,
-                    upstream_auth_header_prefix: t.upstream_auth_header_prefix,
-                    response_headers: t.response_headers,
-                    weight: t.weight,
-                }).collect();
+                let providers = list
+                    .into_iter()
+                    .map(|t| ProviderSpec {
+                        url: t.url,
+                        onwards_key: t.onwards_key,
+                        onwards_model: t.onwards_model,
+                        rate_limit: t.rate_limit,
+                        concurrency_limit: t.concurrency_limit,
+                        upstream_auth_header_name: t.upstream_auth_header_name,
+                        upstream_auth_header_prefix: t.upstream_auth_header_prefix,
+                        response_headers: t.response_headers,
+                        weight: t.weight,
+                        sanitize_response: t.sanitize_response,
+                    })
+                    .collect();
                 PoolConfig {
                     keys,
                     rate_limit: None,
@@ -235,12 +259,14 @@ impl TargetSpecOrList {
                     response_headers: None,
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
+                    sanitize_response: false,
                     providers,
                 }
             }
             TargetSpecOrList::Single(spec) => {
                 // Single provider: use its keys as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
+                let sanitize_response = spec.sanitize_response;
                 let provider = ProviderSpec {
                     url: spec.url,
                     onwards_key: spec.onwards_key,
@@ -251,6 +277,7 @@ impl TargetSpecOrList {
                     upstream_auth_header_prefix: spec.upstream_auth_header_prefix,
                     response_headers: spec.response_headers,
                     weight: spec.weight,
+                    sanitize_response: false, // Will be OR'd with pool-level setting
                 };
                 PoolConfig {
                     keys,
@@ -259,6 +286,7 @@ impl TargetSpecOrList {
                     response_headers: None,
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
+                    sanitize_response,
                     providers: vec![provider],
                 }
             }
@@ -300,6 +328,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
+            sanitize_response: value.sanitize_response,
         }
     }
 }
@@ -324,6 +353,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
+            sanitize_response: value.sanitize_response,
         }
     }
 }
@@ -399,6 +429,9 @@ pub struct Target {
     pub upstream_auth_header_prefix: Option<String>,
     /// Custom headers to include in responses (e.g., pricing, metadata)
     pub response_headers: Option<HashMap<String, String>>,
+    /// Enable response sanitization to enforce strict OpenAI schema compliance
+    #[builder(default)]
+    pub sanitize_response: bool,
 }
 
 impl Target {
@@ -407,7 +440,17 @@ impl Target {
     /// Note: Keys from the target are transferred to the pool level
     pub fn into_pool(self) -> ProviderPool {
         let keys = self.keys.clone();
-        ProviderPool::with_config(vec![Provider { target: self, weight: 1 }], keys, None, None, None, LoadBalanceStrategy::default())
+        ProviderPool::with_config(
+            vec![Provider {
+                target: self,
+                weight: 1,
+            }],
+            keys,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+        )
     }
 }
 
@@ -614,11 +657,7 @@ impl Targets {
 
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
-                debug!(
-                    "Pool '{}' has {} keys configured",
-                    name,
-                    keys.len()
-                );
+                debug!("Pool '{}' has {} keys configured", name, keys.len());
                 keys.extend(global_keys.clone());
                 Some(keys)
             } else if !global_keys.is_empty() {
@@ -643,10 +682,15 @@ impl Targets {
                 });
 
             // Convert provider specs to providers
-            let providers: Vec<Provider> = pool_config.providers
+            // Pool-level sanitize_response enables sanitization for all providers
+            let pool_sanitize = pool_config.sanitize_response;
+            let providers: Vec<Provider> = pool_config
+                .providers
                 .into_iter()
-                .map(|spec| {
+                .map(|mut spec| {
                     let weight = spec.weight;
+                    // Enable sanitization if either pool or provider level is true
+                    spec.sanitize_response = pool_sanitize || spec.sanitize_response;
                     let target: Target = spec.into();
                     Provider { target, weight }
                 })
@@ -1653,5 +1697,42 @@ mod tests {
 
         let pool = targets.targets.get("gpt-4").unwrap();
         assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom);
+    }
+
+    #[test]
+    fn test_into_pool_preserves_sanitize_response() {
+        // Create a target with sanitize_response enabled
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .sanitize_response(true)
+            .build();
+
+        // Convert to pool
+        let pool = target.into_pool();
+
+        // Verify the target's sanitize_response is accessible through the pool
+        let (_, first_target) = pool.select_ordered().next().unwrap();
+        assert!(
+            first_target.sanitize_response,
+            "into_pool should preserve sanitize_response setting"
+        );
+    }
+
+    #[test]
+    fn test_into_pool_preserves_sanitize_response_disabled() {
+        // Create a target with sanitize_response disabled (default)
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        // Convert to pool
+        let pool = target.into_pool();
+
+        // Verify the target's sanitize_response is accessible through the pool
+        let (_, first_target) = pool.select_ordered().next().unwrap();
+        assert!(
+            !first_target.sanitize_response,
+            "into_pool should preserve default sanitize_response setting"
+        );
     }
 }
