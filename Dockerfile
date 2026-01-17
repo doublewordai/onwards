@@ -18,7 +18,7 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime stage - use Ubuntu for better compatibility
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/onwards /app/onwards
