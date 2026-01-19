@@ -460,11 +460,14 @@ pub async fn target_message_handler<T: HttpClient>(
                         status, path_and_query
                     );
 
-                    // Extract original model from request extensions
-                    let original_model = req
-                        .extensions()
-                        .get::<OriginalModel>()
-                        .map(|m| m.0.to_string());
+                    // Determine model name for sanitization:
+                    // 1. Use config's sanitize_model_name if set
+                    // 2. Otherwise fallback to original model from request
+                    let sanitize_model_name = target.sanitize_model_name.clone().or_else(|| {
+                        req.extensions()
+                            .get::<OriginalModel>()
+                            .map(|m| m.0.to_string())
+                    });
 
                     // Check if response is suitable for sanitization
                     // Clone content_type to avoid borrow issues
@@ -482,7 +485,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         debug!("Applying streaming sanitization");
 
                         let sanitizer = crate::response_sanitizer::ResponseSanitizer {
-                            original_model: original_model.clone(),
+                            original_model: sanitize_model_name.clone(),
                         };
 
                         use futures_util::StreamExt;
@@ -494,7 +497,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             match chunk_result {
                                 Ok(chunk) => {
                                     // Sanitize this chunk
-                                    match sanitizer.sanitize_streaming(&chunk) {
+                                    match sanitizer.sanitize_chat_completion_stream(&chunk) {
                                         Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
                                         Ok(None) => Ok(chunk),
                                         Err(e) => {
@@ -541,7 +544,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             &path_and_query,
                             response.headers(),
                             &response_body,
-                            original_model.as_deref(),
+                            sanitize_model_name.as_deref(),
                         ) {
                             Ok(Some(transformed_body)) => {
                                 // Update response with sanitized body

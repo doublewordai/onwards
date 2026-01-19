@@ -68,6 +68,12 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Override the model name in sanitized responses.
+    /// If not set, uses the model name from the client request.
+    /// Useful when you want to present a consistent model name regardless of the upstream provider.
+    #[serde(default)]
+    pub sanitize_model_name: Option<String>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -155,6 +161,12 @@ pub struct PoolSpec {
     #[builder(default)]
     pub sanitize_response: bool,
 
+    /// Override the model name in sanitized responses for all providers in this pool.
+    /// Individual providers can override this setting.
+    /// If not set, uses the model name from the client request.
+    #[serde(default)]
+    pub sanitize_model_name: Option<String>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -188,6 +200,11 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
+
+    /// Override the model name in sanitized responses.
+    /// If not set, uses the model name from the client request.
+    #[serde(default)]
+    pub sanitize_model_name: Option<String>,
 }
 
 fn default_weight() -> u32 {
@@ -216,6 +233,7 @@ pub struct PoolConfig {
     pub fallback: Option<FallbackConfig>,
     pub strategy: LoadBalanceStrategy,
     pub sanitize_response: bool,
+    pub sanitize_model_name: Option<String>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -231,6 +249,7 @@ impl TargetSpecOrList {
                 fallback: pool.fallback,
                 strategy: pool.strategy,
                 sanitize_response: pool.sanitize_response,
+                sanitize_model_name: pool.sanitize_model_name,
                 providers: pool.providers,
             },
             TargetSpecOrList::List(list) => {
@@ -250,6 +269,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        sanitize_model_name: t.sanitize_model_name,
                     })
                     .collect();
                 PoolConfig {
@@ -260,6 +280,7 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response: false,
+                    sanitize_model_name: None,
                     providers,
                 }
             }
@@ -267,6 +288,7 @@ impl TargetSpecOrList {
                 // Single provider: use its keys as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
                 let sanitize_response = spec.sanitize_response;
+                let sanitize_model_name = spec.sanitize_model_name.clone();
                 let provider = ProviderSpec {
                     url: spec.url,
                     onwards_key: spec.onwards_key,
@@ -278,6 +300,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    sanitize_model_name: None, // Will be inherited from pool-level setting
                 };
                 PoolConfig {
                     keys,
@@ -287,6 +310,7 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response,
+                    sanitize_model_name,
                     providers: vec![provider],
                 }
             }
@@ -329,6 +353,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            sanitize_model_name: value.sanitize_model_name,
         }
     }
 }
@@ -354,6 +379,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            sanitize_model_name: value.sanitize_model_name,
         }
     }
 }
@@ -432,6 +458,8 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    /// Override the model name in sanitized responses
+    pub sanitize_model_name: Option<String>,
 }
 
 impl Target {
@@ -684,6 +712,7 @@ impl Targets {
             // Convert provider specs to providers
             // Pool-level sanitize_response enables sanitization for all providers
             let pool_sanitize = pool_config.sanitize_response;
+            let pool_sanitize_model = pool_config.sanitize_model_name.clone();
             let providers: Vec<Provider> = pool_config
                 .providers
                 .into_iter()
@@ -691,6 +720,10 @@ impl Targets {
                     let weight = spec.weight;
                     // Enable sanitization if either pool or provider level is true
                     spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+                    // Inherit pool-level sanitize_model_name if provider doesn't have one
+                    if spec.sanitize_model_name.is_none() {
+                        spec.sanitize_model_name = pool_sanitize_model.clone();
+                    }
                     let target: Target = spec.into();
                     Provider { target, weight }
                 })
