@@ -23,6 +23,7 @@ hyper-util = { version = "0.1.0", features = [
   "client",
   "client-legacy",
   "http1",
+  "http2",
   "tokio",
 ] }
 http-body-util = "0.1.3"
