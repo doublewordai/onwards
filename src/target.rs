@@ -329,6 +329,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: None,
         }
     }
 }
@@ -354,6 +355,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: None,
         }
     }
 }
@@ -432,6 +434,7 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl Target {

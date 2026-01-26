@@ -35,5 +35,10 @@ impl HttpClient for HyperClient {
 
 pub fn create_hyper_client() -> HyperClient {
     let https = hyper_tls::HttpsConnector::new();
-    Client::builder(TokioExecutor::new()).build(https)
+
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(100)
+        .pool_timer(hyper_util::rt::TokioTimer::new())
+        .build(https)
 }

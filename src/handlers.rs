@@ -434,193 +434,407 @@ pub async fn target_message_handler<T: HttpClient>(
             attempt_req.headers()
         );
 
-        // Make the request
-        match state.http_client.request(attempt_req).await {
-            Ok(mut response) => {
-                let status = response.status().as_u16();
+        // Make the request with timeout (if configured)
+        let request_future = state.http_client.request(attempt_req);
 
-                // Check if we should fallback based on status code
-                if pool.should_fallback_on_status(status) {
-                    debug!(
-                        "Provider returned fallback status {}, trying next: {:?}",
-                        status, target.url
-                    );
-                    last_error = Some(OnwardsErrorResponse::bad_gateway());
-                    continue;
-                }
-
-                // Success - apply response transformation if configured
-                // Per-target opt-in via sanitize_response flag, only for 2xx responses
-                if let Some(ref transform_fn) = state.response_transform_fn
-                    && target.sanitize_response
-                    && (200..300).contains(&status)
-                {
-                    debug!(
-                        "Attempting response sanitization for status {}, path {}",
-                        status, path_and_query
-                    );
-
-                    // Extract original model from request extensions
-                    let original_model = req
-                        .extensions()
-                        .get::<OriginalModel>()
-                        .map(|m| m.0.to_string());
-
-                    // Check if response is suitable for sanitization
-                    // Clone content_type to avoid borrow issues
-                    let content_type = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let is_streaming = content_type.contains("text/event-stream");
-
-                    if is_streaming {
-                        // Streaming SSE response - transform chunk-by-chunk
-                        debug!("Applying streaming sanitization");
-
-                        let sanitizer = crate::response_sanitizer::ResponseSanitizer {
-                            original_model: original_model.clone(),
-                        };
-
-                        use futures_util::StreamExt;
-
-                        let body_stream = http_body_util::BodyExt::into_data_stream(
-                            std::mem::take(response.body_mut()),
+        match target.request_timeout_secs {
+            Some(timeout_secs) => {
+                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+                match tokio::time::timeout(timeout_duration, request_future).await {
+                    Err(_) => {
+                        // Timeout occurred
+                        debug!(
+                            "Request to {} timed out after {:?}",
+                            upstream_uri, timeout_duration
                         );
-                        let transformed_stream = body_stream.map(move |chunk_result| {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    // Sanitize this chunk
-                                    match sanitizer.sanitize_streaming(&chunk) {
-                                        Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
-                                        Ok(None) => Ok(chunk),
+                        last_error = Some(OnwardsErrorResponse::gateway_timeout());
+                        continue;
+                    }
+                    Ok(Err(e)) => {
+                        // Request failed
+                        error!(
+                            "Error forwarding request to target url {}: {}",
+                            upstream_uri, e
+                        );
+                        last_error = Some(OnwardsErrorResponse::bad_gateway());
+                        continue;
+                    }
+                    Ok(Ok(mut response)) => {
+                        let status = response.status().as_u16();
+
+                        // Check if we should fallback based on status code
+                        if pool.should_fallback_on_status(status) {
+                            debug!(
+                                "Provider returned fallback status {}, trying next: {:?}",
+                                status, target.url
+                            );
+                            last_error = Some(OnwardsErrorResponse::bad_gateway());
+                            continue;
+                        }
+
+                        // Success - apply response transformation if configured
+                        // Per-target opt-in via sanitize_response flag, only for 2xx responses
+                        if let Some(ref transform_fn) = state.response_transform_fn
+                            && target.sanitize_response
+                            && (200..300).contains(&status)
+                        {
+                            debug!(
+                                "Attempting response sanitization for status {}, path {}",
+                                status, path_and_query
+                            );
+
+                            // Extract original model from request extensions
+                            let original_model = req
+                                .extensions()
+                                .get::<OriginalModel>()
+                                .map(|m| m.0.to_string());
+
+                            // Check if response is suitable for sanitization
+                            // Clone content_type to avoid borrow issues
+                            let content_type = response
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let is_streaming = content_type.contains("text/event-stream");
+
+                            if is_streaming {
+                                // Streaming SSE response - transform chunk-by-chunk
+                                debug!("Applying streaming sanitization");
+
+                                let sanitizer = crate::response_sanitizer::ResponseSanitizer {
+                                    original_model: original_model.clone(),
+                                };
+
+                                use futures_util::StreamExt;
+
+                                let body_stream = http_body_util::BodyExt::into_data_stream(
+                                    std::mem::take(response.body_mut()),
+                                );
+                                let transformed_stream = body_stream.map(move |chunk_result| {
+                                    match chunk_result {
+                                        Ok(chunk) => {
+                                            // Sanitize this chunk
+                                            match sanitizer.sanitize_streaming(&chunk) {
+                                                Ok(Some(sanitized)) => {
+                                                    Ok::<_, std::io::Error>(sanitized)
+                                                }
+                                                Ok(None) => Ok(chunk),
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to sanitize streaming chunk: {}",
+                                                        e
+                                                    );
+                                                    Ok(chunk) // Pass through on error
+                                                }
+                                            }
+                                        }
                                         Err(e) => {
-                                            tracing::error!(
-                                                "Failed to sanitize streaming chunk: {}",
-                                                e
-                                            );
-                                            Ok(chunk) // Pass through on error
+                                            tracing::error!("Stream error: {}", e);
+                                            Err(std::io::Error::other(e))
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Stream error: {}", e);
-                                    Err(std::io::Error::other(e))
-                                }
-                            }
-                        });
+                                });
 
-                        *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
-                    } else {
-                        // Non-streaming response - buffer and transform
-                        debug!("Applying non-streaming sanitization");
+                                *response.body_mut() =
+                                    axum::body::Body::from_stream(transformed_stream);
+                            } else {
+                                // Non-streaming response - buffer and transform
+                                debug!("Applying non-streaming sanitization");
 
-                        let response_body =
-                            axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+                                let response_body = axum::body::to_bytes(
+                                    std::mem::take(response.body_mut()),
+                                    usize::MAX,
+                                )
                                 .await
                                 .map_err(|e| {
                                     error!("Failed to buffer response body: {}", e);
                                     OnwardsErrorResponse::internal()
                                 })?;
 
-                        debug!(
-                            "Response body buffered: {} bytes, content-type: {}",
-                            response_body.len(),
-                            content_type
-                        );
-                        trace!(
-                            "Response body content: {}",
-                            String::from_utf8_lossy(&response_body)
-                        );
-
-                        // Apply transformation
-                        match transform_fn(
-                            &path_and_query,
-                            response.headers(),
-                            &response_body,
-                            original_model.as_deref(),
-                        ) {
-                            Ok(Some(transformed_body)) => {
-                                // Update response with sanitized body
-                                let content_length = transformed_body.len();
                                 debug!(
-                                    "Sanitization successful: {} bytes -> {} bytes",
+                                    "Response body buffered: {} bytes, content-type: {}",
                                     response_body.len(),
-                                    content_length
+                                    content_type
                                 );
                                 trace!(
-                                    "Sanitized body: {}",
-                                    String::from_utf8_lossy(&transformed_body)
+                                    "Response body content: {}",
+                                    String::from_utf8_lossy(&response_body)
                                 );
-                                *response.body_mut() = axum::body::Body::from(transformed_body);
 
-                                // Remove transfer-encoding since we're setting content-length
-                                response.headers_mut().remove(TRANSFER_ENCODING);
-                                response
-                                    .headers_mut()
-                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
-                            }
-                            Ok(None) => {
-                                // No transformation applied, restore original body
-                                debug!(
-                                    "Sanitization returned None, restoring original {} bytes",
-                                    response_body.len()
-                                );
-                                let content_length = response_body.len();
-                                *response.body_mut() = axum::body::Body::from(response_body);
+                                // Apply transformation
+                                match transform_fn(
+                                    &path_and_query,
+                                    response.headers(),
+                                    &response_body,
+                                    original_model.as_deref(),
+                                ) {
+                                    Ok(Some(transformed_body)) => {
+                                        // Update response with sanitized body
+                                        let content_length = transformed_body.len();
+                                        debug!(
+                                            "Sanitization successful: {} bytes -> {} bytes",
+                                            response_body.len(),
+                                            content_length
+                                        );
+                                        trace!(
+                                            "Sanitized body: {}",
+                                            String::from_utf8_lossy(&transformed_body)
+                                        );
+                                        *response.body_mut() =
+                                            axum::body::Body::from(transformed_body);
 
-                                // Ensure proper headers even when not transforming
-                                response.headers_mut().remove(TRANSFER_ENCODING);
-                                response
-                                    .headers_mut()
-                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
-                            }
-                            Err(e) => {
-                                error!("Response sanitization failed: {}", e);
-                                return Err(OnwardsErrorResponse::internal());
+                                        // Remove transfer-encoding since we're setting content-length
+                                        response.headers_mut().remove(TRANSFER_ENCODING);
+                                        response.headers_mut().insert(
+                                            CONTENT_LENGTH,
+                                            HeaderValue::from(content_length),
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No transformation applied, restore original body
+                                        debug!(
+                                            "Sanitization returned None, restoring original {} bytes",
+                                            response_body.len()
+                                        );
+                                        let content_length = response_body.len();
+                                        *response.body_mut() =
+                                            axum::body::Body::from(response_body);
+
+                                        // Ensure proper headers even when not transforming
+                                        response.headers_mut().remove(TRANSFER_ENCODING);
+                                        response.headers_mut().insert(
+                                            CONTENT_LENGTH,
+                                            HeaderValue::from(content_length),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Response sanitization failed: {}", e);
+                                        return Err(OnwardsErrorResponse::internal());
+                                    }
+                                }
                             }
                         }
-                    }
-                }
 
-                // Add custom response headers
-                if let Some(headers) = response_headers {
-                    for (key, value) in headers.iter() {
-                        if let (Ok(header_name), Ok(header_value)) =
-                            (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
-                        {
-                            response.headers_mut().insert(header_name, header_value);
+                        // Add custom response headers
+                        if let Some(headers) = response_headers {
+                            for (key, value) in headers.iter() {
+                                if let (Ok(header_name), Ok(header_value)) =
+                                    (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                                {
+                                    response.headers_mut().insert(header_name, header_value);
+                                }
+                            }
+                            trace!(
+                                model = %model_name,
+                                headers = ?headers,
+                                "Added custom response headers"
+                            );
                         }
+                        debug!(
+                            "Returning response with status {}, content-length: {:?}",
+                            response.status(),
+                            response.headers().get(CONTENT_LENGTH)
+                        );
+                        return Ok(response);
                     }
-                    trace!(
-                        model = %model_name,
-                        headers = ?headers,
-                        "Added custom response headers"
-                    );
                 }
-                debug!(
-                    "Returning response with status {}, content-length: {:?}",
-                    response.status(),
-                    response.headers().get(CONTENT_LENGTH)
-                );
-                return Ok(response);
             }
-            Err(e) => {
-                error!(
-                    "Error forwarding request to target url {}: {}",
-                    upstream_uri, e
-                );
-                last_error = Some(OnwardsErrorResponse::bad_gateway());
+            None => {
+                // No timeout configured - unlimited (current behavior)
+                match request_future.await {
+                    Err(e) => {
+                        error!(
+                            "Error forwarding request to target url {}: {}",
+                            upstream_uri, e
+                        );
+                        last_error = Some(OnwardsErrorResponse::bad_gateway());
+                        continue;
+                    }
+                    Ok(mut response) => {
+                        // Success - continue with response handling
+                        let status = response.status().as_u16();
 
-                // If fallback enabled, try next provider on connection errors
-                if pool.fallback_enabled() {
-                    debug!("Connection error, trying next provider");
-                    continue;
-                } else {
-                    return Err(OnwardsErrorResponse::bad_gateway());
+                        // Check if we should fallback based on status code
+                        if pool.should_fallback_on_status(status) {
+                            debug!(
+                                "Provider returned fallback status {}, trying next: {:?}",
+                                status, target.url
+                            );
+                            last_error = Some(OnwardsErrorResponse::bad_gateway());
+                            continue;
+                        }
+
+                        // Success - apply response transformation if configured
+                        // Per-target opt-in via sanitize_response flag, only for 2xx responses
+                        if let Some(ref transform_fn) = state.response_transform_fn
+                            && target.sanitize_response
+                            && (200..300).contains(&status)
+                        {
+                            debug!(
+                                "Attempting response sanitization for status {}, path {}",
+                                status, path_and_query
+                            );
+
+                            // Extract original model from request extensions
+                            let original_model = req
+                                .extensions()
+                                .get::<OriginalModel>()
+                                .map(|m| m.0.to_string());
+
+                            // Check if response is suitable for sanitization
+                            // Clone content_type to avoid borrow issues
+                            let content_type = response
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let is_streaming = content_type.contains("text/event-stream");
+
+                            if is_streaming {
+                                // Streaming SSE response - transform chunk-by-chunk
+                                debug!("Applying streaming sanitization");
+
+                                let sanitizer = crate::response_sanitizer::ResponseSanitizer {
+                                    original_model: original_model.clone(),
+                                };
+
+                                use futures_util::StreamExt;
+
+                                let body_stream = http_body_util::BodyExt::into_data_stream(
+                                    std::mem::take(response.body_mut()),
+                                );
+                                let transformed_stream = body_stream.map(move |chunk_result| {
+                                    match chunk_result {
+                                        Ok(chunk) => {
+                                            // Sanitize this chunk
+                                            match sanitizer.sanitize_streaming(&chunk) {
+                                                Ok(Some(sanitized)) => {
+                                                    Ok::<_, std::io::Error>(sanitized)
+                                                }
+                                                Ok(None) => Ok(chunk),
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to sanitize streaming chunk: {}",
+                                                        e
+                                                    );
+                                                    Ok(chunk) // Pass through on error
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Stream error: {}", e);
+                                            Err(std::io::Error::other(e))
+                                        }
+                                    }
+                                });
+
+                                *response.body_mut() =
+                                    axum::body::Body::from_stream(transformed_stream);
+                            } else {
+                                // Non-streaming response - buffer and transform
+                                debug!("Applying non-streaming sanitization");
+
+                                let response_body = axum::body::to_bytes(
+                                    std::mem::take(response.body_mut()),
+                                    usize::MAX,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    error!("Failed to buffer response body: {}", e);
+                                    OnwardsErrorResponse::internal()
+                                })?;
+
+                                debug!(
+                                    "Response body buffered: {} bytes, content-type: {}",
+                                    response_body.len(),
+                                    content_type
+                                );
+                                trace!(
+                                    "Response body content: {}",
+                                    String::from_utf8_lossy(&response_body)
+                                );
+
+                                // Apply transformation
+                                match transform_fn(
+                                    &path_and_query,
+                                    response.headers(),
+                                    &response_body,
+                                    original_model.as_deref(),
+                                ) {
+                                    Ok(Some(transformed_body)) => {
+                                        // Update response with sanitized body
+                                        let content_length = transformed_body.len();
+                                        debug!(
+                                            "Sanitization successful: {} bytes -> {} bytes",
+                                            response_body.len(),
+                                            content_length
+                                        );
+                                        trace!(
+                                            "Sanitized body: {}",
+                                            String::from_utf8_lossy(&transformed_body)
+                                        );
+                                        *response.body_mut() =
+                                            axum::body::Body::from(transformed_body);
+
+                                        // Remove transfer-encoding since we're setting content-length
+                                        response.headers_mut().remove(TRANSFER_ENCODING);
+                                        response.headers_mut().insert(
+                                            CONTENT_LENGTH,
+                                            HeaderValue::from(content_length),
+                                        );
+                                    }
+                                    Ok(None) => {
+                                        // No transformation applied, restore original body
+                                        debug!(
+                                            "Sanitization returned None, restoring original {} bytes",
+                                            response_body.len()
+                                        );
+                                        let content_length = response_body.len();
+                                        *response.body_mut() =
+                                            axum::body::Body::from(response_body);
+
+                                        // Ensure proper headers even when not transforming
+                                        response.headers_mut().remove(TRANSFER_ENCODING);
+                                        response.headers_mut().insert(
+                                            CONTENT_LENGTH,
+                                            HeaderValue::from(content_length),
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Response sanitization failed: {}", e);
+                                        return Err(OnwardsErrorResponse::internal());
+                                    }
+                                }
+                            }
+                        }
+
+                        // Add custom response headers
+                        if let Some(headers) = response_headers {
+                            for (key, value) in headers.iter() {
+                                if let (Ok(header_name), Ok(header_value)) =
+                                    (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                                {
+                                    response.headers_mut().insert(header_name, header_value);
+                                }
+                            }
+                            trace!(
+                                model = %model_name,
+                                headers = ?headers,
+                                "Added custom response headers"
+                            );
+                        }
+                        debug!(
+                            "Returning response with status {}, content-length: {:?}",
+                            response.status(),
+                            response.headers().get(CONTENT_LENGTH)
+                        );
+                        return Ok(response);
+                    }
                 }
             }
         }
