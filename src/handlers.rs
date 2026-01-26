@@ -8,6 +8,7 @@ use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
 use crate::models::ListModelResponse;
+use crate::sse::SseBufferedStream;
 use crate::target::Target;
 use axum::{
     Json,
@@ -487,10 +488,14 @@ pub async fn target_message_handler<T: HttpClient>(
 
                         use futures_util::StreamExt;
 
+                        // First wrap with SSE buffer to ensure complete events
                         let body_stream = http_body_util::BodyExt::into_data_stream(
                             std::mem::take(response.body_mut()),
                         );
-                        let transformed_stream = body_stream.map(move |chunk_result| {
+                        let buffered_stream = SseBufferedStream::new(body_stream);
+
+                        // Then apply sanitization to complete events
+                        let transformed_stream = buffered_stream.map(move |chunk_result| {
                             match chunk_result {
                                 Ok(chunk) => {
                                     // Sanitize this chunk
@@ -601,6 +606,22 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Added custom response headers"
                     );
                 }
+                // Wrap SSE streams with buffering to handle incomplete chunks from providers
+                let is_sse = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.starts_with("text/event-stream"));
+
+                if is_sse {
+                    debug!("Wrapping SSE response with buffered stream");
+                    let (parts, body) = response.into_parts();
+                    let byte_stream = body.into_data_stream();
+                    let buffered = SseBufferedStream::new(byte_stream);
+                    let new_body = axum::body::Body::from_stream(buffered);
+                    return Ok(Response::from_parts(parts, new_body));
+                }
+
                 debug!(
                     "Returning response with status {}, content-length: {:?}",
                     response.status(),

@@ -1379,6 +1379,7 @@ dependencies = [
  "axum-prometheus",
  "axum-test",
  "bon",
+ "bytes",
  "clap",
  "dashmap",
  "futures-util",
