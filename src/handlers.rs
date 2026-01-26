@@ -450,7 +450,28 @@ pub async fn target_message_handler<T: HttpClient>(
                     continue;
                 }
 
-                // Success - apply response transformation if configured
+                // Check content type for SSE handling
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let is_sse = content_type.contains("text/event-stream");
+
+                // Wrap SSE streams with buffering to handle incomplete chunks from providers.
+                // This must happen before any stream processing (e.g., sanitization) to ensure
+                // downstream consumers receive complete SSE events with valid JSON.
+                if is_sse {
+                    debug!("Wrapping SSE response with buffered stream");
+                    let (parts, body) = response.into_parts();
+                    let byte_stream = body.into_data_stream();
+                    let buffered = SseBufferedStream::new(byte_stream);
+                    let new_body = axum::body::Body::from_stream(buffered);
+                    response = Response::from_parts(parts, new_body);
+                }
+
+                // Apply response transformation if configured
                 // Per-target opt-in via sanitize_response flag, only for 2xx responses
                 if let Some(ref transform_fn) = state.response_transform_fn
                     && target.sanitize_response
@@ -467,19 +488,9 @@ pub async fn target_message_handler<T: HttpClient>(
                         .get::<OriginalModel>()
                         .map(|m| m.0.to_string());
 
-                    // Check if response is suitable for sanitization
-                    // Clone content_type to avoid borrow issues
-                    let content_type = response
-                        .headers()
-                        .get("content-type")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let is_streaming = content_type.contains("text/event-stream");
-
-                    if is_streaming {
+                    if is_sse {
                         // Streaming SSE response - transform chunk-by-chunk
+                        // Note: stream is already buffered above
                         debug!("Applying streaming sanitization");
 
                         let sanitizer = crate::response_sanitizer::ResponseSanitizer {
@@ -488,14 +499,11 @@ pub async fn target_message_handler<T: HttpClient>(
 
                         use futures_util::StreamExt;
 
-                        // First wrap with SSE buffer to ensure complete events
                         let body_stream = http_body_util::BodyExt::into_data_stream(
                             std::mem::take(response.body_mut()),
                         );
-                        let buffered_stream = SseBufferedStream::new(body_stream);
 
-                        // Then apply sanitization to complete events
-                        let transformed_stream = buffered_stream.map(move |chunk_result| {
+                        let transformed_stream = body_stream.map(move |chunk_result| {
                             match chunk_result {
                                 Ok(chunk) => {
                                     // Sanitize this chunk
@@ -605,21 +613,6 @@ pub async fn target_message_handler<T: HttpClient>(
                         headers = ?headers,
                         "Added custom response headers"
                     );
-                }
-                // Wrap SSE streams with buffering to handle incomplete chunks from providers
-                let is_sse = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .is_some_and(|ct| ct.starts_with("text/event-stream"));
-
-                if is_sse {
-                    debug!("Wrapping SSE response with buffered stream");
-                    let (parts, body) = response.into_parts();
-                    let byte_stream = body.into_data_stream();
-                    let buffered = SseBufferedStream::new(byte_stream);
-                    let new_body = axum::body::Body::from_stream(buffered);
-                    return Ok(Response::from_parts(parts, new_body));
                 }
 
                 debug!(
