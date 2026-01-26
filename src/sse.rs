@@ -10,11 +10,22 @@ use futures_util::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// Maximum buffer size per SSE stream (64KB).
+///
+/// This prevents memory exhaustion from malicious or buggy providers that
+/// send endless data without event delimiters. Typical SSE events are under
+/// 1KB, so 64KB provides ample headroom while capping worst-case memory at
+/// ~64MB for 1000 concurrent streams.
+const MAX_SSE_BUFFER_SIZE: usize = 64 * 1024;
+
 /// A stream wrapper that buffers SSE events until they are complete.
 ///
 /// SSE events are delimited by `\n\n`. This wrapper accumulates incoming
 /// bytes and only yields complete events, preventing consumers from
 /// receiving partial JSON data.
+///
+/// The buffer is capped at [`MAX_SSE_BUFFER_SIZE`] bytes to prevent memory
+/// exhaustion from malicious or buggy upstream providers.
 pub struct SseBufferedStream<S> {
     inner: S,
     buffer: BytesMut,
@@ -51,6 +62,18 @@ where
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     this.buffer.extend_from_slice(&chunk);
+
+                    // Check buffer size limit to prevent memory exhaustion
+                    // If exceeded, log error and terminate stream by returning None
+                    if this.buffer.len() > MAX_SSE_BUFFER_SIZE {
+                        tracing::error!(
+                            "SSE buffer exceeded maximum size of {} bytes, terminating stream",
+                            MAX_SSE_BUFFER_SIZE
+                        );
+                        this.buffer.clear();
+                        return Poll::Ready(None);
+                    }
+
                     // Loop back to check for complete events
                 }
                 Poll::Ready(Some(Err(e))) => {
@@ -227,5 +250,39 @@ mod tests {
             results[0].as_ref().unwrap().as_ref(),
             b"data: line1\ndata: line2\n\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_overflow_terminates_stream() {
+        // Create a chunk larger than MAX_SSE_BUFFER_SIZE without \n\n
+        let large_chunk = vec![b'x'; MAX_SSE_BUFFER_SIZE + 1];
+        let chunks: Vec<&[u8]> = vec![&large_chunk];
+        let stream = SseBufferedStream::new(futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, Infallible>(Bytes::from(c.to_vec()))),
+        ));
+        let results: Vec<_> = stream.collect().await;
+
+        // Stream terminates immediately when buffer exceeded (returns None)
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_at_limit_still_works() {
+        // Create a chunk exactly at MAX_SSE_BUFFER_SIZE with \n\n at the end
+        let mut chunk = vec![b'x'; MAX_SSE_BUFFER_SIZE - 2];
+        chunk.extend_from_slice(b"\n\n");
+        let chunks: Vec<&[u8]> = vec![&chunk];
+        let stream = SseBufferedStream::new(futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, Infallible>(Bytes::from(c.to_vec()))),
+        ));
+        let results: Vec<_> = stream.collect().await;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(results[0].as_ref().unwrap().len(), MAX_SSE_BUFFER_SIZE);
     }
 }
