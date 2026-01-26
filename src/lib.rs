@@ -47,6 +47,7 @@ pub mod handlers;
 pub mod load_balancer;
 pub mod models;
 pub mod response_sanitizer;
+pub mod sse;
 pub mod target;
 
 use client::{HttpClient, HyperClient};
