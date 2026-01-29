@@ -23,6 +23,11 @@ use axum::{
 use serde_json::map::Entry;
 use tracing::{debug, error, instrument, trace};
 
+/// Record HTTP response status code on the current span
+fn record_response_status(status_code: u16) {
+    tracing::Span::current().record("http.response.status_code", status_code);
+}
+
 /// Stores the original model name requested by the client
 ///
 /// This is used to rewrite the model field in responses when `onwards_model` is configured
@@ -119,7 +124,10 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
-#[instrument(skip(state, req))]
+#[instrument(skip(state, req), fields(
+    gen_ai.request.model = tracing::field::Empty,
+    http.response.status_code = tracing::field::Empty,
+))]
 pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
@@ -155,12 +163,16 @@ pub async fn target_message_handler<T: HttpClient>(
     let model_name = match crate::extract_model_from_request(req.headers(), &body_bytes) {
         Some(model) => model,
         None => {
+            record_response_status(400);
             return Err(OnwardsErrorResponse::bad_request(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             ));
         }
     };
+
+    // Record model in span for trace correlation
+    tracing::Span::current().record("gen_ai.request.model", &model_name);
 
     // Store original model in request extensions for response sanitization
     req.extensions_mut()
@@ -181,6 +193,7 @@ pub async fn target_message_handler<T: HttpClient>(
         Some(pool) => pool,
         None => {
             debug!("No target found for model: {}", model_name);
+            record_response_status(404);
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
@@ -207,11 +220,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     debug!("Bearer token validation successful");
                 } else {
                     debug!("Bearer token validation failed - token not in key set");
+                    record_response_status(403);
                     return Err(OnwardsErrorResponse::forbidden());
                 }
             }
             None => {
                 debug!("No bearer token found in authorization header");
+                record_response_status(401);
                 return Err(OnwardsErrorResponse::unauthorized());
             }
         }
@@ -227,6 +242,7 @@ pub async fn target_message_handler<T: HttpClient>(
         && limiter.check().is_err()
     {
         debug!("Pool-level rate limit exceeded for model: {}", model_name);
+        record_response_status(429);
         return Err(OnwardsErrorResponse::rate_limited());
     }
 
@@ -236,6 +252,7 @@ pub async fn target_message_handler<T: HttpClient>(
         && limiter.check().is_err()
     {
         debug!("Per-key rate limit exceeded for token: {}", token);
+        record_response_status(429);
         return Err(OnwardsErrorResponse::rate_limited());
     }
 
@@ -615,6 +632,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     );
                 }
 
+                record_response_status(response.status().as_u16());
                 debug!(
                     "Returning response with status {}, content-length: {:?}",
                     response.status(),
@@ -641,6 +659,7 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // All providers exhausted
+    record_response_status(502);
     Err(last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())))
 }
 
