@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/doublewordai/onwards/compare/v0.11.1...v0.11.2) - 2026-02-02
+
+### Added
+
+- furnish more useful info on to traces ([#67](https://github.com/doublewordai/onwards/pull/67))
+
+### Other
+
+- enforce conventional commits in pr titles ([#69](https://github.com/doublewordai/onwards/pull/69))
+
 ## [0.11.1](https://github.com/doublewordai/onwards/compare/v0.11.0...v0.11.1) - 2026-01-26
 
 ### Fixed
