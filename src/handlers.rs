@@ -457,7 +457,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // For streaming responses, the body may take much longer than the timeout.
         let request_result = if let Some(timeout_secs) = target.request_timeout_secs {
             let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-            match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req)).await {
+            match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+                .await
+            {
                 Err(_) => {
                     // Timeout occurred
                     debug!(
@@ -559,9 +561,8 @@ pub async fn target_message_handler<T: HttpClient>(
 
                 use futures_util::StreamExt;
 
-                let body_stream = http_body_util::BodyExt::into_data_stream(
-                    std::mem::take(response.body_mut()),
-                );
+                let body_stream =
+                    http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
 
                 let transformed_stream = body_stream.map(move |chunk_result| {
                     match chunk_result {
@@ -571,10 +572,7 @@ pub async fn target_message_handler<T: HttpClient>(
                                 Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
                                 Ok(None) => Ok(chunk),
                                 Err(e) => {
-                                    tracing::error!(
-                                        "Failed to sanitize streaming chunk: {}",
-                                        e
-                                    );
+                                    tracing::error!("Failed to sanitize streaming chunk: {}", e);
                                     Ok(chunk) // Pass through on error
                                 }
                             }
@@ -586,21 +584,18 @@ pub async fn target_message_handler<T: HttpClient>(
                     }
                 });
 
-                *response.body_mut() =
-                    axum::body::Body::from_stream(transformed_stream);
+                *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
             } else {
                 // Non-streaming response - buffer and transform
                 debug!("Applying non-streaming sanitization");
 
-                let response_body = axum::body::to_bytes(
-                    std::mem::take(response.body_mut()),
-                    usize::MAX,
-                )
-                .await
-                .map_err(|e| {
-                    error!("Failed to buffer response body: {}", e);
-                    OnwardsErrorResponse::internal()
-                })?;
+                let response_body =
+                    axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to buffer response body: {}", e);
+                            OnwardsErrorResponse::internal()
+                        })?;
 
                 debug!(
                     "Response body buffered: {} bytes, content-type: {}",
@@ -631,15 +626,13 @@ pub async fn target_message_handler<T: HttpClient>(
                             "Sanitized body: {}",
                             String::from_utf8_lossy(&transformed_body)
                         );
-                        *response.body_mut() =
-                            axum::body::Body::from(transformed_body);
+                        *response.body_mut() = axum::body::Body::from(transformed_body);
 
                         // Remove transfer-encoding since we're setting content-length
                         response.headers_mut().remove(TRANSFER_ENCODING);
-                        response.headers_mut().insert(
-                            CONTENT_LENGTH,
-                            HeaderValue::from(content_length),
-                        );
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
                     }
                     Ok(None) => {
                         // No transformation applied, restore original body
@@ -648,15 +641,13 @@ pub async fn target_message_handler<T: HttpClient>(
                             response_body.len()
                         );
                         let content_length = response_body.len();
-                        *response.body_mut() =
-                            axum::body::Body::from(response_body);
+                        *response.body_mut() = axum::body::Body::from(response_body);
 
                         // Ensure proper headers even when not transforming
                         response.headers_mut().remove(TRANSFER_ENCODING);
-                        response.headers_mut().insert(
-                            CONTENT_LENGTH,
-                            HeaderValue::from(content_length),
-                        );
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
                     }
                     Err(e) => {
                         error!("Response sanitization failed: {}", e);
@@ -692,7 +683,8 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // All providers exhausted
-    let final_error = last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+    let final_error =
+        last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
     record_response_status(final_error.status.as_u16());
     Err(final_error)
 }
@@ -1402,7 +1394,7 @@ mod tests {
         // Test that gateway_timeout returns 504 status
         let error = OnwardsErrorResponse::gateway_timeout();
         let response = error.into_response();
-        
+
         assert_eq!(response.status().as_u16(), 504);
     }
 
@@ -1434,7 +1426,10 @@ mod tests {
 
     impl DelayedMockClient {
         fn new(delay: std::time::Duration, response_status: u16) -> Self {
-            Self { delay, response_status }
+            Self {
+                delay,
+                response_status,
+            }
         }
     }
 
@@ -1493,11 +1488,7 @@ mod tests {
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
-        let result = tokio::time::timeout(
-            timeout_duration,
-            state.http_client.request(req),
-        )
-        .await;
+        let result = tokio::time::timeout(timeout_duration, state.http_client.request(req)).await;
 
         // Should timeout (Err from tokio::time::timeout)
         assert!(result.is_err(), "Expected timeout but request completed");
@@ -1508,7 +1499,7 @@ mod tests {
         // Test that pool configuration correctly enables fallback with multiple providers
         // This validates pool setup, not actual retry behavior
         use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{Target, FallbackConfig, LoadBalanceStrategy};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
 
         // Create two targets
         let target1 = Target::builder()
@@ -1522,8 +1513,14 @@ mod tests {
             .build();
 
         let providers = vec![
-            Provider { target: target1, weight: 1 },
-            Provider { target: target2, weight: 1 },
+            Provider {
+                target: target1,
+                weight: 1,
+            },
+            Provider {
+                target: target2,
+                weight: 1,
+            },
         ];
 
         let fallback_config = Some(FallbackConfig {

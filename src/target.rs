@@ -378,13 +378,17 @@ impl From<ProviderSpec> for Target {
     }
 }
 
+/// Error returned when rate limit is exceeded
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitExceeded;
+
 pub trait RateLimiter: std::fmt::Debug + Send + Sync {
-    fn check(&self) -> Result<(), ()>;
+    fn check(&self) -> Result<(), RateLimitExceeded>;
 }
 
 impl RateLimiter for DefaultDirectRateLimiter {
-    fn check(&self) -> Result<(), ()> {
-        self.check().map_err(|_| ())
+    fn check(&self) -> Result<(), RateLimitExceeded> {
+        self.check().map_err(|_| RateLimitExceeded)
     }
 }
 
@@ -1836,11 +1840,17 @@ mod tests {
         let providers = pool.providers();
 
         // First provider should have 30 second timeout
-        let provider1 = providers.iter().find(|p| p.target.url.host_str() == Some("api.openai.com")).unwrap();
+        let provider1 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.openai.com"))
+            .unwrap();
         assert_eq!(provider1.target.request_timeout_secs, Some(30));
 
         // Second provider should have 60 second timeout
-        let provider2 = providers.iter().find(|p| p.target.url.host_str() == Some("api.azure.com")).unwrap();
+        let provider2 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.azure.com"))
+            .unwrap();
         assert_eq!(provider2.target.request_timeout_secs, Some(60));
     }
 
@@ -1874,8 +1884,16 @@ mod tests {
         let providers = pool.providers();
 
         // One provider with timeout
-        assert!(providers.iter().any(|p| p.target.request_timeout_secs == Some(30)));
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs == Some(30))
+        );
         // One provider without timeout
-        assert!(providers.iter().any(|p| p.target.request_timeout_secs.is_none()));
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs.is_none())
+        );
     }
 }
