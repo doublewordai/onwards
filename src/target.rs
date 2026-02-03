@@ -1756,4 +1756,126 @@ mod tests {
             "into_pool should preserve default sanitize_response setting"
         );
     }
+
+    #[test]
+    fn test_single_target_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in single-target format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key",
+                    "request_timeout_secs": 30
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_single_target_config_without_timeout() {
+        // Test that request_timeout_secs defaults to None when not specified
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_pool_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in pool/providers format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "request_timeout_secs": 60,
+                            "weight": 1
+                        }
+                    ],
+                    "fallback": {
+                        "enabled": true,
+                        "on_status": [502, 503]
+                    }
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Check both providers have their respective timeouts
+        let providers = pool.providers();
+
+        // First provider should have 30 second timeout
+        let provider1 = providers.iter().find(|p| p.target.url.host_str() == Some("api.openai.com")).unwrap();
+        assert_eq!(provider1.target.request_timeout_secs, Some(30));
+
+        // Second provider should have 60 second timeout
+        let provider2 = providers.iter().find(|p| p.target.url.host_str() == Some("api.azure.com")).unwrap();
+        assert_eq!(provider2.target.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_pool_config_mixed_timeouts() {
+        // Test that some providers can have timeouts while others don't
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "weight": 1
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let providers = pool.providers();
+
+        // One provider with timeout
+        assert!(providers.iter().any(|p| p.target.request_timeout_secs == Some(30)));
+        // One provider without timeout
+        assert!(providers.iter().any(|p| p.target.request_timeout_secs.is_none()));
+    }
 }
