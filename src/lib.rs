@@ -45,6 +45,7 @@ pub mod client;
 pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
+pub mod model_switcher;
 pub mod models;
 pub mod response_sanitizer;
 pub mod sse;
