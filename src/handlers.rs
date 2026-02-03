@@ -469,6 +469,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     if pool.fallback_enabled() {
                         continue;
                     } else {
+                        record_response_status(504);
                         return Err(last_error.unwrap());
                     }
                 }
@@ -691,8 +692,9 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // All providers exhausted
-    record_response_status(502);
-    Err(last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())))
+    let final_error = last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+    record_response_status(final_error.status.as_u16());
+    Err(final_error)
 }
 
 #[instrument(skip(state, req))]
@@ -1415,9 +1417,12 @@ mod tests {
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-        // Should contain error information about timeout
-        assert!(body_str.contains("error"));
-        assert!(body_str.contains("timeout") || body_str.contains("took too long"));
+        // Should contain error structure with message and code fields
+        // ErrorResponseBody has: message, type, param, code (no outer "error" wrapper)
+        assert!(body_str.contains("message"));
+        assert!(body_str.contains("code"));
+        assert!(body_str.contains("gateway_timeout"));
+        assert!(body_str.contains("took too long"));
     }
 
     // Mock HttpClient that delays responses to test timeout behavior
@@ -1448,7 +1453,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_timeout_returns_504_when_fallback_disabled() {
+    async fn test_mock_client_timeout_fires() {
+        // Test that tokio::time::timeout correctly fires when the mock client delays
+        // This validates the test infrastructure, not the handler behavior
         use crate::target::Target;
 
         // Create a target with 1 second timeout
@@ -1481,9 +1488,7 @@ mod tests {
             .body(axum::body::Body::from(r#"{"model":"gpt-4","messages":[]}"#))
             .unwrap();
 
-        // Call the handler logic directly (simulated)
-        // Since we can't easily call target_message_handler without the full routing setup,
-        // we test the timeout logic works by verifying the timeout fires
+        // Test the timeout logic directly (not the full handler)
         let target = pool.first_target().unwrap();
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
@@ -1498,25 +1503,27 @@ mod tests {
         assert!(result.is_err(), "Expected timeout but request completed");
     }
 
-    #[tokio::test]
-    async fn test_timeout_tries_next_provider_when_fallback_enabled() {
+    #[test]
+    fn test_pool_with_fallback_enabled() {
+        // Test that pool configuration correctly enables fallback with multiple providers
+        // This validates pool setup, not actual retry behavior
         use crate::load_balancer::{Provider, ProviderPool};
         use crate::target::{Target, FallbackConfig, LoadBalanceStrategy};
 
-        // Create two targets: first times out, second responds quickly
-        let slow_target = Target::builder()
-            .url("https://slow.example.com/".parse().unwrap())
+        // Create two targets
+        let target1 = Target::builder()
+            .url("https://provider1.example.com/".parse().unwrap())
             .request_timeout_secs(1)
             .build();
 
-        let fast_target = Target::builder()
-            .url("https://fast.example.com/".parse().unwrap())
+        let target2 = Target::builder()
+            .url("https://provider2.example.com/".parse().unwrap())
             .request_timeout_secs(1)
             .build();
 
         let providers = vec![
-            Provider { target: slow_target, weight: 1 },
-            Provider { target: fast_target, weight: 1 },
+            Provider { target: target1, weight: 1 },
+            Provider { target: target2, weight: 1 },
         ];
 
         let fallback_config = Some(FallbackConfig {
@@ -1531,7 +1538,7 @@ mod tests {
             None,
             None,
             fallback_config,
-            LoadBalanceStrategy::Priority, // Use priority to ensure order
+            LoadBalanceStrategy::Priority,
         );
 
         assert!(pool.fallback_enabled(), "Fallback should be enabled");
