@@ -1197,11 +1197,11 @@ mod tests {
     }
 
     impl RateLimiter for MockRateLimiter {
-        fn check(&self) -> Result<(), ()> {
+        fn check(&self) -> Result<(), RateLimitExceeded> {
             if *self.should_allow.lock().unwrap() {
                 Ok(())
             } else {
-                Err(())
+                Err(RateLimitExceeded)
             }
         }
     }
