@@ -1,6 +1,6 @@
 [package]
 name = "onwards"
-version = "0.11.0"
+version = "0.11.2"
 edition = "2024"
 rust-version = "1.88.0"
 description = "A flexible LLM proxy library"
@@ -14,6 +14,7 @@ categories = ["web-programming", "api-bindings"]
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-trait = "0.1.88"
+bytes = "1.10"
 axum = "0.8.4"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 dashmap = "6.1.0"

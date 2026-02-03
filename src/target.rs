@@ -68,6 +68,14 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -188,6 +196,14 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 fn default_weight() -> u32 {
@@ -250,6 +266,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        request_timeout_secs: t.request_timeout_secs,
                     })
                     .collect();
                 PoolConfig {
@@ -278,6 +295,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    request_timeout_secs: spec.request_timeout_secs,
                 };
                 PoolConfig {
                     keys,
@@ -329,7 +347,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            request_timeout_secs: None,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }
@@ -355,7 +373,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            request_timeout_secs: None,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }

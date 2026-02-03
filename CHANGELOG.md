@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2](https://github.com/doublewordai/onwards/compare/v0.11.1...v0.11.2) - 2026-02-02
+
+### Added
+
+- furnish more useful info on to traces ([#67](https://github.com/doublewordai/onwards/pull/67))
+
+### Other
+
+- enforce conventional commits in pr titles ([#69](https://github.com/doublewordai/onwards/pull/69))
+
+## [0.11.1](https://github.com/doublewordai/onwards/compare/v0.11.0...v0.11.1) - 2026-01-26
+
+### Fixed
+
+- *(deps)* update rust crate axum-prometheus to 0.10.0 ([#54](https://github.com/doublewordai/onwards/pull/54))
+
+### Other
+
+- Buffer SSE chunks to handle incomplete JSON from providers ([#64](https://github.com/doublewordai/onwards/pull/64))
+- *(deps)* update rust crate axum-test to v18 ([#57](https://github.com/doublewordai/onwards/pull/57))
+- *(deps)* update ubuntu docker tag to v24 ([#58](https://github.com/doublewordai/onwards/pull/58))
+- *(deps)* update docker/build-push-action action to v6 ([#56](https://github.com/doublewordai/onwards/pull/56))
+- *(deps)* update actions/checkout action to v6 ([#55](https://github.com/doublewordai/onwards/pull/55))
+- *(deps)* update rust docker tag to v1.92.0 ([#53](https://github.com/doublewordai/onwards/pull/53))
+
 ## [0.11.0](https://github.com/doublewordai/onwards/compare/v0.10.1...v0.11.0) - 2026-01-16
 
 ### Added
