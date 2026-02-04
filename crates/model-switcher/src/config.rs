@@ -197,13 +197,13 @@ fn default_drain_before_switch() -> bool {
 impl PolicyConfig {
     /// Build a SwitchPolicy from this config
     pub fn build_policy(&self) -> Box<dyn SwitchPolicy> {
-        match self.policy_type.as_str() {
-            "fifo" | _ => Box::new(FifoPolicy::new(
-                self.sleep_level,
-                Duration::from_secs(self.request_timeout_secs),
-                self.drain_before_switch,
-            )),
-        }
+        // Currently only FIFO policy is implemented
+        // Future: add other policy types like "batching"
+        Box::new(FifoPolicy::new(
+            self.sleep_level,
+            Duration::from_secs(self.request_timeout_secs),
+            self.drain_before_switch,
+        ))
     }
 }
 

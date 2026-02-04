@@ -169,11 +169,11 @@ impl ModelSwitcher {
         // Fast path: model is already active
         {
             let state = self.inner.state.read().await;
-            if let SwitcherState::Active { model: active } = &*state {
-                if active == model {
-                    trace!(model = %model, "Model already active");
-                    return Ok(());
-                }
+            if let SwitcherState::Active { model: active } = &*state
+                && active == model
+            {
+                trace!(model = %model, "Model already active");
+                return Ok(());
             }
         }
 
@@ -251,10 +251,10 @@ impl ModelSwitcher {
         // Already switching?
         {
             let state = self.inner.state.read().await;
-            if let SwitcherState::Switching { to, .. } = &*state {
-                if to == target_model {
-                    return;
-                }
+            if let SwitcherState::Switching { to, .. } = &*state
+                && to == target_model
+            {
+                return;
             }
         }
 
@@ -317,20 +317,20 @@ impl ModelSwitcher {
         info!(from = ?from_model, to = %target_model, "Starting model switch");
 
         // Prepare switch (drain in-flight if needed)
-        if let Some(ref from) = from_model {
-            if let Some(from_state) = self.inner.model_states.get(from) {
-                let in_flight_drained = Arc::new(Notify::new());
-                let from_state_clone = Arc::clone(from_state);
+        if let Some(ref from) = from_model
+            && let Some(from_state) = self.inner.model_states.get(from)
+        {
+            let in_flight_drained = Arc::new(Notify::new());
+            let from_state_clone = Arc::clone(from_state);
 
-                let mut switch_ctx = SwitchContext::new(
-                    from_model.clone(),
-                    target_model.to_string(),
-                    Arc::clone(&in_flight_drained),
-                    Box::new(move || from_state_clone.in_flight.load(Ordering::SeqCst)),
-                );
+            let mut switch_ctx = SwitchContext::new(
+                from_model.clone(),
+                target_model.to_string(),
+                Arc::clone(&in_flight_drained),
+                Box::new(move || from_state_clone.in_flight.load(Ordering::SeqCst)),
+            );
 
-                self.inner.policy.prepare_switch(&mut switch_ctx).await;
-            }
+            self.inner.policy.prepare_switch(&mut switch_ctx).await;
         }
 
         // Sleep old model

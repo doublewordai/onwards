@@ -118,17 +118,17 @@ where
 /// Extract model name from request headers or JSON body
 fn extract_model(headers: &axum::http::HeaderMap, body: &Bytes) -> Option<String> {
     // Check model-override header first
-    if let Some(model) = headers.get("model-override") {
-        if let Ok(model_str) = model.to_str() {
-            return Some(model_str.to_string());
-        }
+    if let Some(model) = headers.get("model-override")
+        && let Ok(model_str) = model.to_str()
+    {
+        return Some(model_str.to_string());
     }
 
     // Parse JSON body for "model" field
-    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
-        if let Some(model) = json.get("model").and_then(|v| v.as_str()) {
-            return Some(model.to_string());
-        }
+    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body)
+        && let Some(model) = json.get("model").and_then(|v| v.as_str())
+    {
+        return Some(model.to_string());
     }
 
     None

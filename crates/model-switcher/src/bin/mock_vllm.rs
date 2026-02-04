@@ -141,11 +141,18 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await?;
 
+    // Get the actual port (important when port=0 for dynamic allocation)
+    let actual_port = listener.local_addr()?.port();
+
     info!(
         model = %model,
-        port = port,
+        port = actual_port,
         "Mock vLLM server listening"
     );
+
+    // Signal readiness to stdout for test harness
+    // Format: "READY <port>" on its own line
+    println!("READY {}", actual_port);
 
     axum::serve(listener, app).await?;
     Ok(())
