@@ -25,6 +25,15 @@ pub struct Config {
     /// Metrics port (0 to disable)
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+
+    /// Command to use for spawning vLLM processes (default: "vllm")
+    /// Can be overridden for testing with mock-vllm
+    #[serde(default = "default_vllm_command")]
+    pub vllm_command: String,
+}
+
+fn default_vllm_command() -> String {
+    "vllm".to_string()
 }
 
 fn default_port() -> u16 {

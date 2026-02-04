@@ -56,11 +56,20 @@ pub struct Orchestrator {
     health_timeout: Duration,
     /// Startup timeout
     startup_timeout: Duration,
+    /// Command to use for spawning processes (e.g., "vllm" or path to mock)
+    vllm_command: String,
 }
 
 impl Orchestrator {
     /// Create a new orchestrator with the given model configurations
     pub fn new(configs: HashMap<String, ModelConfig>) -> Self {
+        Self::with_command(configs, "vllm".to_string())
+    }
+
+    /// Create a new orchestrator with a custom command for spawning processes
+    ///
+    /// This is useful for testing with mock-vllm
+    pub fn with_command(configs: HashMap<String, ModelConfig>, vllm_command: String) -> Self {
         let processes = DashMap::new();
 
         for (name, config) in &configs {
@@ -81,6 +90,7 @@ impl Orchestrator {
             operation_lock: Mutex::new(()),
             health_timeout: Duration::from_secs(5),
             startup_timeout: Duration::from_secs(300), // 5 minutes for large models
+            vllm_command,
         }
     }
 
@@ -179,11 +189,13 @@ impl Orchestrator {
         debug!(model = %model, args = ?args, "vLLM command args");
 
         // Spawn process
-        let child = Command::new("vllm")
+        // Use null for stdout/stderr to avoid backpressure issues
+        // In production, we might want to capture output for debugging
+        let child = Command::new(&self.vllm_command)
             .args(&args)
             .env("VLLM_SERVER_DEV_MODE", "1") // Required for sleep mode endpoints
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| OrchestratorError::SpawnFailed {
                 model: model.to_string(),

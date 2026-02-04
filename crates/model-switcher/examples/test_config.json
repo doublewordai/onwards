@@ -1,0 +1,24 @@
+{
+  "port": 8000,
+  "models": {
+    "model-a": {
+      "model_path": "mock/model-a",
+      "port": 8001,
+      "gpu_memory_utilization": 0.9,
+      "tensor_parallel_size": 1,
+      "dtype": "auto",
+      "sleep_level": 1
+    },
+    "model-b": {
+      "model_path": "mock/model-b",
+      "port": 8002,
+      "gpu_memory_utilization": 0.9,
+      "tensor_parallel_size": 1,
+      "dtype": "auto",
+      "sleep_level": 2
+    }
+  },
+  "policy": {
+    "type": "fifo"
+  }
+}

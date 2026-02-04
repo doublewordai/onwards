@@ -60,8 +60,11 @@ use tracing::info;
 pub async fn build_app(config: Config) -> Result<axum::Router> {
     info!("Building model-switcher with {} models", config.models.len());
 
-    // Create orchestrator
-    let orchestrator = Arc::new(Orchestrator::new(config.models.clone()));
+    // Create orchestrator with configured command
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
 
     // Create policy
     let policy = config.policy.build_policy();
