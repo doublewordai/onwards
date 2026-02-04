@@ -83,11 +83,12 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{Target, Targets};
+    use crate::target::{OpenResponsesConfig, Target, Targets};
     use crate::test_utils::MockHttpClient;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use dashmap::DashMap;
+    use http_body_util::BodyExt;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -105,10 +106,57 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
         };
 
         let mock_response = r#"{"id":"chatcmpl-123","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Hello!"}}]}"#;
         AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, mock_response))
+    }
+
+    /// Create test app state with adapter mode enabled
+    fn create_adapter_test_app_state() -> (AppState<MockHttpClient>, MockHttpClient) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock response that simulates a Chat Completions response
+        let mock_response = r#"{
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! How can I help you today?"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 8,
+                "total_tokens": 18
+            }
+        }"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
     }
 
     #[tokio::test]
@@ -137,5 +185,153 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_adapter_converts_responses_to_chat_completions() {
+        let (state, mock_client) = create_adapter_test_app_state();
+        let router = build_strict_router(state);
+
+        // Send a Responses API request
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "Hello, how are you?"
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        // Check that we got a successful response
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Parse the response body
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify the response is in Open Responses format
+        assert_eq!(response_json["object"], "response");
+        assert!(response_json["id"].as_str().unwrap().starts_with("resp_"));
+        assert_eq!(response_json["status"], "completed");
+
+        // Verify output items exist
+        let output = response_json["output"].as_array().unwrap();
+        assert!(!output.is_empty());
+
+        // Verify the mock client received a Chat Completions request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        // Check the request was sent to chat completions endpoint
+        assert!(requests[0].uri.contains("chat/completions"));
+
+        // Parse the request body to verify conversion
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request_json["model"], "gpt-4o");
+
+        // Verify messages array was created from input
+        let messages = request_json["messages"].as_array().unwrap();
+        assert!(!messages.is_empty());
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn test_adapter_with_instructions() {
+        let (state, mock_client) = create_adapter_test_app_state();
+        let router = build_strict_router(state);
+
+        // Send a Responses API request with instructions
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "What's 2 + 2?",
+            "instructions": "You are a helpful math tutor."
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify the mock client received the request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        // Parse the request body to verify system message was added
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).unwrap();
+        let messages = request_json["messages"].as_array().unwrap();
+
+        // Should have system message first, then user message
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are a helpful math tutor.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "What's 2 + 2?");
+    }
+
+    #[tokio::test]
+    async fn test_passthrough_mode_without_adapter() {
+        // Create a target WITHOUT adapter enabled
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                // No open_responses config - defaults to passthrough
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock response in Responses format (as if upstream supports it)
+        let mock_response = r#"{
+            "id": "resp_abc123",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = build_strict_router(state);
+
+        // Send a Responses API request
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "Hello"
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify the mock client received the request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        // In passthrough mode, request should go to /v1/responses (not chat/completions)
+        assert!(requests[0].uri.contains("/responses"));
     }
 }
