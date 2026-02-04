@@ -1,0 +1,39 @@
+[package]
+name = "model-switcher"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Zero-reload model switching for vLLM - manages multiple models on shared GPU"
+
+[[bin]]
+name = "model-switcher"
+path = "src/main.rs"
+
+[dependencies]
+onwards.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+rstest = "0.26.1"

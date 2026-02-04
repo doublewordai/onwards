@@ -37,7 +37,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for a single vLLM model endpoint
 #[derive(Debug, Clone)]
@@ -64,12 +64,12 @@ pub trait VllmHttpClient: Send + Sync {
 /// Default HTTP client using reqwest (if feature enabled) or hyper
 #[derive(Debug, Clone, Default)]
 pub struct DefaultVllmClient {
-    timeout: Duration,
+    _timeout: Duration,
 }
 
 impl DefaultVllmClient {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self { _timeout: timeout }
     }
 }
 
