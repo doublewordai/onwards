@@ -22,6 +22,7 @@
 pub mod adapter;
 pub mod handlers;
 pub mod schemas;
+pub mod streaming;
 
 use crate::client::HttpClient;
 use crate::AppState;

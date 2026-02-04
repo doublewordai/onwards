@@ -176,6 +176,154 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
         self.store.store(&value).await
     }
+
+    /// Check if a response requires tool execution
+    pub fn requires_tool_action(&self, response: &ChatCompletionResponse) -> bool {
+        response
+            .choices
+            .first()
+            .map(|c| c.finish_reason.as_deref() == Some("tool_calls"))
+            .unwrap_or(false)
+    }
+
+    /// Extract tool calls from a response that require execution
+    pub fn extract_tool_calls(&self, response: &ChatCompletionResponse) -> Vec<PendingToolCall> {
+        response
+            .choices
+            .iter()
+            .flat_map(|choice| {
+                choice
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls.iter().map(|tc| PendingToolCall {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        })
+                    })
+                    .into_iter()
+                    .flatten()
+            })
+            .collect()
+    }
+
+    /// Execute a tool call using the configured executor
+    pub async fn execute_tool(
+        &self,
+        tool_call: &PendingToolCall,
+    ) -> Result<ToolCallResult, ToolError> {
+        // Check if the executor can handle this tool
+        if !self.executor.can_handle(&tool_call.name) {
+            return Ok(ToolCallResult::Unhandled(tool_call.clone()));
+        }
+
+        // Parse arguments as JSON
+        let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
+            .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+
+        // Execute the tool
+        let result = self
+            .executor
+            .execute(&tool_call.name, &tool_call.id, &args)
+            .await?;
+
+        Ok(ToolCallResult::Executed {
+            call_id: tool_call.id.clone(),
+            output: serde_json::to_string(&result)
+                .unwrap_or_else(|_| result.to_string()),
+        })
+    }
+
+    /// Execute all tool calls and return results
+    pub async fn execute_tool_calls(
+        &self,
+        tool_calls: &[PendingToolCall],
+    ) -> Vec<ToolCallResult> {
+        let mut results = Vec::new();
+        for tc in tool_calls {
+            match self.execute_tool(tc).await {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    results.push(ToolCallResult::Error {
+                        call_id: tc.id.clone(),
+                        error: e.to_string(),
+                    });
+                }
+            }
+        }
+        results
+    }
+
+    /// Add tool results to messages for the next iteration
+    pub fn add_tool_results_to_messages(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        assistant_message: &ChatMessage,
+        results: &[ToolCallResult],
+    ) {
+        // First add the assistant message with tool calls
+        messages.push(assistant_message.clone());
+
+        // Then add tool response messages
+        for result in results {
+            match result {
+                ToolCallResult::Executed { call_id, output } => {
+                    messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(MessageContent::Text(output.clone())),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        extra: None,
+                    });
+                }
+                ToolCallResult::Error { call_id, error } => {
+                    messages.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(MessageContent::Text(format!("Error: {}", error))),
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: Some(call_id.clone()),
+                        extra: None,
+                    });
+                }
+                ToolCallResult::Unhandled(_) => {
+                    // Unhandled tools are returned to the client, not added to messages
+                }
+            }
+        }
+    }
+
+    /// Check if there are any unhandled tool calls that need client action
+    pub fn has_unhandled_tools(&self, results: &[ToolCallResult]) -> bool {
+        results.iter().any(|r| matches!(r, ToolCallResult::Unhandled(_)))
+    }
+
+    /// Get the maximum number of tool iterations
+    pub fn max_iterations(&self) -> u32 {
+        self.max_tool_iterations
+    }
+}
+
+/// A pending tool call extracted from the response
+#[derive(Debug, Clone)]
+pub struct PendingToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Result of executing a tool call
+#[derive(Debug, Clone)]
+pub enum ToolCallResult {
+    /// Tool was executed successfully
+    Executed { call_id: String, output: String },
+    /// Tool execution failed
+    Error { call_id: String, error: String },
+    /// Tool was not handled (should be returned to client)
+    Unhandled(PendingToolCall),
 }
 
 /// Errors that can occur during adaptation
