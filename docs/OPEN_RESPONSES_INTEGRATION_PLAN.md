@@ -162,20 +162,20 @@ Strict mode uses a **separate router** with typed handlers that leverage Axum's 
 - Type-safe request handling
 - Upstream validates further - we just ensure well-formed requests
 
-### Open Responses Adapter (Not Just Translation)
+### Open Responses Adapter
 
-When the upstream only supports Chat Completions, we need more than simple format translation. A single `/v1/responses` request may require:
+The adapter implements full Open Responses semantics over **any Chat Completions backend**. It's not just for "legacy" upstreams - it adds capabilities that even partial Responses API implementations (like vLLM) lack:
 
-- **Multiple upstream calls** (tool loops: 1:N mapping)
-- **State management** (`previous_response_id` → expand to full context)
-- **Event synthesis** (generate semantic streaming events from raw deltas)
-- **Tool orchestration** (execute some tools locally, pass others through)
+- **State management** (`previous_response_id`) - most upstreams don't implement this
+- **Tool loop orchestration** - execute tools at the proxy, regardless of upstream support
+- **Streaming event synthesis** - generate semantic events from raw deltas
+- **Hybrid tool handling** - some tools local, some passed through
 
-This is an **adapter** that implements Open Responses semantics over a Chat Completions backend, not a simple 1:1 translation.
+**The adapter always uses Chat Completions internally**, even if the upstream claims Responses API support. This is simpler and more reliable - partial implementations (like vLLM's stateless Responses API) don't offer meaningful advantages when the adapter is managing state and tool loops anyway.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              Open Responses Adapter (strict mode)                │
+│                    Open Responses Adapter                        │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  Client Request (/v1/responses)                                 │
@@ -194,6 +194,7 @@ This is an **adapter** that implements Open Responses semantics over a Chat Comp
 │       ▼                                                         │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │ 3. Forward to upstream (/v1/chat/completions)           │   │
+│  │    └── Always Chat Completions, regardless of upstream   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │       │                                                         │
 │       ▼                                                         │
@@ -201,7 +202,6 @@ This is an **adapter** that implements Open Responses semantics over a Chat Comp
 │  │ 4. Tool call in response?                               │   │
 │  │    ├── ToolExecutor.can_handle()? Execute locally       │   │
 │  │    │   └── Loop back to step 3 with result              │   │
-│  │    ├── Pass to upstream for hosted tool execution       │   │
 │  │    └── Return to client (requires_action)               │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │       │                                                         │
@@ -330,7 +330,7 @@ Implement the sub-agent loop:
 
 ### Per-Target Configuration
 
-When `strict_mode: true`, Open Responses requests are **validated then passed through** by default. The adapter is opt-in for upstreams that don't support Open Responses natively:
+When `strict_mode: true`, Open Responses requests are **validated then passed through** by default. The adapter is opt-in:
 
 ```json
 {
@@ -340,14 +340,21 @@ When `strict_mode: true`, Open Responses requests are **validated then passed th
     "gpt-4o": {
       "url": "https://api.openai.com/v1",
       "onwards_key": "sk-..."
-      // Default: validate schema, then passthrough to upstream
-      // Upstream handles /v1/responses natively
+      // Default: validate schema, then passthrough to upstream /v1/responses
+    },
+    "vllm-local": {
+      "url": "http://localhost:8000/v1",
+      "open_responses": {
+        "adapter": true  // Use adapter for full Open Responses semantics
+      }
+      // Even though vLLM has partial /v1/responses support, the adapter
+      // provides state management and tool loops that vLLM lacks
     },
     "claude-3-opus": {
       "url": "https://api.anthropic.com",
       "onwards_key": "sk-...",
       "open_responses": {
-        "adapter": true  // Use adapter (upstream only supports Chat Completions)
+        "adapter": true  // Use adapter (Anthropic only supports Chat Completions)
       }
     }
   }
@@ -356,8 +363,8 @@ When `strict_mode: true`, Open Responses requests are **validated then passed th
 
 **Strict mode behavior for `/v1/responses`:**
 1. Validate request schema (fail fast with good errors)
-2. If `adapter: true` → use adapter to convert to Chat Completions
-3. If `adapter: false` (default) → passthrough to upstream as-is
+2. If `adapter: true` → use adapter (always calls upstream via Chat Completions)
+3. If `adapter: false` (default) → passthrough to upstream `/v1/responses` as-is
 
 ### Mode Comparison
 
@@ -420,7 +427,7 @@ The compliance suite validates:
 
 ## Adapter Capabilities
 
-When using the adapter (upstream only supports Chat Completions):
+The adapter provides full Open Responses semantics over any Chat Completions backend:
 
 | Feature | Supported | Notes |
 |---------|-----------|-------|
@@ -429,12 +436,19 @@ When using the adapter (upstream only supports Chat Completions):
 | Item state machine | ✅ | Tracked by adapter |
 | `allowed_tools` vs `tools` | ✅ | Filter/reject disallowed calls |
 | Tool loops | ✅ | Via `ToolExecutor` trait |
-| Hybrid tool handling | ✅ | Some local, some passed through |
+| Proxy-level tool execution | ✅ | Execute tools locally, feed results back |
 | Reasoning traces | ❌ | Requires upstream model support |
 | `truncation` | ❌ | Passed through to upstream |
 | `service_tier` | ❌ | Passed through to upstream |
 
-**Reasoning traces** are the only feature that cannot be provided by the adapter - they require the upstream model to actually perform and expose reasoning.
+**Why always use Chat Completions internally?**
+
+Even upstreams with "Responses API support" (like vLLM) often have partial implementations:
+- No `previous_response_id` support
+- No `store` parameter
+- Stateless design
+
+Since the adapter manages state and tool loops anyway, using Chat Completions is simpler and more reliable. The adapter provides the full Open Responses semantics regardless of upstream capabilities.
 
 ---
 
