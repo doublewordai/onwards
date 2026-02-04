@@ -33,360 +33,419 @@ Open Responses extends the OpenAI Responses API as an open standard. Key differe
 
 ## Integration Strategy
 
-### Architectural Constraint: No Body Serialization by Default
+### Current State: Passthrough Already Works
 
-Onwards is designed as a **transparent proxy** that avoids deserializing request/response bodies. The current approach:
-
-1. **Minimal extraction**: Only the `model` field is extracted for routing (via lightweight `ExtractedModel`)
-2. **Model rewriting via `serde_json::Value`**: Preserves all fields without full schema definitions
-3. **Opt-in sanitization**: Response sanitization (`sanitize_response: true`) is the only feature that does full deserialization, and it's per-target opt-in
-
-This philosophy prioritizes:
-- Performance (no unnecessary parsing)
-- Flexibility (unknown fields pass through)
-- Provider compatibility (doesn't impose schema requirements)
-
-### Option A: Native Passthrough (Recommended Default)
-
-Add `/v1/responses` endpoint that routes directly to providers supporting Open Responses natively:
+The existing wildcard route `/{*path}` (in `lib.rs:394`) already forwards `/v1/responses` requests to upstreams. **No changes needed for native passthrough.**
 
 ```
-Client (Open Responses) → Onwards → Provider (Open Responses)
+Client (any format) → Onwards (extract model, route) → Provider (handles format)
 ```
 
-**Behavior**:
-- Extract `model` field from request body (same minimal extraction as chat completions)
-- Route to target based on model name
-- Pass request/response through unchanged as bytes
-- SSE buffering for streaming (already implemented)
+The upstream provider determines whether Open Responses is supported. If it is, requests work. If not, the provider returns an error. This is the transparent proxy philosophy.
 
-**Pros**: Maintains transparent proxy philosophy, zero schema maintenance
-**Cons**: Only works with Open Responses-compliant providers
+### Proposed: Strict Mode (New Opt-in Feature)
 
-### Option B: Strict Mode Translation (Opt-in)
-
-Add opt-in `strict_mode` or `translate_responses` flag that enables protocol translation:
+Add a new `strict_mode` flag that enables comprehensive request/response validation and translation. This **subsumes and extends** existing `sanitize_response` and `body_transform_fn` functionality.
 
 ```
-Client (Open Responses) → Onwards (translate) → Provider (Chat Completions)
+strict_mode: false (default)     strict_mode: true
+─────────────────────────────    ─────────────────────────────
+• Transparent passthrough        • Path validation
+• Minimal model extraction       • Request schema validation
+• No body parsing               • Response schema validation
+• Provider determines format    • Protocol translation (when needed)
 ```
 
-**Behavior**:
-- When enabled: Full deserialization, protocol translation, re-serialization
-- When disabled: Passthrough (Option A behavior)
-- Follows same pattern as existing `sanitize_response` opt-in
+**Strict mode provides:**
 
-**Pros**: Enables Open Responses clients with legacy providers
-**Cons**: Requires schema maintenance, loses unknown fields
+1. **Path validation**: Only accept known OpenAI-compatible paths
+   - `/v1/chat/completions`
+   - `/v1/responses`
+   - `/v1/embeddings`
+   - `/v1/models`
+   - (reject unknown paths with 404)
 
-### Option C: Hybrid Routing (Recommended for Production)
+2. **Request schema validation**: Validate request bodies against known schemas
+   - Chat Completions: `messages` array, `model`, etc.
+   - Responses: `input` (string or items), `model`, etc.
+   - Embeddings: `input`, `model`, etc.
 
-Combine both approaches with automatic detection:
+3. **Response schema validation**: Enforce strict OpenAI schema compliance
+   - Subsumes existing `sanitize_response` functionality
+   - Remove provider-specific fields
+   - Rewrite model names
 
-```json
-{
-  "targets": {
-    "gpt-4o": {
-      "url": "https://api.openai.com/v1",
-      "open_responses": {
-        "mode": "native"           // passthrough, provider supports it
-      }
-    },
-    "claude-3": {
-      "url": "https://api.anthropic.com",
-      "open_responses": {
-        "mode": "translate"        // opt-in translation
-      }
-    },
-    "local-model": {
-      "url": "http://localhost:8000",
-      "open_responses": {
-        "mode": "disabled"         // no /v1/responses support
-      }
-    }
-  }
-}
+4. **Protocol translation** (for `/v1/responses` only):
+   - If upstream supports Open Responses → passthrough
+   - If upstream only supports Chat Completions → translate request/response
+
+### Architecture: Strict Mode Sits Alongside Transparent Mode
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Onwards Router                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  strict_mode: false (default)                               │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ • Extract model from body                            │   │
+│  │ • Route to target                                    │   │
+│  │ • Passthrough request/response as bytes              │   │
+│  │ • SSE buffering for streaming                        │   │
+│  │ • (optional) body_transform_fn                       │   │
+│  │ • (optional) sanitize_response per target            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  strict_mode: true (opt-in)                                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ • Validate path against allowed endpoints            │   │
+│  │ • Parse and validate request schema                  │   │
+│  │ • Route to target                                    │   │
+│  │ • Translate if needed (responses → chat completions) │   │
+│  │ • Parse and validate response schema                 │   │
+│  │ • Translate response if needed                       │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Routing logic**:
-1. `/v1/responses` request arrives
-2. Extract model, look up target
-3. If `mode: native` → passthrough
-4. If `mode: translate` → deserialize, convert to chat completions, forward, convert response back
-5. If `mode: disabled` → return 404 or error
+**Key principle**: Strict mode doesn't change the existing transparent behavior. It's an entirely separate code path that users opt into.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Native Passthrough (Minimal Change)
+### Phase 0: Passthrough (Already Complete)
 
-**Goal**: Add `/v1/responses` endpoint that routes to providers with zero body parsing beyond model extraction.
+**Status**: ✅ Already works today
 
-**Changes to `lib.rs`**:
+The wildcard route `/{*path}` already forwards `/v1/responses` to upstreams. If your upstream supports Open Responses, it works. No code changes needed.
 
-```rust
-pub fn build_router<T: HttpClient>(state: AppState<T>) -> Router {
-    Router::new()
-        .route("/v1/models", get(handlers::models))
-        .route("/v1/chat/completions", any(handlers::target_message_handler))
-        // NEW: Open Responses endpoint - reuses existing handler
-        .route("/v1/responses", any(handlers::target_message_handler))
-        .fallback(any(handlers::target_message_handler))
-        .with_state(state)
-}
+### Phase 1: Strict Mode Foundation
+
+**Goal**: Add `strict_mode` configuration flag and routing infrastructure.
+
+**New module structure**:
+
+```
+src/
+├── strict/
+│   ├── mod.rs              # Strict mode entry point
+│   ├── validator.rs        # Path and schema validation
+│   ├── schemas/
+│   │   ├── mod.rs
+│   │   ├── chat_completions.rs
+│   │   ├── responses.rs
+│   │   └── embeddings.rs
+│   └── translator.rs       # Protocol translation (Phase 2)
 ```
 
-That's it for Phase 1. The existing `target_message_handler` already:
-- Extracts `model` from JSON body (works for Open Responses format too)
-- Routes to the correct target
-- Handles SSE buffering
-- Applies rate limiting and auth
+**Configuration**:
 
-**No new types needed** - bodies pass through as bytes.
-
-### Phase 2: Configuration for Open Responses Mode
-
-**Goal**: Allow per-target configuration for how to handle `/v1/responses` requests.
-
-**New config options in `target.rs`**:
-
-```rust
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum OpenResponsesMode {
-    #[default]
-    Native,      // Passthrough to provider
-    Translate,   // Convert to/from chat completions (strict mode)
-    Disabled,    // Return 404 for /v1/responses
-}
-
-pub struct Target {
-    // ... existing fields ...
-
-    /// How to handle /v1/responses requests for this target
-    #[serde(default)]
-    pub open_responses_mode: OpenResponsesMode,
+```json
+{
+  "strict_mode": true,  // Global flag, default false
+  "targets": {
+    "gpt-4o": {
+      "url": "https://api.openai.com/v1",
+      "supports_responses_api": true  // Passthrough for /v1/responses
+    },
+    "claude-3": {
+      "url": "https://api.anthropic.com",
+      "supports_responses_api": false  // Translate /v1/responses → /v1/chat/completions
+    }
+  }
 }
 ```
 
 **Handler modification**:
 
 ```rust
-// In target_message_handler, after routing:
-if path.contains("/v1/responses") {
-    match target.open_responses_mode {
-        OpenResponsesMode::Native => { /* passthrough, current behavior */ }
-        OpenResponsesMode::Translate => { /* Phase 3 */ }
-        OpenResponsesMode::Disabled => {
-            return Err(OnwardsErrorResponse::not_found("Open Responses not supported for this target"));
+pub async fn target_message_handler<T: HttpClient>(
+    State(state): State<AppState<T>>,
+    req: Request,
+) -> Result<Response, OnwardsErrorResponse> {
+    // Check if strict mode is enabled globally
+    if state.strict_mode {
+        return strict::handle_request(state, req).await;
+    }
+
+    // Existing transparent passthrough logic (unchanged)
+    // ...
+}
+```
+
+### Phase 2: Path and Request Validation
+
+**Goal**: In strict mode, validate paths and request schemas.
+
+**Allowed paths**:
+
+```rust
+const STRICT_MODE_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/responses",
+    "/v1/embeddings",
+    "/v1/models",
+    "/models",
+];
+
+fn validate_path(path: &str) -> Result<EndpointType, OnwardsErrorResponse> {
+    match path {
+        p if p.ends_with("/chat/completions") => Ok(EndpointType::ChatCompletions),
+        p if p.ends_with("/responses") => Ok(EndpointType::Responses),
+        p if p.ends_with("/embeddings") => Ok(EndpointType::Embeddings),
+        p if p.ends_with("/models") => Ok(EndpointType::Models),
+        _ => Err(OnwardsErrorResponse::not_found("Unknown endpoint")),
+    }
+}
+```
+
+**Request validation**:
+
+```rust
+fn validate_request(endpoint: EndpointType, body: &[u8]) -> Result<ValidatedRequest, OnwardsErrorResponse> {
+    match endpoint {
+        EndpointType::ChatCompletions => {
+            let req: ChatCompletionRequest = serde_json::from_slice(body)?;
+            // Validate required fields, types, etc.
+            Ok(ValidatedRequest::ChatCompletion(req))
+        }
+        EndpointType::Responses => {
+            let req: ResponsesRequest = serde_json::from_slice(body)?;
+            Ok(ValidatedRequest::Responses(req))
+        }
+        // ...
+    }
+}
+```
+
+### Phase 3: Response Validation (Subsumes `sanitize_response`)
+
+**Goal**: In strict mode, validate and sanitize all responses.
+
+This replaces the per-target `sanitize_response` flag with automatic validation:
+
+```rust
+fn validate_response(
+    endpoint: EndpointType,
+    body: &[u8],
+    original_model: Option<&str>,
+) -> Result<Bytes, OnwardsErrorResponse> {
+    match endpoint {
+        EndpointType::ChatCompletions => {
+            // Reuse existing ResponseSanitizer logic
+            let sanitizer = ResponseSanitizer { original_model };
+            sanitizer.sanitize_non_streaming(body)
+        }
+        EndpointType::Responses => {
+            // New: Open Responses sanitizer
+            let sanitizer = OpenResponsesSanitizer { original_model };
+            sanitizer.sanitize(body)
+        }
+        // ...
+    }
+}
+```
+
+### Phase 4: Protocol Translation (Responses ↔ Chat Completions)
+
+**Goal**: In strict mode, translate `/v1/responses` requests for upstreams that don't support it.
+
+**Per-target configuration**:
+
+```rust
+pub struct Target {
+    // ... existing fields ...
+
+    /// Does this upstream support /v1/responses natively?
+    /// Only relevant when strict_mode is enabled.
+    #[serde(default)]
+    pub supports_responses_api: bool,
+}
+```
+
+**Translation logic**:
+
+```rust
+async fn handle_responses_request(
+    state: &AppState,
+    target: &Target,
+    request: ResponsesRequest,
+) -> Result<Response, OnwardsErrorResponse> {
+    if target.supports_responses_api {
+        // Passthrough - serialize back to bytes and forward
+        forward_as_responses(state, target, request).await
+    } else {
+        // Translate to chat completions
+        let chat_request = translate_to_chat_completions(&request)?;
+        let chat_response = forward_as_chat_completions(state, target, chat_request).await?;
+        let responses_response = translate_from_chat_completions(&chat_response)?;
+        Ok(responses_response)
+    }
+}
+```
+
+### Phase 5: Streaming Translation
+
+**Goal**: Handle streaming responses in translation mode.
+
+```rust
+pub struct StreamingTranslator {
+    direction: TranslationDirection,
+    response_id: String,
+    sequence: u64,
+}
+
+enum TranslationDirection {
+    ChatToResponses,  // Upstream sent chat.completion.chunk, client expects response.*
+    PassThrough,      // No translation needed
+}
+
+impl StreamingTranslator {
+    fn translate_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, String> {
+        match self.direction {
+            TranslationDirection::PassThrough => Ok(Bytes::copy_from_slice(chunk)),
+            TranslationDirection::ChatToResponses => {
+                // Parse chat.completion.chunk
+                // Emit response.output_text.delta events
+                self.translate_chat_to_responses(chunk)
+            }
         }
     }
 }
 ```
 
-### Phase 3: Strict Mode Translation (Opt-in Only)
+### Phase 6: Advanced Features (Future)
 
-**Goal**: When `open_responses_mode: translate` is set, convert between formats.
-
-**New module** (only loaded when translation is needed):
-
-```
-src/
-├── open_responses/
-│   ├── mod.rs              # Feature-gated module
-│   ├── translator.rs       # Bidirectional translation
-│   └── types.rs            # Minimal types for translation
-```
-
-**Key design principles for translation**:
-
-1. **Lenient parsing** (like response sanitizer):
-   ```rust
-   #[derive(Deserialize)]
-   struct LenientOpenResponsesRequest {
-       model: String,
-       input: serde_json::Value,  // Don't fully parse, just transform
-       #[serde(flatten)]
-       other: HashMap<String, serde_json::Value>,  // Preserve unknown fields
-   }
-   ```
-
-2. **Minimal transformation**:
-   ```rust
-   fn translate_request(body: &[u8]) -> Result<Bytes, String> {
-       let req: LenientOpenResponsesRequest = serde_json::from_slice(body)?;
-
-       // Convert input to messages array
-       let messages = input_to_messages(&req.input)?;
-
-       // Build chat completion request, preserving other fields
-       let mut chat_req = req.other;
-       chat_req.insert("messages".into(), messages);
-       chat_req.insert("model".into(), req.model.into());
-
-       Ok(Bytes::from(serde_json::to_vec(&chat_req)?))
-   }
-   ```
-
-3. **Response transformation follows existing pattern**:
-   - Use `ResponseTransformFn` hook
-   - Apply only when `open_responses_mode: translate`
-   - Streaming: transform SSE chunks
-   - Non-streaming: buffer and transform
-
-### Phase 4: Streaming Event Translation (Strict Mode Only)
-
-**Goal**: Transform Chat Completions SSE deltas into Open Responses semantic events.
-
-**Only applies when `translate` mode is active**:
-
-```rust
-pub struct StreamingTranslator {
-    response_id: String,
-    sequence: u64,
-}
-
-impl StreamingTranslator {
-    /// Transform a chat.completion.chunk into response.* events
-    pub fn translate_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, String> {
-        // Parse minimally
-        let parsed: serde_json::Value = serde_json::from_slice(chunk)?;
-
-        // Generate semantic events
-        let events = vec![
-            self.make_delta_event(&parsed)?,
-        ];
-
-        // Format as SSE
-        Ok(self.format_sse_events(&events))
-    }
-}
-```
-
-### Phase 5: Sub-Agent Loop Orchestration (Advanced, Strict Mode)
-
-**Goal**: For providers without native tool loops, orchestrate client-side.
-
-**Only relevant for `translate` mode with tool-calling requests**:
-
-```rust
-/// Orchestrates tool loops for providers that don't support them natively
-pub async fn orchestrate_tool_loop<T: HttpClient>(
-    client: &T,
-    target: &Target,
-    original_request: Bytes,
-    max_iterations: u32,
-) -> Result<Response, Error> {
-    // This is complex and requires full deserialization
-    // Only enabled when:
-    // 1. open_responses_mode: translate
-    // 2. Request contains tools
-    // 3. Provider doesn't support native loops
-
-    // Implementation deferred to future phase
-    unimplemented!("Tool loop orchestration")
-}
-```
+- Sub-agent loop orchestration
+- Reasoning trace normalization
+- `previous_response_id` state management
 
 ---
 
 ## Configuration Changes
 
-### New Target Options
+### Global Strict Mode Flag
 
 ```json
 {
+  "strict_mode": false,  // Default: transparent passthrough (existing behavior)
+
+  "targets": {
+    // ... targets unchanged when strict_mode is false
+  }
+}
+```
+
+### Strict Mode Configuration
+
+When `strict_mode: true`, additional per-target options become relevant:
+
+```json
+{
+  "strict_mode": true,
+
   "targets": {
     "gpt-4o": {
       "url": "https://api.openai.com/v1",
       "onwards_key": "sk-...",
-
-      // NEW: Open Responses mode (default: "native")
-      "open_responses_mode": "native"
+      "supports_responses_api": true   // Passthrough /v1/responses
     },
     "claude-3-opus": {
       "url": "https://api.anthropic.com",
       "onwards_key": "sk-...",
-
-      // Opt-in translation (strict mode)
-      "open_responses_mode": "translate"
+      "supports_responses_api": false  // Translate /v1/responses → chat completions
     },
     "local-llama": {
       "url": "http://localhost:8000",
-
-      // Disable /v1/responses for this target
-      "open_responses_mode": "disabled"
+      "supports_responses_api": false
     }
   }
 }
 ```
 
-### Mode Descriptions
+### Mode Comparison
 
-| Mode | Body Parsing | Use Case |
-|------|--------------|----------|
-| `native` (default) | Minimal (model only) | Provider supports Open Responses |
-| `translate` | Full deserialization | Provider only supports Chat Completions |
-| `disabled` | None | Explicitly disable /v1/responses |
+| Feature | `strict_mode: false` | `strict_mode: true` |
+|---------|---------------------|---------------------|
+| Path validation | ❌ Any path forwarded | ✅ Only known OpenAI paths |
+| Request validation | ❌ Passthrough | ✅ Schema validation |
+| Response validation | ⚠️ Optional (`sanitize_response`) | ✅ Always validated |
+| Protocol translation | ❌ Not available | ✅ Based on `supports_responses_api` |
+| Unknown fields | ✅ Preserved | ❌ Stripped during validation |
+| Performance | ✅ Optimal | ⚠️ Deserialization overhead |
+
+### Migration from Existing Options
+
+When `strict_mode: true`:
+- `sanitize_response` is **ignored** (responses always sanitized)
+- `body_transform_fn` is **ignored** (strict mode handles transformations)
+- `onwards_model` still works (model rewriting)
+
+Existing deployments with `strict_mode: false` (default) are **unchanged**.
 
 ---
 
 ## API Compatibility Matrix
 
-| Feature | Native Mode | Translate Mode | Notes |
-|---------|-------------|----------------|-------|
-| Basic text generation | ✅ Passthrough | ✅ | |
-| Tool/function calling | ✅ Passthrough | ⚠️ Partial | External tools only |
-| Streaming | ✅ Passthrough | ⚠️ Complex | Requires event translation |
-| Reasoning traces | ✅ Passthrough | ❌ | No Chat Completions equivalent |
-| Encrypted reasoning | ✅ Passthrough | ❌ | Provider-specific |
-| Sub-agent loops | ✅ Passthrough | ❌ | Would require orchestration |
-| `previous_response_id` | ✅ Passthrough | ❌ | No state maintained |
-| Unknown fields | ✅ Preserved | ❌ Lost | Translation requires schema |
-| Performance | ✅ Optimal | ⚠️ Overhead | Deserialization cost |
+| Feature | Transparent (default) | Strict + Native | Strict + Translate |
+|---------|----------------------|-----------------|-------------------|
+| Basic text generation | ✅ Passthrough | ✅ Validated | ✅ Translated |
+| Tool/function calling | ✅ Passthrough | ✅ Validated | ⚠️ External only |
+| Streaming | ✅ Passthrough | ✅ Validated | ⚠️ Translated |
+| Reasoning traces | ✅ Passthrough | ✅ Validated | ❌ Lost |
+| Encrypted reasoning | ✅ Passthrough | ✅ Validated | ❌ Lost |
+| Sub-agent loops | ✅ Passthrough | ✅ Validated | ❌ Not supported |
+| `previous_response_id` | ✅ Passthrough | ✅ Validated | ❌ Not supported |
+| Unknown fields | ✅ Preserved | ❌ Stripped | ❌ Stripped |
+| Unknown paths | ✅ Forwarded | ❌ Rejected | ❌ Rejected |
+| Performance | ✅ Optimal | ⚠️ Validation | ⚠️ Translation |
 
 ---
 
 ## Implementation Timeline
 
-### Sprint 1: Native Passthrough (1-2 days)
-- [ ] Add `/v1/responses` route to `build_router()` (single line change)
-- [ ] Verify model extraction works for Open Responses request format
-- [ ] Test with Open Responses-compliant provider (e.g., OpenAI)
-- [ ] Document the new endpoint
+### Sprint 0: Passthrough (Done)
+- [x] `/v1/responses` already works via wildcard route
+- [ ] (Optional) Document that Open Responses passthrough is supported
 
-**Deliverable**: `/v1/responses` works as transparent passthrough.
+**Deliverable**: Users can use `/v1/responses` today if their upstream supports it.
 
-### Sprint 2: Configuration & Mode Selection (3-5 days)
-- [ ] Add `open_responses_mode` field to `Target` struct
-- [ ] Add mode-based routing in handler
-- [ ] Implement `disabled` mode (return 404)
-- [ ] Update configuration documentation
+### Sprint 1: Strict Mode Infrastructure (1 week)
+- [ ] Add `strict_mode` flag to config
+- [ ] Create `src/strict/` module structure
+- [ ] Add routing branch in `target_message_handler`
+- [ ] Implement path validation (reject unknown paths)
 
-**Deliverable**: Per-target control over Open Responses behavior.
+**Deliverable**: `strict_mode: true` rejects unknown paths.
 
-### Sprint 3: Strict Mode Translation (1-2 weeks, optional)
-- [ ] Create `open_responses/` module
-- [ ] Implement lenient request translation (Items → Messages)
-- [ ] Implement lenient response translation (Choices → Output Items)
-- [ ] Add request/response transform hooks
+### Sprint 2: Request/Response Schemas (1-2 weeks)
+- [ ] Define schemas for chat completions, responses, embeddings
+- [ ] Implement request validation
+- [ ] Implement response validation (migrate from `ResponseSanitizer`)
+- [ ] Add `supports_responses_api` target option
 
-**Deliverable**: `translate` mode works for non-streaming requests.
+**Deliverable**: Full request/response validation in strict mode.
 
-### Sprint 4: Streaming Translation (1 week, optional)
-- [ ] Implement SSE chunk translation
+### Sprint 3: Protocol Translation (1-2 weeks)
+- [ ] Implement Responses → Chat Completions request translation
+- [ ] Implement Chat Completions → Responses response translation
+- [ ] Non-streaming end-to-end working
+
+**Deliverable**: `/v1/responses` works with Chat Completions-only upstreams.
+
+### Sprint 4: Streaming Translation (1 week)
+- [ ] Implement streaming chunk translation
 - [ ] Handle semantic event generation
 - [ ] Test with various providers
 
-**Deliverable**: `translate` mode works for streaming requests.
+**Deliverable**: Streaming works in translation mode.
 
 ### Sprint 5: Advanced Features (Future)
 - [ ] Sub-agent loop orchestration
-- [ ] Reasoning trace handling
+- [ ] Reasoning trace normalization
 - [ ] Compliance test suite integration
-
-**Note**: Sprints 3-5 are only needed if `translate` mode is required. Most deployments can use native passthrough.
 
 ---
 
@@ -415,46 +474,70 @@ npx ts-node bin/compliance-test.ts --endpoint http://localhost:8080/v1/responses
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Provider doesn't support Open Responses | High | Low | Return provider's error, document limitations |
-| Model extraction fails on Open Responses format | Low | High | Test extraction with spec examples |
-| Translation mode loses fidelity | Medium | Medium | Document limitations, prefer native mode |
-| Spec changes after implementation | Medium | Low | Native mode unaffected, version pin for translate |
+| Provider doesn't support Open Responses | High | Low | Transparent mode: provider error. Strict mode: translation. |
+| Schema drift as Open Responses evolves | Medium | Medium | Strict mode schemas versioned, transparent unaffected |
+| Translation loses fidelity | Medium | Medium | Document limitations, recommend native upstreams |
+| Strict mode breaks existing deployments | Low | High | Strict mode is opt-in, default unchanged |
 
-## Key Architectural Decision
+## Key Architectural Decisions
 
-**The native passthrough approach was chosen to maintain Onwards' transparent proxy philosophy.**
+### 1. Passthrough Already Works
 
-Previous versions of this plan assumed full request/response deserialization. After reviewing the codebase, this was revised to:
+The existing wildcard route `/{*path}` forwards `/v1/responses` today. No changes needed for basic Open Responses support with compliant upstreams.
 
-1. **Phase 1 (Native)**: Single line change - add route, reuse existing handler
-2. **Phase 2 (Config)**: Add mode selection per target
-3. **Phase 3+ (Translate)**: Only if needed, follows existing `sanitize_response` pattern
+### 2. Strict Mode is Separate, Not Incremental
 
-This means:
-- ✅ No new types required for basic support
-- ✅ Unknown fields pass through unchanged
-- ✅ No schema maintenance burden
-- ✅ Performance identical to current passthrough
-- ⚠️ Translation mode (if needed) is opt-in and isolated
+Strict mode is an entirely different code path, not a modification of transparent mode:
+
+```
+strict_mode: false → existing target_message_handler (unchanged)
+strict_mode: true  → new strict::handle_request
+```
+
+This ensures:
+- ✅ Existing deployments unaffected
+- ✅ Clear separation of concerns
+- ✅ Strict mode can evolve independently
+- ✅ Easy to disable if issues arise
+
+### 3. Strict Mode Subsumes Existing Validation Features
+
+When `strict_mode: true`:
+- `sanitize_response` → always on (subsumed)
+- `body_transform_fn` → replaced by schema validation
+- Path validation → always on (new)
+
+This avoids configuration complexity and ensures consistent behavior.
 
 ---
 
 ## Open Questions
 
-1. **Default mode**: Should the default `open_responses_mode` be `native` (passthrough) or `disabled` (explicit opt-in)?
-   - **Recommendation**: Default to `native` for simplicity - if a provider doesn't support it, they'll return an error anyway.
+1. **Strict mode naming**: Is `strict_mode` the right name? Alternatives:
+   - `validated_mode`
+   - `openai_compat_mode`
+   - `schema_validation`
+   - **Current preference**: `strict_mode` - clear and concise
 
-2. **Model extraction**: The current `ExtractedModel` struct expects `{"model": "..."}`. Open Responses uses the same field name, but should we validate the overall request structure?
-   - **Recommendation**: No - maintain minimal extraction philosophy.
+2. **Which endpoints in strict mode?**: The plan lists chat completions, responses, embeddings, models. Should we include:
+   - `/v1/audio/*` (transcriptions, speech)
+   - `/v1/images/*` (generations, edits)
+   - `/v1/files`, `/v1/assistants`, etc.
+   - **Recommendation**: Start with core endpoints, expand based on demand
 
-3. **Translate mode priority**: Is `translate` mode actually needed? If most providers will support Open Responses natively (OpenAI, Hugging Face Inference), translation may be low priority.
-   - **Recommendation**: Implement passthrough first, add translation only if there's demand.
+3. **Error format in strict mode**: When validation fails, should errors follow:
+   - OpenAI error format (current `OnwardsErrorResponse`)
+   - Open Responses error format
+   - Both based on request path
+   - **Recommendation**: OpenAI format for consistency with existing behavior
 
-4. **Response sanitization for Open Responses**: Should we create an Open Responses-specific sanitizer (like `create_openai_sanitizer()`) for the `native` mode?
-   - **Recommendation**: Only if providers return non-compliant responses. Start without it.
+4. **`supports_responses_api` detection**: Could we auto-detect by probing the upstream?
+   - **Recommendation**: No - explicit configuration is more reliable and predictable
 
-5. **Streaming format differences**: Open Responses uses semantic events (`response.output_text.delta`) while Chat Completions uses `chat.completion.chunk`. In `native` mode, is SSE buffering sufficient?
-   - **Recommendation**: Yes - existing `SseBufferedStream` handles incomplete chunks regardless of event format.
+5. **Schema versioning**: Open Responses spec will evolve. How to handle?
+   - Pin to specific version
+   - `OpenResponses-Version` header support
+   - **Recommendation**: Start without versioning, add if needed
 
 ---
 
