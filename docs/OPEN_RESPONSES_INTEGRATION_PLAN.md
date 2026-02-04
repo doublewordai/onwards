@@ -984,6 +984,138 @@ async fn responses_handler(...) {
 
 ---
 
+## Additional Spec Considerations
+
+The following Open Responses spec features should be considered for implementation:
+
+### Request Parameters Not Yet Covered
+
+**`allowed_tools`**: Limits which tools are actually executable without changing the `tools` list:
+
+```json
+{
+  "tools": [
+    {"type": "function", "name": "search"},
+    {"type": "function", "name": "delete"}
+  ],
+  "allowed_tools": ["search"]  // Model can see both, but can only call search
+}
+```
+
+This is a cache-preservation feature - the `tools` schema stays constant (cacheable), while `allowed_tools` varies per-request.
+
+**`truncation`**: Controls context overflow behavior:
+- `"auto"` (default) - Server MAY truncate older context to fit window
+- `"disabled"` - Server MUST fail if context exceeds window
+
+**`service_tier`**: Priority hint for scheduling:
+- `"standard"`, `"priority"`, `"batch"` etc.
+- Maps to different SLAs/pricing
+
+### Error Schema
+
+The spec defines structured errors that we should emit in strict mode:
+
+```json
+{
+  "error": {
+    "type": "invalid_request_error",  // server_error, model_error, not_found, too_many_requests
+    "code": "model_not_found",         // Specific error code
+    "param": "model",                  // Which parameter caused it
+    "message": "The requested model 'fake-model' does not exist."
+  }
+}
+```
+
+| Error Type | HTTP Status |
+|------------|-------------|
+| `server_error` | 500 |
+| `invalid_request_error` | 400 |
+| `not_found` | 404 |
+| `model_error` | 500 |
+| `too_many_requests` | 429 |
+
+### Streaming Event Ordering
+
+The spec mandates a specific event sequence for output items:
+
+```
+1. response.output_item.added     // Item created with minimal info
+2. response.content_part.added    // Content part started
+3. response.output_text.delta     // Text deltas (repeating)
+4. response.content_part.done     // Content part finished
+5. response.output_item.done      // Item finished
+```
+
+When translating from Chat Completions, we must synthesize this structure from `chat.completion.chunk` events.
+
+### Item State Machine
+
+Items have explicit lifecycle states:
+
+| State | Description |
+|-------|-------------|
+| `in_progress` | Model is currently emitting tokens for this item |
+| `incomplete` | Model exhausted token budget before finishing (terminal) |
+| `completed` | Item fully sampled (terminal) |
+
+If an item ends `incomplete`, it MUST be the last item, and the response MUST also be `incomplete`.
+
+### Content Type Asymmetry
+
+The spec defines separate unions for input vs output content:
+
+**UserContent** (input): Can include text, images, audio, video
+```rust
+enum UserContent {
+    InputText { text: String },
+    InputImage { url: String, detail: Option<String> },
+    InputAudio { data: String, format: String },
+    // ...
+}
+```
+
+**ModelContent** (output): Usually just text
+```rust
+enum ModelContent {
+    OutputText { text: String, annotations: Option<Vec<Annotation>> },
+    Refusal { refusal: String },
+}
+```
+
+### Extension Guidelines
+
+If Onwards wants to add custom items/events (e.g., for observability), the spec requires:
+
+**Custom items MUST**:
+- Be prefixed with implementor slug: `onwards:trace_item`
+- Include required fields: `id`, `type`, `status`
+
+**Custom streaming events MUST**:
+- Be prefixed: `onwards:latency_event`
+- Include: `type`, `sequence_number`
+
+**Extending existing schemas**:
+- Keep all standard fields unchanged
+- Use optional fields for extensions
+- Document clearly
+- Don't assume other implementations will honor them
+
+### Translation Limitations
+
+When translating Responses → Chat Completions, these features are **lost**:
+
+| Feature | Why |
+|---------|-----|
+| `previous_response_id` | Chat Completions is stateless |
+| Reasoning traces | No equivalent in Chat Completions |
+| Semantic streaming events | Only raw deltas available |
+| Item state machine | No equivalent concept |
+| `allowed_tools` vs `tools` | Chat Completions only has `tools` |
+| `truncation: disabled` | Provider-dependent behavior |
+
+---
+
 ## Open Questions
 
 1. **Strict mode naming**: Is `strict_mode` the right name? Alternatives:
