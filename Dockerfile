@@ -6,7 +6,7 @@
 # =============================================================================
 # Stage 1: Build the Rust binary
 # =============================================================================
-FROM --platform=linux/amd64 rust:1.83-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.85-bookworm AS builder
 
 WORKDIR /build
 
