@@ -334,4 +334,83 @@ mod tests {
         // In passthrough mode, request should go to /v1/responses (not chat/completions)
         assert!(requests[0].uri.contains("/responses"));
     }
+
+    #[tokio::test]
+    async fn test_streaming_adapter_mode() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock streaming SSE response
+        let chunks = vec![
+            "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" there!\"},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = build_strict_router(state);
+
+        // Send a streaming Responses API request
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "Hello",
+            "stream": true
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        // Check status
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Check content type is SSE
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("text/event-stream"));
+
+        // Read the streaming response
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = std::str::from_utf8(&body_bytes).unwrap();
+
+        // Verify we got Open Responses semantic events
+        assert!(body_text.contains("response.created"));
+        assert!(body_text.contains("response.output_item.added"));
+        assert!(body_text.contains("response.output_text.delta"));
+        assert!(body_text.contains("response.completed"));
+
+        // Verify the mock client received the request
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        // Check the request was sent to chat completions with stream: true
+        assert!(requests[0].uri.contains("chat/completions"));
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request_json["stream"], true);
+    }
 }

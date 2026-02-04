@@ -7,6 +7,7 @@ use super::adapter::OpenResponsesAdapter;
 use super::schemas::chat_completions::{ChatCompletionRequest, ChatCompletionResponse};
 use super::schemas::embeddings::EmbeddingsRequest;
 use super::schemas::responses::ResponsesRequest;
+use super::streaming::{parse_chat_chunk, StreamingState};
 use crate::client::HttpClient;
 use crate::handlers::target_message_handler;
 use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
@@ -16,10 +17,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Handler for GET /v1/models
 ///
@@ -140,6 +142,15 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
 }
 
 /// Handle a request using the Open Responses adapter
+///
+/// This function implements the full Open Responses adapter flow including tool loop orchestration:
+/// 1. Convert Responses request to Chat Completions request
+/// 2. Forward to upstream
+/// 3. If response requires tool action:
+///    a. Execute tools via ToolExecutor if handled
+///    b. If any tools are unhandled, return to client with requires_action status
+///    c. Add tool results to messages and loop back to step 2
+/// 4. Continue until completion or max iterations reached
 async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     headers: HeaderMap,
@@ -153,7 +164,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     );
 
     // Convert the Responses request to a Chat Completions request
-    let chat_request = match adapter.to_chat_request(&request).await {
+    let mut chat_request = match adapter.to_chat_request(&request).await {
         Ok(req) => req,
         Err(e) => {
             error!(error = %e, "Failed to convert responses request to chat completions");
@@ -167,16 +178,187 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // Check if streaming is requested
     if request.stream == Some(true) {
-        // For streaming, we need different handling
-        // TODO: Implement streaming adapter using StreamingState
-        warn!("Streaming adapter mode not yet implemented, falling back to non-streaming");
+        debug!("Using streaming adapter mode");
+        return handle_streaming_adapter_request(state, headers, request, chat_request).await;
     }
+
+    // Tool loop orchestration for non-streaming requests
+    let max_iterations = adapter.max_iterations();
+    let mut iteration = 0;
+
+    loop {
+        iteration += 1;
+        debug!(iteration = iteration, max = max_iterations, "Tool loop iteration");
+
+        // Serialize the chat request for non-streaming
+        let body_bytes = match serde_json::to_vec(&chat_request) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to serialize chat completions request");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to process request",
+                );
+            }
+        };
+
+        // Forward to Chat Completions endpoint
+        let response =
+            forward_request_raw(state.clone(), headers.clone(), "/v1/chat/completions", body_bytes)
+                .await;
+
+        // Check if the response is successful
+        if !response.status().is_success() {
+            // Pass through error responses
+            return response;
+        }
+
+        // Parse the response body as ChatCompletionResponse
+        let (parts, body) = response.into_parts();
+        let body_bytes = match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) => {
+                error!(error = %e, "Failed to read response body");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
+
+        let chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!(error = %e, "Failed to parse chat completions response");
+                // Log some of the response for debugging
+                if let Ok(text) = std::str::from_utf8(&body_bytes) {
+                    debug!(
+                        response_preview = &text[..text.len().min(500)],
+                        "Response body preview"
+                    );
+                }
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream_error",
+                    "Failed to parse upstream response",
+                );
+            }
+        };
+
+        // Check if the response requires tool action
+        if adapter.requires_tool_action(&chat_response) && iteration < max_iterations {
+            debug!("Response requires tool action");
+
+            // Extract tool calls
+            let tool_calls = adapter.extract_tool_calls(&chat_response);
+            debug!(tool_count = tool_calls.len(), "Extracted tool calls");
+
+            // Execute tool calls
+            let results = adapter.execute_tool_calls(&tool_calls).await;
+
+            // Check if there are unhandled tools
+            if adapter.has_unhandled_tools(&results) {
+                debug!("Some tools are unhandled, returning to client");
+                // Return to client with requires_action status
+                let responses_response =
+                    adapter.to_responses_response(&chat_response, &request.model);
+
+                let response_bytes = match serde_json::to_vec(&responses_response) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!(error = %e, "Failed to serialize responses response");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "Failed to serialize response",
+                        );
+                    }
+                };
+
+                return Response::builder()
+                    .status(parts.status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(response_bytes))
+                    .unwrap_or_else(|_| {
+                        error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "Failed to build response",
+                        )
+                    });
+            }
+
+            // All tools handled - add results to messages and continue loop
+            debug!("All tools handled, continuing loop");
+
+            // Get the assistant message from the response
+            if let Some(choice) = chat_response.choices.first() {
+                adapter
+                    .add_tool_results_to_messages(&mut chat_request.messages, &choice.message, &results);
+            }
+
+            // Continue to next iteration
+            continue;
+        }
+
+        // No tool action required or max iterations reached - return final response
+        let responses_response = adapter.to_responses_response(&chat_response, &request.model);
+
+        info!(
+            response_id = %responses_response.id,
+            status = ?responses_response.status,
+            output_items = responses_response.output.len(),
+            iterations = iteration,
+            "Adapter conversion complete"
+        );
+
+        // Return the converted response
+        let response_bytes = match serde_json::to_vec(&responses_response) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to serialize responses response");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to serialize response",
+                );
+            }
+        };
+
+        return Response::builder()
+            .status(parts.status)
+            .header("content-type", "application/json")
+            .body(Body::from(response_bytes))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to build response",
+                )
+            });
+    }
+}
+
+/// Handle a streaming request using the Open Responses adapter
+///
+/// This function transforms the upstream Chat Completions SSE stream into
+/// Open Responses semantic events using the StreamingState state machine.
+async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
+    state: AppState<T>,
+    headers: HeaderMap,
+    request: ResponsesRequest,
+    mut chat_request: ChatCompletionRequest,
+) -> Response {
+    // Ensure stream is enabled on the chat request
+    chat_request.stream = Some(true);
 
     // Serialize the chat request
     let body_bytes = match serde_json::to_vec(&chat_request) {
         Ok(bytes) => bytes,
         Err(e) => {
-            error!(error = %e, "Failed to serialize chat completions request");
+            error!(error = %e, "Failed to serialize streaming chat completions request");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -190,72 +372,105 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // Check if the response is successful
     if !response.status().is_success() {
-        // Pass through error responses
         return response;
     }
 
-    // Parse the response body as ChatCompletionResponse
+    // Check content type to ensure it's SSE
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !content_type.contains("text/event-stream") {
+        warn!(
+            content_type = content_type,
+            "Expected SSE stream but got different content type"
+        );
+        // Try to handle as non-streaming response
+        return response;
+    }
+
+    // Get the response body as a stream
     let (parts, body) = response.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(e) => {
-            error!(error = %e, "Failed to read response body");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "Failed to read upstream response",
-            );
-        }
-    };
+    let byte_stream = body.into_data_stream();
 
-    let chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
-        Ok(resp) => resp,
-        Err(e) => {
-            error!(error = %e, "Failed to parse chat completions response");
-            // Log some of the response for debugging
-            if let Ok(text) = std::str::from_utf8(&body_bytes) {
-                debug!(response_preview = &text[..text.len().min(500)], "Response body preview");
+    // Create the streaming state
+    let model = request.model.clone();
+
+    // Create a transformed stream that converts Chat Completions chunks to Open Responses events
+    let transformed_stream = async_stream::stream! {
+        let mut state = StreamingState::new(&model);
+        let mut buffer = String::new();
+
+        let mut pinned_stream = std::pin::pin!(byte_stream);
+
+        while let Some(chunk_result) = pinned_stream.next().await {
+            match chunk_result {
+                Ok(bytes) => {
+                    // Append bytes to buffer
+                    if let Ok(text) = std::str::from_utf8(&bytes) {
+                        buffer.push_str(text);
+                    } else {
+                        continue;
+                    }
+
+                    // Process complete SSE events from buffer
+                    while let Some(event_end) = buffer.find("\n\n") {
+                        let event_text = buffer[..event_end].to_string();
+                        buffer = buffer[event_end + 2..].to_string();
+
+                        // Parse SSE event
+                        for line in event_text.lines() {
+                            if let Some(data) = line.strip_prefix("data: ") {
+                                // Check for [DONE] marker
+                                if data.trim() == "[DONE]" {
+                                    trace!("Received [DONE] marker");
+                                    // Finalize and emit completion events
+                                    let final_events = state.finalize();
+                                    for event in final_events {
+                                        yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+                                    }
+                                    continue;
+                                }
+
+                                // Parse as chat completion chunk
+                                if let Some(chunk) = parse_chat_chunk(data) {
+                                    trace!(chunk_id = %chunk.id, "Processing chat chunk");
+                                    let events = state.process_chunk(&chunk);
+                                    for event in events {
+                                        yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "Error reading stream");
+                    break;
+                }
             }
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "upstream_error",
-                "Failed to parse upstream response",
-            );
         }
+
+        // Yield final [DONE] marker for Open Responses format
+        yield Ok::<_, std::io::Error>("data: [DONE]\n\n".to_string().into_bytes());
     };
 
-    // Convert to Responses format
-    let responses_response = adapter.to_responses_response(&chat_response, &request.model);
+    info!(model = %request.model, "Streaming adapter response started");
 
-    info!(
-        response_id = %responses_response.id,
-        status = ?responses_response.status,
-        output_items = responses_response.output.len(),
-        "Adapter conversion complete"
-    );
-
-    // Return the converted response
-    let response_bytes = match serde_json::to_vec(&responses_response) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize responses response");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to serialize response",
-            );
-        }
-    };
-
+    // Build the streaming response
     Response::builder()
         .status(parts.status)
-        .header("content-type", "application/json")
-        .body(Body::from(response_bytes))
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(transformed_stream))
         .unwrap_or_else(|_| {
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "Failed to build response",
+                "Failed to build streaming response",
             )
         })
 }
