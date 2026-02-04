@@ -157,10 +157,10 @@ Strict mode uses a **separate router** with typed handlers that leverage Axum's 
 ```
 
 **Benefits:**
-- Leverages Axum's built-in validation via `Json<T>` extractors
+- Leverages Axum's built-in validation via `Json<T>` extractors (serde deserialization)
 - Unknown paths rejected automatically (no wildcard)
 - Type-safe request handling
-- Can use `axum-valid` or `validator` crate for additional validation
+- Upstream validates further - we just ensure well-formed requests
 
 ### Open Responses Adapter (Not Just Translation)
 
@@ -277,7 +277,7 @@ src/
 
 ### Step 2: Request/Response Schemas
 
-Define request types that Axum's `Json<T>` extractor validates automatically. Use `axum-valid` or `validator` crate for additional validation.
+Define request types that Axum's `Json<T>` extractor validates via serde deserialization. The upstream validates further - we just ensure well-formed JSON that matches the expected schema.
 
 ### Step 3: Response Sanitization
 
@@ -328,9 +328,9 @@ Implement the sub-agent loop:
 }
 ```
 
-### Per-Target Adapter Configuration
+### Per-Target Configuration
 
-When `strict_mode: true`:
+When `strict_mode: true`, Open Responses requests are **validated then passed through** by default. The adapter is opt-in for upstreams that don't support Open Responses natively:
 
 ```json
 {
@@ -340,7 +340,8 @@ When `strict_mode: true`:
     "gpt-4o": {
       "url": "https://api.openai.com/v1",
       "onwards_key": "sk-..."
-      // No adapter config - upstream supports Open Responses natively
+      // Default: validate schema, then passthrough to upstream
+      // Upstream handles /v1/responses natively
     },
     "claude-3-opus": {
       "url": "https://api.anthropic.com",
@@ -353,14 +354,19 @@ When `strict_mode: true`:
 }
 ```
 
+**Strict mode behavior for `/v1/responses`:**
+1. Validate request schema (fail fast with good errors)
+2. If `adapter: true` → use adapter to convert to Chat Completions
+3. If `adapter: false` (default) → passthrough to upstream as-is
+
 ### Mode Comparison
 
 | Feature | `strict_mode: false` | `strict_mode: true` |
 |---------|---------------------|---------------------|
 | Path validation | Any path forwarded | Only known OpenAI paths |
-| Request validation | Passthrough | Schema validation |
+| Request validation | None (passthrough) | Schema validation via serde |
 | Response validation | Optional (`sanitize_response`) | Always validated |
-| Open Responses adapter | Not available | Based on `open_responses.adapter` |
+| `/v1/responses` handling | Passthrough | Validate → passthrough (default) or adapter |
 | Unknown fields | Preserved | Stripped during validation |
 | `body_transform_fn` | Available | Applied after validation |
 
