@@ -3023,4 +3023,364 @@ mod tests {
             assert_eq!(response.status_code(), 200);
         }
     }
+
+    mod openai_responses_api {
+        use super::*;
+
+        /// Test that OpenAI Responses API requests are properly passed through to upstream
+        #[tokio::test]
+        async fn test_openai_responses_api_passthrough() {
+            // Create a target for OpenAI
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4o".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test-key".to_string())
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Mock response for OpenAI Responses API
+            let mock_response = r#"{
+                "id": "resp_123abc",
+                "object": "response",
+                "created_at": 1710000000,
+                "model": "gpt-4o",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_001",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "Hello! How can I help you today?"
+                            }
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 25,
+                    "total_tokens": 35
+                }
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            // Make request to OpenAI Responses API endpoint
+            let request_body = json!({
+                "model": "gpt-4o",
+                "input": "Hello, who are you?",
+                "instructions": "You are a helpful assistant."
+            });
+
+            let response = server.post("/v1/responses").json(&request_body).await;
+
+            // Verify response status
+            assert_eq!(response.status_code(), 200);
+
+            // Verify response body was passed through correctly
+            let response_body: serde_json::Value = response.json();
+            assert_eq!(response_body["id"], "resp_123abc");
+            assert_eq!(response_body["object"], "response");
+            assert_eq!(response_body["model"], "gpt-4o");
+            assert!(response_body["output"].is_array());
+            assert_eq!(response_body["output"][0]["type"], "message");
+            assert_eq!(response_body["output"][0]["role"], "assistant");
+
+            // Verify request was forwarded correctly
+            let requests = mock_client.get_requests();
+            assert_eq!(requests.len(), 1);
+
+            let forwarded_request = &requests[0];
+
+            // Check HTTP method
+            assert_eq!(forwarded_request.method, "POST");
+
+            // Check URL was correctly constructed
+            assert_eq!(
+                forwarded_request.uri,
+                "https://api.openai.com/v1/responses"
+            );
+
+            // Check authorization header was added
+            let auth_header = forwarded_request
+                .headers
+                .iter()
+                .find(|(key, _)| key == "authorization")
+                .map(|(_, value)| value);
+            assert_eq!(auth_header, Some(&"Bearer sk-test-key".to_string()));
+
+            // Check host header
+            let host_header = forwarded_request
+                .headers
+                .iter()
+                .find(|(key, _)| key == "host")
+                .map(|(_, value)| value);
+            assert_eq!(host_header, Some(&"api.openai.com".to_string()));
+
+            // Check request body was forwarded correctly
+            let forwarded_body: serde_json::Value =
+                serde_json::from_slice(&forwarded_request.body).unwrap();
+            assert_eq!(forwarded_body["model"], "gpt-4o");
+            assert_eq!(forwarded_body["input"], "Hello, who are you?");
+            assert_eq!(forwarded_body["instructions"], "You are a helpful assistant.");
+        }
+
+        /// Test that OpenAI Responses API streaming is properly passed through
+        #[tokio::test]
+        async fn test_openai_responses_api_streaming_passthrough() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4o".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test-key".to_string())
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Mock streaming response for OpenAI Responses API
+            let streaming_chunks = vec![
+                r#"event: response.created
+data: {"id":"resp_123","object":"response","status":"in_progress","model":"gpt-4o"}
+
+"#
+                    .to_string(),
+                r#"event: response.output_item.added
+data: {"type":"message","id":"msg_001","role":"assistant"}
+
+"#
+                    .to_string(),
+                r#"event: response.content_part.added
+data: {"type":"output_text","text":""}
+
+"#
+                    .to_string(),
+                r#"event: response.output_text.delta
+data: {"delta":"Hello"}
+
+"#
+                    .to_string(),
+                r#"event: response.output_text.delta
+data: {"delta":"!"}
+
+"#
+                    .to_string(),
+                r#"event: response.completed
+data: {"id":"resp_123","object":"response","status":"completed"}
+
+"#
+                    .to_string(),
+            ];
+
+            let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/responses")
+                .json(&json!({
+                    "model": "gpt-4o",
+                    "input": "Hello!",
+                    "stream": true
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            // Verify streaming content was passed through
+            let body = response.text();
+            assert!(body.contains("response.created"));
+            assert!(body.contains("response.output_text.delta"));
+            assert!(body.contains("response.completed"));
+            assert!(body.contains("Hello"));
+
+            // Verify request was forwarded
+            let requests = mock_client.get_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].uri, "https://api.openai.com/v1/responses");
+
+            let forwarded_body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(forwarded_body["stream"], true);
+        }
+
+        /// Test that OpenAI Responses API with model rewrite works correctly
+        #[tokio::test]
+        async fn test_openai_responses_api_with_model_rewrite() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4o".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test-key".to_string())
+                        .onwards_model("gpt-4o-2024-08-06".to_string()) // Rewrite to specific version
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_response = r#"{
+                "id": "resp_456",
+                "object": "response",
+                "model": "gpt-4o-2024-08-06",
+                "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi!"}]}]
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/responses")
+                .json(&json!({
+                    "model": "gpt-4o",
+                    "input": "Hi!"
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            // Verify the model was rewritten in the forwarded request
+            let requests = mock_client.get_requests();
+            assert_eq!(requests.len(), 1);
+
+            let forwarded_body: serde_json::Value =
+                serde_json::from_slice(&requests[0].body).unwrap();
+            assert_eq!(
+                forwarded_body["model"], "gpt-4o-2024-08-06",
+                "Model should be rewritten to the specific version"
+            );
+        }
+
+        /// Test that OpenAI Responses API error responses are passed through
+        #[tokio::test]
+        async fn test_openai_responses_api_error_passthrough() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4o".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test-key".to_string())
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Mock error response
+            let mock_error = r#"{
+                "error": {
+                    "message": "Invalid request: input is required",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request"
+                }
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::BAD_REQUEST, mock_error);
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/responses")
+                .json(&json!({
+                    "model": "gpt-4o"
+                    // Missing required "input" field
+                }))
+                .await;
+
+            // Verify error status is passed through
+            assert_eq!(response.status_code(), 400);
+
+            // Verify error body is passed through
+            let response_body: serde_json::Value = response.json();
+            assert!(response_body.get("error").is_some());
+            assert_eq!(response_body["error"]["type"], "invalid_request_error");
+        }
+
+        /// Test that OpenAI Responses API with custom headers works
+        #[tokio::test]
+        async fn test_openai_responses_api_preserves_content_type() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4o".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test-key".to_string())
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            let mock_response = r#"{"id": "resp_789", "object": "response", "model": "gpt-4o"}"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/responses")
+                .add_header("content-type", "application/json")
+                .json(&json!({
+                    "model": "gpt-4o",
+                    "input": "test"
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+
+            // Verify content-type was forwarded
+            let requests = mock_client.get_requests();
+            assert_eq!(requests.len(), 1);
+
+            let content_type_header = requests[0]
+                .headers
+                .iter()
+                .find(|(key, _)| key == "content-type")
+                .map(|(_, value)| value);
+            assert_eq!(content_type_header, Some(&"application/json".to_string()));
+        }
+    }
 }
