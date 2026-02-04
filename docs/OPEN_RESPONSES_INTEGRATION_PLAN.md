@@ -43,73 +43,132 @@ Client (any format) → Onwards (extract model, route) → Provider (handles for
 
 The upstream provider determines whether Open Responses is supported. If it is, requests work. If not, the provider returns an error. This is the transparent proxy philosophy.
 
-### Proposed: Strict Mode (New Opt-in Feature)
+### Proposed: Strict Mode as Tower Middleware
 
-Add a new `strict_mode` flag that enables comprehensive request/response validation and translation. This **subsumes and extends** existing `sanitize_response` and `body_transform_fn` functionality.
-
-```
-strict_mode: false (default)     strict_mode: true
-─────────────────────────────    ─────────────────────────────
-• Transparent passthrough        • Path validation
-• Minimal model extraction       • Request schema validation
-• No body parsing               • Response schema validation
-• Provider determines format    • Protocol translation (when needed)
-```
-
-**Strict mode provides:**
-
-1. **Path validation**: Only accept known OpenAI-compatible paths
-   - `/v1/chat/completions`
-   - `/v1/responses`
-   - `/v1/embeddings`
-   - `/v1/models`
-   - (reject unknown paths with 404)
-
-2. **Request schema validation**: Validate request bodies against known schemas
-   - Chat Completions: `messages` array, `model`, etc.
-   - Responses: `input` (string or items), `model`, etc.
-   - Embeddings: `input`, `model`, etc.
-
-3. **Response schema validation**: Enforce strict OpenAI schema compliance
-   - Subsumes existing `sanitize_response` functionality
-   - Remove provider-specific fields
-   - Rewrite model names
-
-4. **Protocol translation** (for `/v1/responses` only):
-   - If upstream supports Open Responses → passthrough
-   - If upstream only supports Chat Completions → translate request/response
-
-### Architecture: Strict Mode Sits Alongside Transparent Mode
+Rather than a parallel code path, strict mode is implemented as a **Tower middleware** that wraps the existing handler:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        Onwards Router                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  strict_mode: false (default)                               │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ • Extract model from body                            │   │
-│  │ • Route to target                                    │   │
-│  │ • Passthrough request/response as bytes              │   │
-│  │ • SSE buffering for streaming                        │   │
-│  │ • (optional) body_transform_fn                       │   │
-│  │ • (optional) sanitize_response per target            │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-│  strict_mode: true (opt-in)                                 │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │ • Validate path against allowed endpoints            │   │
-│  │ • Parse and validate request schema                  │   │
-│  │ • Route to target                                    │   │
-│  │ • Translate if needed (responses → chat completions) │   │
-│  │ • Parse and validate response schema                 │   │
-│  │ • Translate response if needed                       │   │
-│  └─────────────────────────────────────────────────────┘   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                    Request Flow (strict_mode: true)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  Request                                                        │
+│     │                                                           │
+│     ▼                                                           │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              StrictLayer (Tower Middleware)              │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ 1. Validate path (reject unknown)               │    │   │
+│  │  │ 2. Validate request schema                      │    │   │
+│  │  │ 3. Transform request if needed                  │    │   │
+│  │  │    (e.g., /v1/responses → /v1/chat/completions) │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  │                         │                                │   │
+│  │                         ▼                                │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │         Inner Service (existing handler)         │    │   │
+│  │  │  • Extract model                                 │    │   │
+│  │  │  • Route to target                               │    │   │
+│  │  │  • Passthrough to upstream                       │    │   │
+│  │  │  • SSE buffering                                 │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  │                         │                                │   │
+│  │                         ▼                                │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ 4. Transform response if needed                  │    │   │
+│  │  │    (e.g., chat completions → responses format)  │    │   │
+│  │  │ 5. Validate response schema                      │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│     │                                                           │
+│     ▼                                                           │
+│  Response                                                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Key principle**: Strict mode doesn't change the existing transparent behavior. It's an entirely separate code path that users opt into.
+**Benefits of middleware approach:**
+- ✅ No code duplication - inner handler unchanged
+- ✅ Composable with other Tower layers
+- ✅ Easy to enable/disable
+- ✅ Clear separation of concerns
+- ✅ Can be conditionally applied per-route if needed
+
+**Tower implementation sketch:**
+
+```rust
+pub struct StrictLayer {
+    config: StrictConfig,
+}
+
+impl<S> Layer<S> for StrictLayer {
+    type Service = StrictService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StrictService {
+            inner,
+            config: self.config.clone(),
+        }
+    }
+}
+
+impl<S> Service<Request> for StrictService<S>
+where
+    S: Service<Request, Response = Response>,
+{
+    type Response = Response;
+    type Error = S::Error;
+
+    async fn call(&mut self, req: Request) -> Result<Response, Self::Error> {
+        // 1. Validate path
+        let endpoint = validate_path(req.uri().path())?;
+
+        // 2. Validate request schema
+        let (parts, body) = req.into_parts();
+        let validated = validate_request(endpoint, &body)?;
+
+        // 3. Transform if needed (responses → chat completions)
+        let (transformed_body, needs_response_transform) =
+            self.maybe_transform_request(endpoint, validated, &parts)?;
+
+        let req = Request::from_parts(parts, transformed_body);
+
+        // 4. Call inner service (existing handler)
+        let response = self.inner.call(req).await?;
+
+        // 5. Transform response if needed (chat completions → responses)
+        let response = if needs_response_transform {
+            self.transform_response(response).await?
+        } else {
+            response
+        };
+
+        // 6. Validate response schema
+        validate_response(endpoint, &response)?;
+
+        Ok(response)
+    }
+}
+```
+
+**Router construction:**
+
+```rust
+pub fn build_router<T: HttpClient>(state: AppState<T>) -> Router {
+    let base_router = Router::new()
+        .route("/models", get(models_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/{*path}", any(target_message_handler))
+        .with_state(state.clone());
+
+    if state.strict_mode {
+        // Wrap with strict validation middleware
+        base_router.layer(StrictLayer::new(state.strict_config))
+    } else {
+        base_router
+    }
+}
+```
 
 ---
 
@@ -121,74 +180,84 @@ strict_mode: false (default)     strict_mode: true
 
 The wildcard route `/{*path}` already forwards `/v1/responses` to upstreams. If your upstream supports Open Responses, it works. No code changes needed.
 
-### Phase 1: Strict Mode Foundation
+### Phase 1: Strict Mode Middleware Foundation
 
-**Goal**: Add `strict_mode` configuration flag and routing infrastructure.
+**Goal**: Create Tower middleware infrastructure for strict mode.
 
 **New module structure**:
 
 ```
 src/
 ├── strict/
-│   ├── mod.rs              # Strict mode entry point
+│   ├── mod.rs              # StrictLayer, StrictService
 │   ├── validator.rs        # Path and schema validation
 │   ├── schemas/
 │   │   ├── mod.rs
 │   │   ├── chat_completions.rs
 │   │   ├── responses.rs
 │   │   └── embeddings.rs
-│   └── translator.rs       # Protocol translation (Phase 2)
+│   └── translator.rs       # Protocol translation
 ```
 
-**Configuration**:
+**Middleware skeleton**:
 
-```json
+```rust
+// src/strict/mod.rs
+use tower::{Layer, Service};
+
+pub struct StrictLayer {
+    config: StrictConfig,
+}
+
+pub struct StrictService<S> {
+    inner: S,
+    config: StrictConfig,
+}
+
+impl<S> Service<Request<Body>> for StrictService<S>
+where
+    S: Service<Request<Body>, Response = Response<Body>>,
 {
-  "strict_mode": true,  // Global flag, default false
-  "targets": {
-    "gpt-4o": {
-      "url": "https://api.openai.com/v1",
-      "supports_responses_api": true  // Passthrough for /v1/responses
-    },
-    "claude-3": {
-      "url": "https://api.anthropic.com",
-      "supports_responses_api": false  // Translate /v1/responses → /v1/chat/completions
+    type Response = Response<Body>;
+    type Error = S::Error;
+    type Future = StrictFuture<S::Future>;
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        // Middleware logic here
     }
-  }
 }
 ```
 
-**Handler modification**:
+**Router integration**:
 
 ```rust
-pub async fn target_message_handler<T: HttpClient>(
-    State(state): State<AppState<T>>,
-    req: Request,
-) -> Result<Response, OnwardsErrorResponse> {
-    // Check if strict mode is enabled globally
+pub fn build_router<T: HttpClient>(state: AppState<T>) -> Router {
+    let router = Router::new()
+        .route("/models", get(models_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/{*path}", any(target_message_handler))
+        .with_state(state.clone());
+
     if state.strict_mode {
-        return strict::handle_request(state, req).await;
+        router.layer(StrictLayer::new(state.strict_config.clone()))
+    } else {
+        router
     }
-
-    // Existing transparent passthrough logic (unchanged)
-    // ...
 }
 ```
 
-### Phase 2: Path and Request Validation
+### Phase 2: Path Validation
 
-**Goal**: In strict mode, validate paths and request schemas.
-
-**Allowed paths**:
+**Goal**: Middleware rejects unknown paths in strict mode.
 
 ```rust
-const STRICT_MODE_PATHS: &[&str] = &[
-    "/v1/chat/completions",
-    "/v1/responses",
-    "/v1/embeddings",
-    "/v1/models",
-    "/models",
-];
+#[derive(Debug, Clone, Copy)]
+pub enum EndpointType {
+    ChatCompletions,
+    Responses,
+    Embeddings,
+    Models,
+}
 
 fn validate_path(path: &str) -> Result<EndpointType, OnwardsErrorResponse> {
     match path {
@@ -201,18 +270,31 @@ fn validate_path(path: &str) -> Result<EndpointType, OnwardsErrorResponse> {
 }
 ```
 
-**Request validation**:
+### Phase 3: Request Schema Validation
+
+**Goal**: Middleware validates request bodies against known schemas.
 
 ```rust
-fn validate_request(endpoint: EndpointType, body: &[u8]) -> Result<ValidatedRequest, OnwardsErrorResponse> {
+pub enum ValidatedRequest {
+    ChatCompletion(ChatCompletionRequest),
+    Responses(ResponsesRequest),
+    Embeddings(EmbeddingsRequest),
+    Models, // GET, no body
+}
+
+fn validate_request(
+    endpoint: EndpointType,
+    body: &[u8],
+) -> Result<ValidatedRequest, OnwardsErrorResponse> {
     match endpoint {
         EndpointType::ChatCompletions => {
-            let req: ChatCompletionRequest = serde_json::from_slice(body)?;
-            // Validate required fields, types, etc.
+            let req: ChatCompletionRequest = serde_json::from_slice(body)
+                .map_err(|e| OnwardsErrorResponse::bad_request(e.to_string()))?;
             Ok(ValidatedRequest::ChatCompletion(req))
         }
         EndpointType::Responses => {
-            let req: ResponsesRequest = serde_json::from_slice(body)?;
+            let req: ResponsesRequest = serde_json::from_slice(body)
+                .map_err(|e| OnwardsErrorResponse::bad_request(e.to_string()))?;
             Ok(ValidatedRequest::Responses(req))
         }
         // ...
@@ -220,103 +302,99 @@ fn validate_request(endpoint: EndpointType, body: &[u8]) -> Result<ValidatedRequ
 }
 ```
 
-### Phase 3: Response Validation (Subsumes `sanitize_response`)
+### Phase 4: Response Validation
 
-**Goal**: In strict mode, validate and sanitize all responses.
+**Goal**: Middleware validates and sanitizes responses.
 
-This replaces the per-target `sanitize_response` flag with automatic validation:
+This reuses and extends the existing `ResponseSanitizer`:
 
 ```rust
 fn validate_response(
     endpoint: EndpointType,
+    headers: &HeaderMap,
     body: &[u8],
     original_model: Option<&str>,
 ) -> Result<Bytes, OnwardsErrorResponse> {
     match endpoint {
         EndpointType::ChatCompletions => {
-            // Reuse existing ResponseSanitizer logic
             let sanitizer = ResponseSanitizer { original_model };
-            sanitizer.sanitize_non_streaming(body)
+            sanitizer.sanitize("/v1/chat/completions", headers, body)
         }
         EndpointType::Responses => {
-            // New: Open Responses sanitizer
             let sanitizer = OpenResponsesSanitizer { original_model };
-            sanitizer.sanitize(body)
+            sanitizer.sanitize(headers, body)
         }
         // ...
     }
 }
 ```
 
-### Phase 4: Protocol Translation (Responses ↔ Chat Completions)
+### Phase 5: Protocol Translation
 
-**Goal**: In strict mode, translate `/v1/responses` requests for upstreams that don't support it.
-
-**Per-target configuration**:
+**Goal**: When `open_responses.translate: true`, transform requests/responses.
 
 ```rust
-pub struct Target {
-    // ... existing fields ...
-
-    /// Does this upstream support /v1/responses natively?
-    /// Only relevant when strict_mode is enabled.
-    #[serde(default)]
-    pub supports_responses_api: bool,
-}
-```
-
-**Translation logic**:
-
-```rust
-async fn handle_responses_request(
-    state: &AppState,
-    target: &Target,
-    request: ResponsesRequest,
-) -> Result<Response, OnwardsErrorResponse> {
-    if target.supports_responses_api {
-        // Passthrough - serialize back to bytes and forward
-        forward_as_responses(state, target, request).await
-    } else {
-        // Translate to chat completions
-        let chat_request = translate_to_chat_completions(&request)?;
-        let chat_response = forward_as_chat_completions(state, target, chat_request).await?;
-        let responses_response = translate_from_chat_completions(&chat_response)?;
-        Ok(responses_response)
-    }
-}
-```
-
-### Phase 5: Streaming Translation
-
-**Goal**: Handle streaming responses in translation mode.
-
-```rust
-pub struct StreamingTranslator {
-    direction: TranslationDirection,
-    response_id: String,
-    sequence: u64,
-}
-
-enum TranslationDirection {
-    ChatToResponses,  // Upstream sent chat.completion.chunk, client expects response.*
-    PassThrough,      // No translation needed
-}
-
-impl StreamingTranslator {
-    fn translate_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, String> {
-        match self.direction {
-            TranslationDirection::PassThrough => Ok(Bytes::copy_from_slice(chunk)),
-            TranslationDirection::ChatToResponses => {
-                // Parse chat.completion.chunk
-                // Emit response.output_text.delta events
-                self.translate_chat_to_responses(chunk)
+impl<S> StrictService<S> {
+    fn maybe_transform_request(
+        &self,
+        endpoint: EndpointType,
+        validated: ValidatedRequest,
+        target: &Target,
+    ) -> Result<(Bytes, bool), OnwardsErrorResponse> {
+        match (endpoint, &validated) {
+            (EndpointType::Responses, ValidatedRequest::Responses(req))
+                if target.open_responses.translate =>
+            {
+                // Transform to chat completions
+                let chat_req = translator::responses_to_chat_completions(req)?;
+                let body = serde_json::to_vec(&chat_req)?;
+                Ok((Bytes::from(body), true)) // true = needs response transform
+            }
+            _ => {
+                // No transformation needed
+                let body = serde_json::to_vec(&validated)?;
+                Ok((Bytes::from(body), false))
             }
         }
     }
+
+    async fn maybe_transform_response(
+        &self,
+        response: Response,
+        needs_transform: bool,
+    ) -> Result<Response, OnwardsErrorResponse> {
+        if !needs_transform {
+            return Ok(response);
+        }
+
+        // Transform chat completions response back to responses format
+        translator::chat_completions_to_responses(response).await
+    }
 }
 ```
 
-### Phase 6: Advanced Features (Future)
+### Phase 6: Streaming Translation
+
+**Goal**: Handle streaming responses in translation mode.
+
+The middleware wraps the response body stream:
+
+```rust
+fn wrap_streaming_response(
+    response: Response,
+    translator: StreamingTranslator,
+) -> Response {
+    let (parts, body) = response.into_parts();
+
+    let translated_body = body.map(move |chunk| {
+        translator.translate_chunk(chunk)
+    });
+
+    Response::from_parts(parts, Body::wrap_stream(translated_body))
+}
+```
+
+### Phase 7: Advanced Features (Future)
 
 - Sub-agent loop orchestration
 - Reasoning trace normalization
@@ -349,19 +427,35 @@ When `strict_mode: true`, additional per-target options become relevant:
   "targets": {
     "gpt-4o": {
       "url": "https://api.openai.com/v1",
-      "onwards_key": "sk-...",
-      "supports_responses_api": true   // Passthrough /v1/responses
+      "onwards_key": "sk-..."
+      // No open_responses config needed - upstream supports it natively
     },
     "claude-3-opus": {
       "url": "https://api.anthropic.com",
       "onwards_key": "sk-...",
-      "supports_responses_api": false  // Translate /v1/responses → chat completions
+      "open_responses": {
+        "translate": true  // Translate /v1/responses → /v1/chat/completions
+      }
     },
     "local-llama": {
       "url": "http://localhost:8000",
-      "supports_responses_api": false
+      "open_responses": {
+        "translate": true
+      }
     }
   }
+}
+```
+
+**Per-target `open_responses` config:**
+
+```rust
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpenResponsesConfig {
+    /// When true, translate /v1/responses requests to /v1/chat/completions
+    /// and translate responses back. Only applies when strict_mode is enabled.
+    #[serde(default)]
+    pub translate: bool,
 }
 ```
 
@@ -372,7 +466,7 @@ When `strict_mode: true`, additional per-target options become relevant:
 | Path validation | ❌ Any path forwarded | ✅ Only known OpenAI paths |
 | Request validation | ❌ Passthrough | ✅ Schema validation |
 | Response validation | ⚠️ Optional (`sanitize_response`) | ✅ Always validated |
-| Protocol translation | ❌ Not available | ✅ Based on `supports_responses_api` |
+| Protocol translation | ❌ Not available | ✅ Based on `open_responses.translate` |
 | Unknown fields | ✅ Preserved | ❌ Stripped during validation |
 | Performance | ✅ Optimal | ⚠️ Deserialization overhead |
 
@@ -389,8 +483,8 @@ Existing deployments with `strict_mode: false` (default) are **unchanged**.
 
 ## API Compatibility Matrix
 
-| Feature | Transparent (default) | Strict + Native | Strict + Translate |
-|---------|----------------------|-----------------|-------------------|
+| Feature | Transparent (default) | Strict (passthrough) | Strict + `translate: true` |
+|---------|----------------------|---------------------|---------------------------|
 | Basic text generation | ✅ Passthrough | ✅ Validated | ✅ Translated |
 | Tool/function calling | ✅ Passthrough | ✅ Validated | ⚠️ External only |
 | Streaming | ✅ Passthrough | ✅ Validated | ⚠️ Translated |
@@ -412,31 +506,32 @@ Existing deployments with `strict_mode: false` (default) are **unchanged**.
 
 **Deliverable**: Users can use `/v1/responses` today if their upstream supports it.
 
-### Sprint 1: Strict Mode Infrastructure (1 week)
+### Sprint 1: Tower Middleware Foundation (1 week)
 - [ ] Add `strict_mode` flag to config
-- [ ] Create `src/strict/` module structure
-- [ ] Add routing branch in `target_message_handler`
+- [ ] Create `src/strict/mod.rs` with `StrictLayer` and `StrictService`
+- [ ] Integrate layer conditionally in `build_router()`
 - [ ] Implement path validation (reject unknown paths)
 
-**Deliverable**: `strict_mode: true` rejects unknown paths.
+**Deliverable**: `strict_mode: true` wraps handler and rejects unknown paths.
 
 ### Sprint 2: Request/Response Schemas (1-2 weeks)
 - [ ] Define schemas for chat completions, responses, embeddings
-- [ ] Implement request validation
-- [ ] Implement response validation (migrate from `ResponseSanitizer`)
-- [ ] Add `supports_responses_api` target option
+- [ ] Implement request validation in middleware
+- [ ] Implement response validation (reuse/extend `ResponseSanitizer`)
+- [ ] Add `open_responses` target config struct
 
 **Deliverable**: Full request/response validation in strict mode.
 
 ### Sprint 3: Protocol Translation (1-2 weeks)
 - [ ] Implement Responses → Chat Completions request translation
 - [ ] Implement Chat Completions → Responses response translation
+- [ ] Wire up `open_responses.translate` config
 - [ ] Non-streaming end-to-end working
 
 **Deliverable**: `/v1/responses` works with Chat Completions-only upstreams.
 
 ### Sprint 4: Streaming Translation (1 week)
-- [ ] Implement streaming chunk translation
+- [ ] Implement streaming body wrapper
 - [ ] Handle semantic event generation
 - [ ] Test with various providers
 
@@ -485,29 +580,44 @@ npx ts-node bin/compliance-test.ts --endpoint http://localhost:8080/v1/responses
 
 The existing wildcard route `/{*path}` forwards `/v1/responses` today. No changes needed for basic Open Responses support with compliant upstreams.
 
-### 2. Strict Mode is Separate, Not Incremental
+### 2. Strict Mode as Middleware, Not Parallel Code Path
 
-Strict mode is an entirely different code path, not a modification of transparent mode:
+Strict mode is implemented as a Tower middleware that **wraps** the existing handler:
 
 ```
-strict_mode: false → existing target_message_handler (unchanged)
-strict_mode: true  → new strict::handle_request
+strict_mode: false → request → target_message_handler → response
+strict_mode: true  → request → StrictLayer → target_message_handler → StrictLayer → response
 ```
 
 This ensures:
-- ✅ Existing deployments unaffected
-- ✅ Clear separation of concerns
-- ✅ Strict mode can evolve independently
-- ✅ Easy to disable if issues arise
+- ✅ No code duplication
+- ✅ Existing handler logic unchanged
+- ✅ Composable with other middleware
+- ✅ Clear request/response transformation points
+- ✅ Easy to disable (just remove the layer)
 
 ### 3. Strict Mode Subsumes Existing Validation Features
 
 When `strict_mode: true`:
-- `sanitize_response` → always on (subsumed)
+- `sanitize_response` → always on (subsumed by response validation)
 - `body_transform_fn` → replaced by schema validation
 - Path validation → always on (new)
 
 This avoids configuration complexity and ensures consistent behavior.
+
+### 4. Translation via `open_responses.translate`
+
+Per-target translation is explicit:
+
+```json
+{
+  "open_responses": {
+    "translate": true  // Transform /v1/responses ↔ /v1/chat/completions
+  }
+}
+```
+
+This makes it clear what's happening - the middleware transforms the request before passing to the inner handler, then transforms the response on the way back.
 
 ---
 
