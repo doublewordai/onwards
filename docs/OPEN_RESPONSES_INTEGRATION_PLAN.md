@@ -2,32 +2,119 @@
 
 ## Executive Summary
 
-This document outlines a plan for integrating the [Open Responses specification](https://github.com/openresponses/openresponses) into the Onwards LLM router. The Open Responses spec is an open-source standard for multi-provider, interoperable LLM interfaces that supports agentic workloads with tool calling, reasoning traces, and semantic streaming.
+This document outlines a plan for enhanced [Open Responses specification](https://github.com/openresponses/openresponses) support in the Onwards LLM router.
+
+**Current state**: Open Responses passthrough already works today via the wildcard route. If your upstream supports `/v1/responses`, it works with no changes.
+
+**This plan adds**: A `strict_mode` option that provides schema validation, protocol translation (for upstreams that only support Chat Completions), and extensibility traits for stateful features like `previous_response_id` and server-side tool execution.
 
 ## Background
 
 ### Current Onwards Architecture
 
-Onwards is a Rust-based LLM gateway built around the **OpenAI Chat Completions API** (`/v1/chat/completions`). Key characteristics:
+Onwards is a Rust-based **transparent LLM proxy** that routes requests to upstream providers based on the `model` field. Key characteristics:
 
-- **Request flow**: Client → Onwards → Provider (OpenAI-compatible)
-- **Data model**: Messages array with role/content structure
-- **Streaming**: Raw SSE text deltas
-- **Transformations**: Model rewriting, response sanitization, body transforms
+- **Transparent passthrough**: Requests forwarded as-is via wildcard route `/{*path}`
+- **Minimal parsing**: Only the `model` field is extracted for routing decisions
+- **Protocol agnostic**: Works with any endpoint the upstream supports, including `/v1/responses`
+- **Optional transformations**: Model rewriting, response sanitization, body transforms (all opt-in)
 - **Load balancing**: Weighted random / priority selection across provider pools
+- **SSE buffering**: Handles incomplete JSON chunks in streaming responses
+
+**Current state**: `/v1/responses` already works today if the upstream provider supports it. No code changes required for basic Open Responses passthrough.
 
 ### Open Responses Specification
 
-Open Responses extends the OpenAI Responses API as an open standard. Key differences from Chat Completions:
+[Open Responses](https://openresponses.org) is an open-source specification for multi-provider, interoperable LLM interfaces. Initiated by OpenAI (March 2025) and developed with the open-source community (backed by Hugging Face), it extends OpenAI's Responses API as an open standard designed for **agentic workloads**.
+
+#### Why Open Responses?
+
+The Chat Completions API was designed for turn-based conversations. As LLM applications evolved toward autonomous agents that reason, plan, and act, limitations emerged:
+
+- **Tool loops**: Chat Completions requires clients to manage tool execution loops manually
+- **Reasoning visibility**: No standard way to expose model reasoning/thinking
+- **Streaming semantics**: Raw text deltas don't convey structured meaning
+- **State management**: Clients must resend full conversation history each turn
+
+Open Responses addresses these gaps with purpose-built primitives for agentic systems.
+
+#### Core Concepts
+
+**Items as the context unit**: Instead of a flat messages array, Open Responses uses typed Items with explicit state machines:
+
+```json
+{
+  "input": [
+    { "type": "message", "role": "user", "content": "Book me a flight to Paris" },
+    { "type": "function_call_output", "call_id": "call_123", "output": "{...}" }
+  ]
+}
+```
+
+**Semantic streaming events**: Instead of raw text deltas, streams emit typed events:
+
+```
+event: response.output_item.added
+data: {"type": "message", "id": "item_0", ...}
+
+event: response.output_text.delta
+data: {"item_id": "item_0", "delta": "Hello", "sequence_number": 1}
+
+event: response.output_item.done
+data: {"type": "message", "id": "item_0", "status": "completed", ...}
+```
+
+**Provider-managed tool loops**: The provider can execute tools server-side and continue generation:
+
+```json
+{
+  "model": "gpt-4o",
+  "input": "What's the weather in Paris?",
+  "tools": [{"type": "function", "name": "get_weather", ...}],
+  "tool_choice": "auto"
+}
+// Provider executes get_weather internally, returns final response
+```
+
+**Reasoning traces**: Structured access to model thinking:
+
+```json
+{
+  "output": [
+    {
+      "type": "reasoning",
+      "content": "User wants weather info...",      // Raw traces (open models)
+      "encrypted_content": "...",                   // Encrypted (proprietary)
+      "summary": "Determined user location..."      // Always available
+    },
+    {
+      "type": "message",
+      "content": "The weather in Paris is..."
+    }
+  ]
+}
+```
+
+**Stateful conversations** (optional): Reference previous responses instead of resending context:
+
+```json
+{
+  "previous_response_id": "resp_abc123",
+  "input": "What about tomorrow?"
+}
+```
+
+#### Comparison with Chat Completions
 
 | Aspect | Chat Completions | Open Responses |
 |--------|------------------|----------------|
 | **Endpoint** | `/v1/chat/completions` | `/v1/responses` |
-| **Context unit** | Messages array | Items array |
-| **Streaming** | Raw text deltas | Semantic events |
-| **State** | Stateless | Optional state via `previous_response_id` |
+| **Context unit** | Messages array | Items array (typed, with state) |
+| **Streaming** | Raw text deltas (`chat.completion.chunk`) | Semantic events (`response.*`) |
+| **State** | Stateless (client sends full history) | Optional via `previous_response_id` |
 | **Tool loops** | Client-managed | Provider-managed (sub-agent loops) |
 | **Reasoning** | Not exposed | `content`, `encrypted_content`, `summary` |
+| **Request mapping** | 1:1 | 1:N (tool loops may require multiple LLM calls) |
 
 ---
 
