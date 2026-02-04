@@ -33,98 +33,95 @@ Open Responses extends the OpenAI Responses API as an open standard. Key differe
 
 ## Integration Strategy
 
-### Option A: Protocol Translation Layer (Recommended)
+### Architectural Constraint: No Body Serialization by Default
 
-Add a bidirectional translation layer that converts between Open Responses and Chat Completions formats, allowing Onwards to:
+Onwards is designed as a **transparent proxy** that avoids deserializing request/response bodies. The current approach:
 
-1. Accept Open Responses requests from clients
-2. Route to existing Chat Completions providers
-3. Translate responses back to Open Responses format
+1. **Minimal extraction**: Only the `model` field is extracted for routing (via lightweight `ExtractedModel`)
+2. **Model rewriting via `serde_json::Value`**: Preserves all fields without full schema definitions
+3. **Opt-in sanitization**: Response sanitization (`sanitize_response: true`) is the only feature that does full deserialization, and it's per-target opt-in
 
-**Pros**: Leverages existing provider ecosystem, minimal provider changes
-**Cons**: Some features (sub-agent loops, reasoning) require provider support
+This philosophy prioritizes:
+- Performance (no unnecessary parsing)
+- Flexibility (unknown fields pass through)
+- Provider compatibility (doesn't impose schema requirements)
 
-### Option B: Native Open Responses Passthrough
+### Option A: Native Passthrough (Recommended Default)
 
-Add native routing for Open Responses requests to providers that support the spec natively.
+Add `/v1/responses` endpoint that routes directly to providers supporting Open Responses natively:
 
-**Pros**: Full feature support with compliant providers
-**Cons**: Limited to providers implementing Open Responses
+```
+Client (Open Responses) → Onwards → Provider (Open Responses)
+```
 
-### Option C: Hybrid Approach (Recommended for Production)
+**Behavior**:
+- Extract `model` field from request body (same minimal extraction as chat completions)
+- Route to target based on model name
+- Pass request/response through unchanged as bytes
+- SSE buffering for streaming (already implemented)
 
-Combine both options:
-- Native passthrough for Open Responses-compliant providers
-- Translation layer for Chat Completions-only providers
-- Automatic detection/routing based on provider capabilities
+**Pros**: Maintains transparent proxy philosophy, zero schema maintenance
+**Cons**: Only works with Open Responses-compliant providers
+
+### Option B: Strict Mode Translation (Opt-in)
+
+Add opt-in `strict_mode` or `translate_responses` flag that enables protocol translation:
+
+```
+Client (Open Responses) → Onwards (translate) → Provider (Chat Completions)
+```
+
+**Behavior**:
+- When enabled: Full deserialization, protocol translation, re-serialization
+- When disabled: Passthrough (Option A behavior)
+- Follows same pattern as existing `sanitize_response` opt-in
+
+**Pros**: Enables Open Responses clients with legacy providers
+**Cons**: Requires schema maintenance, loses unknown fields
+
+### Option C: Hybrid Routing (Recommended for Production)
+
+Combine both approaches with automatic detection:
+
+```json
+{
+  "targets": {
+    "gpt-4o": {
+      "url": "https://api.openai.com/v1",
+      "open_responses": {
+        "mode": "native"           // passthrough, provider supports it
+      }
+    },
+    "claude-3": {
+      "url": "https://api.anthropic.com",
+      "open_responses": {
+        "mode": "translate"        // opt-in translation
+      }
+    },
+    "local-model": {
+      "url": "http://localhost:8000",
+      "open_responses": {
+        "mode": "disabled"         // no /v1/responses support
+      }
+    }
+  }
+}
+```
+
+**Routing logic**:
+1. `/v1/responses` request arrives
+2. Extract model, look up target
+3. If `mode: native` → passthrough
+4. If `mode: translate` → deserialize, convert to chat completions, forward, convert response back
+5. If `mode: disabled` → return 404 or error
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Core Data Models
+### Phase 1: Native Passthrough (Minimal Change)
 
-**Goal**: Define Rust types for Open Responses request/response structures.
-
-**New files**:
-```
-src/
-├── open_responses/
-│   ├── mod.rs              # Module root
-│   ├── models.rs           # Request/response types
-│   ├── items.rs            # Item types (message, function_call, reasoning)
-│   └── streaming.rs        # Streaming event types
-```
-
-**Key types to implement**:
-
-```rust
-// Request structure
-pub struct CreateResponseRequest {
-    pub model: String,
-    pub input: Input,                           // String or Vec<InputItem>
-    pub previous_response_id: Option<String>,
-    pub tools: Option<Vec<Tool>>,
-    pub tool_choice: Option<ToolChoice>,
-    pub max_tool_calls: Option<u32>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub max_output_tokens: Option<u32>,
-    pub stream: Option<bool>,
-    pub reasoning: Option<ReasoningConfig>,
-    pub metadata: Option<HashMap<String, String>>,
-}
-
-// Response structure
-pub struct ResponseResource {
-    pub id: String,
-    pub object: String,                         // "response"
-    pub created_at: u64,
-    pub completed_at: Option<u64>,
-    pub status: ResponseStatus,                 // completed, in_progress, incomplete, failed
-    pub model: String,
-    pub output: Vec<OutputItem>,
-    pub usage: Option<Usage>,
-    pub reasoning: Option<ReasoningOutput>,
-    pub error: Option<ResponseError>,
-}
-
-// Item types
-pub enum InputItem {
-    Message(InputMessage),
-    FunctionCallOutput(FunctionCallOutput),
-}
-
-pub enum OutputItem {
-    Message(OutputMessage),
-    FunctionCall(FunctionCall),
-    Reasoning(ReasoningItem),
-}
-```
-
-### Phase 2: Endpoint Registration
-
-**Goal**: Add `/v1/responses` endpoint to the Axum router.
+**Goal**: Add `/v1/responses` endpoint that routes to providers with zero body parsing beyond model extraction.
 
 **Changes to `lib.rs`**:
 
@@ -133,191 +130,162 @@ pub fn build_router<T: HttpClient>(state: AppState<T>) -> Router {
     Router::new()
         .route("/v1/models", get(handlers::models))
         .route("/v1/chat/completions", any(handlers::target_message_handler))
-        // NEW: Open Responses endpoint
-        .route("/v1/responses", post(handlers::open_responses_handler))
+        // NEW: Open Responses endpoint - reuses existing handler
+        .route("/v1/responses", any(handlers::target_message_handler))
         .fallback(any(handlers::target_message_handler))
         .with_state(state)
 }
 ```
 
-### Phase 3: Request Translation (Open Responses → Chat Completions)
+That's it for Phase 1. The existing `target_message_handler` already:
+- Extracts `model` from JSON body (works for Open Responses format too)
+- Routes to the correct target
+- Handles SSE buffering
+- Applies rate limiting and auth
 
-**Goal**: Convert incoming Open Responses requests to Chat Completions format for routing to existing providers.
+**No new types needed** - bodies pass through as bytes.
 
-**Translation logic**:
+### Phase 2: Configuration for Open Responses Mode
+
+**Goal**: Allow per-target configuration for how to handle `/v1/responses` requests.
+
+**New config options in `target.rs`**:
 
 ```rust
-impl From<CreateResponseRequest> for ChatCompletionRequest {
-    fn from(req: CreateResponseRequest) -> Self {
-        ChatCompletionRequest {
-            model: req.model,
-            messages: items_to_messages(req.input),
-            tools: req.tools.map(convert_tools),
-            tool_choice: req.tool_choice,
-            temperature: req.temperature,
-            top_p: req.top_p,
-            max_tokens: req.max_output_tokens,
-            stream: req.stream,
-            // Note: reasoning config not supported by most providers
-        }
-    }
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenResponsesMode {
+    #[default]
+    Native,      // Passthrough to provider
+    Translate,   // Convert to/from chat completions (strict mode)
+    Disabled,    // Return 404 for /v1/responses
 }
 
-fn items_to_messages(input: Input) -> Vec<Message> {
-    match input {
-        Input::Text(s) => vec![Message::user(s)],
-        Input::Items(items) => items.into_iter().map(item_to_message).collect(),
-    }
+pub struct Target {
+    // ... existing fields ...
+
+    /// How to handle /v1/responses requests for this target
+    #[serde(default)]
+    pub open_responses_mode: OpenResponsesMode,
 }
 ```
 
-### Phase 4: Response Translation (Chat Completions → Open Responses)
-
-**Goal**: Convert Chat Completions responses back to Open Responses format.
+**Handler modification**:
 
 ```rust
-impl From<ChatCompletionResponse> for ResponseResource {
-    fn from(resp: ChatCompletionResponse) -> Self {
-        ResponseResource {
-            id: format!("resp_{}", resp.id),
-            object: "response".to_string(),
-            created_at: resp.created,
-            completed_at: Some(resp.created),
-            status: ResponseStatus::Completed,
-            model: resp.model,
-            output: choices_to_items(resp.choices),
-            usage: resp.usage.map(convert_usage),
-            reasoning: None,
-            error: None,
+// In target_message_handler, after routing:
+if path.contains("/v1/responses") {
+    match target.open_responses_mode {
+        OpenResponsesMode::Native => { /* passthrough, current behavior */ }
+        OpenResponsesMode::Translate => { /* Phase 3 */ }
+        OpenResponsesMode::Disabled => {
+            return Err(OnwardsErrorResponse::not_found("Open Responses not supported for this target"));
         }
     }
 }
 ```
 
-### Phase 5: Semantic Streaming Events
+### Phase 3: Strict Mode Translation (Opt-in Only)
 
-**Goal**: Transform raw SSE deltas into Open Responses semantic events.
+**Goal**: When `open_responses_mode: translate` is set, convert between formats.
 
-**Event types to support**:
+**New module** (only loaded when translation is needed):
 
-```rust
-pub enum StreamingEvent {
-    ResponseCreated(ResponseResource),
-    ResponseInProgress,
-    OutputItemAdded { item_id: String, item: OutputItem },
-    OutputTextDelta { item_id: String, delta: String },
-    OutputItemDone { item_id: String, item: OutputItem },
-    ResponseCompleted(ResponseResource),
-    ResponseFailed { error: ResponseError },
-}
+```
+src/
+├── open_responses/
+│   ├── mod.rs              # Feature-gated module
+│   ├── translator.rs       # Bidirectional translation
+│   └── types.rs            # Minimal types for translation
 ```
 
-**Streaming transformer**:
+**Key design principles for translation**:
+
+1. **Lenient parsing** (like response sanitizer):
+   ```rust
+   #[derive(Deserialize)]
+   struct LenientOpenResponsesRequest {
+       model: String,
+       input: serde_json::Value,  // Don't fully parse, just transform
+       #[serde(flatten)]
+       other: HashMap<String, serde_json::Value>,  // Preserve unknown fields
+   }
+   ```
+
+2. **Minimal transformation**:
+   ```rust
+   fn translate_request(body: &[u8]) -> Result<Bytes, String> {
+       let req: LenientOpenResponsesRequest = serde_json::from_slice(body)?;
+
+       // Convert input to messages array
+       let messages = input_to_messages(&req.input)?;
+
+       // Build chat completion request, preserving other fields
+       let mut chat_req = req.other;
+       chat_req.insert("messages".into(), messages);
+       chat_req.insert("model".into(), req.model.into());
+
+       Ok(Bytes::from(serde_json::to_vec(&chat_req)?))
+   }
+   ```
+
+3. **Response transformation follows existing pattern**:
+   - Use `ResponseTransformFn` hook
+   - Apply only when `open_responses_mode: translate`
+   - Streaming: transform SSE chunks
+   - Non-streaming: buffer and transform
+
+### Phase 4: Streaming Event Translation (Strict Mode Only)
+
+**Goal**: Transform Chat Completions SSE deltas into Open Responses semantic events.
+
+**Only applies when `translate` mode is active**:
 
 ```rust
-pub struct OpenResponsesStreamTransformer {
+pub struct StreamingTranslator {
     response_id: String,
-    item_counter: u32,
-    current_item: Option<PartialItem>,
+    sequence: u64,
 }
 
-impl OpenResponsesStreamTransformer {
-    pub fn transform_chunk(&mut self, chunk: ChatCompletionChunk) -> Vec<StreamingEvent> {
-        let mut events = Vec::new();
+impl StreamingTranslator {
+    /// Transform a chat.completion.chunk into response.* events
+    pub fn translate_chunk(&mut self, chunk: &[u8]) -> Result<Bytes, String> {
+        // Parse minimally
+        let parsed: serde_json::Value = serde_json::from_slice(chunk)?;
 
-        for choice in chunk.choices {
-            if let Some(delta) = choice.delta {
-                // Convert delta to semantic events
-                if let Some(content) = delta.content {
-                    events.push(StreamingEvent::OutputTextDelta {
-                        item_id: self.current_item_id(),
-                        delta: content,
-                    });
-                }
-                if let Some(tool_calls) = delta.tool_calls {
-                    // Handle tool call deltas
-                }
-            }
-            if choice.finish_reason.is_some() {
-                events.push(StreamingEvent::OutputItemDone { ... });
-            }
-        }
+        // Generate semantic events
+        let events = vec![
+            self.make_delta_event(&parsed)?,
+        ];
 
-        events
+        // Format as SSE
+        Ok(self.format_sse_events(&events))
     }
 }
 ```
 
-### Phase 6: Provider Capability Detection
+### Phase 5: Sub-Agent Loop Orchestration (Advanced, Strict Mode)
 
-**Goal**: Detect whether a provider supports Open Responses natively vs requiring translation.
+**Goal**: For providers without native tool loops, orchestrate client-side.
 
-**Configuration extension**:
-
-```json
-{
-  "targets": {
-    "gpt-4": {
-      "url": "https://api.openai.com",
-      "onwards_key": "sk-...",
-      "capabilities": {
-        "open_responses": true,
-        "reasoning": true,
-        "sub_agent_loops": true
-      }
-    },
-    "claude-3": {
-      "url": "https://api.anthropic.com",
-      "onwards_key": "sk-...",
-      "capabilities": {
-        "open_responses": false
-      }
-    }
-  }
-}
-```
-
-### Phase 7: Sub-Agent Loop Support (Advanced)
-
-**Goal**: For providers that don't support sub-agent loops natively, implement client-side loop orchestration.
+**Only relevant for `translate` mode with tool-calling requests**:
 
 ```rust
-pub async fn execute_with_tool_loop(
-    client: &impl HttpClient,
-    mut request: CreateResponseRequest,
-    tools: &[Tool],
+/// Orchestrates tool loops for providers that don't support them natively
+pub async fn orchestrate_tool_loop<T: HttpClient>(
+    client: &T,
+    target: &Target,
+    original_request: Bytes,
     max_iterations: u32,
-) -> Result<ResponseResource, Error> {
-    let mut iteration = 0;
-    let mut accumulated_items = Vec::new();
+) -> Result<Response, Error> {
+    // This is complex and requires full deserialization
+    // Only enabled when:
+    // 1. open_responses_mode: translate
+    // 2. Request contains tools
+    // 3. Provider doesn't support native loops
 
-    loop {
-        let response = send_request(client, &request).await?;
-        accumulated_items.extend(response.output.clone());
-
-        // Check for tool calls in output
-        let tool_calls: Vec<_> = response.output.iter()
-            .filter_map(|item| match item {
-                OutputItem::FunctionCall(fc) => Some(fc),
-                _ => None,
-            })
-            .collect();
-
-        if tool_calls.is_empty() || iteration >= max_iterations {
-            return Ok(ResponseResource {
-                output: accumulated_items,
-                ..response
-            });
-        }
-
-        // Execute tools and add results to input
-        for tool_call in tool_calls {
-            let result = execute_tool(tool_call, tools).await?;
-            request.input.push(InputItem::FunctionCallOutput(result));
-        }
-
-        iteration += 1;
-    }
+    // Implementation deferred to future phase
+    unimplemented!("Tool loop orchestration")
 }
 ```
 
@@ -330,80 +298,95 @@ pub async fn execute_with_tool_loop(
 ```json
 {
   "targets": {
-    "model-name": {
-      "url": "https://provider.example.com",
+    "gpt-4o": {
+      "url": "https://api.openai.com/v1",
       "onwards_key": "sk-...",
 
-      // NEW: Open Responses configuration
-      "open_responses": {
-        "enabled": true,
-        "native": false,           // Use translation layer
-        "reasoning_mode": "summary", // content | encrypted | summary | none
-        "max_tool_loop_iterations": 10
-      }
+      // NEW: Open Responses mode (default: "native")
+      "open_responses_mode": "native"
+    },
+    "claude-3-opus": {
+      "url": "https://api.anthropic.com",
+      "onwards_key": "sk-...",
+
+      // Opt-in translation (strict mode)
+      "open_responses_mode": "translate"
+    },
+    "local-llama": {
+      "url": "http://localhost:8000",
+
+      // Disable /v1/responses for this target
+      "open_responses_mode": "disabled"
     }
   }
 }
 ```
 
-### Global Settings
+### Mode Descriptions
 
-```json
-{
-  "open_responses": {
-    "default_enabled": true,
-    "translation_mode": "auto",    // auto | always | never
-    "preserve_provider_extensions": false
-  }
-}
-```
+| Mode | Body Parsing | Use Case |
+|------|--------------|----------|
+| `native` (default) | Minimal (model only) | Provider supports Open Responses |
+| `translate` | Full deserialization | Provider only supports Chat Completions |
+| `disabled` | None | Explicitly disable /v1/responses |
 
 ---
 
 ## API Compatibility Matrix
 
-| Feature | Native Support | Translation Support |
-|---------|---------------|---------------------|
-| Basic text generation | ✅ | ✅ |
-| Tool/function calling | ✅ | ✅ |
-| Streaming | ✅ | ✅ (semantic events) |
-| Reasoning traces | ✅ | ❌ (not available) |
-| Encrypted reasoning | ✅ | ❌ |
-| Sub-agent loops | ✅ | ⚠️ (client-side) |
-| `previous_response_id` | ✅ | ⚠️ (requires state store) |
-| Custom provider extensions | ✅ | ❌ |
+| Feature | Native Mode | Translate Mode | Notes |
+|---------|-------------|----------------|-------|
+| Basic text generation | ✅ Passthrough | ✅ | |
+| Tool/function calling | ✅ Passthrough | ⚠️ Partial | External tools only |
+| Streaming | ✅ Passthrough | ⚠️ Complex | Requires event translation |
+| Reasoning traces | ✅ Passthrough | ❌ | No Chat Completions equivalent |
+| Encrypted reasoning | ✅ Passthrough | ❌ | Provider-specific |
+| Sub-agent loops | ✅ Passthrough | ❌ | Would require orchestration |
+| `previous_response_id` | ✅ Passthrough | ❌ | No state maintained |
+| Unknown fields | ✅ Preserved | ❌ Lost | Translation requires schema |
+| Performance | ✅ Optimal | ⚠️ Overhead | Deserialization cost |
 
 ---
 
 ## Implementation Timeline
 
-### Sprint 1: Foundation (Weeks 1-2)
-- [ ] Define core data models (`open_responses/models.rs`)
-- [ ] Add `/v1/responses` endpoint stub
-- [ ] Implement basic request translation
-- [ ] Unit tests for translation logic
+### Sprint 1: Native Passthrough (1-2 days)
+- [ ] Add `/v1/responses` route to `build_router()` (single line change)
+- [ ] Verify model extraction works for Open Responses request format
+- [ ] Test with Open Responses-compliant provider (e.g., OpenAI)
+- [ ] Document the new endpoint
 
-### Sprint 2: Response Handling (Weeks 3-4)
-- [ ] Implement response translation
-- [ ] Add response sanitization for Open Responses format
-- [ ] Non-streaming end-to-end flow working
+**Deliverable**: `/v1/responses` works as transparent passthrough.
 
-### Sprint 3: Streaming (Weeks 5-6)
-- [ ] Implement semantic streaming event transformer
-- [ ] SSE event formatting for Open Responses
-- [ ] Streaming end-to-end flow working
+### Sprint 2: Configuration & Mode Selection (3-5 days)
+- [ ] Add `open_responses_mode` field to `Target` struct
+- [ ] Add mode-based routing in handler
+- [ ] Implement `disabled` mode (return 404)
+- [ ] Update configuration documentation
 
-### Sprint 4: Advanced Features (Weeks 7-8)
-- [ ] Provider capability detection
-- [ ] Native passthrough for compliant providers
-- [ ] Client-side tool loop orchestration
-- [ ] Configuration schema updates
+**Deliverable**: Per-target control over Open Responses behavior.
 
-### Sprint 5: Testing & Documentation (Weeks 9-10)
-- [ ] Integration tests with multiple providers
-- [ ] Compliance testing against Open Responses test suite
-- [ ] Documentation and examples
-- [ ] Performance benchmarking
+### Sprint 3: Strict Mode Translation (1-2 weeks, optional)
+- [ ] Create `open_responses/` module
+- [ ] Implement lenient request translation (Items → Messages)
+- [ ] Implement lenient response translation (Choices → Output Items)
+- [ ] Add request/response transform hooks
+
+**Deliverable**: `translate` mode works for non-streaming requests.
+
+### Sprint 4: Streaming Translation (1 week, optional)
+- [ ] Implement SSE chunk translation
+- [ ] Handle semantic event generation
+- [ ] Test with various providers
+
+**Deliverable**: `translate` mode works for streaming requests.
+
+### Sprint 5: Advanced Features (Future)
+- [ ] Sub-agent loop orchestration
+- [ ] Reasoning trace handling
+- [ ] Compliance test suite integration
+
+**Note**: Sprints 3-5 are only needed if `translate` mode is required. Most deployments can use native passthrough.
 
 ---
 
@@ -432,22 +415,46 @@ npx ts-node bin/compliance-test.ts --endpoint http://localhost:8080/v1/responses
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|-----------|--------|------------|
-| Translation loses fidelity | Medium | Medium | Extensive testing, document limitations |
-| Streaming performance overhead | Low | Medium | Benchmark, optimize transformer |
-| Provider incompatibilities | Medium | High | Capability detection, fallback modes |
-| Spec changes during development | Medium | Medium | Version pinning, abstraction layers |
+| Provider doesn't support Open Responses | High | Low | Return provider's error, document limitations |
+| Model extraction fails on Open Responses format | Low | High | Test extraction with spec examples |
+| Translation mode loses fidelity | Medium | Medium | Document limitations, prefer native mode |
+| Spec changes after implementation | Medium | Low | Native mode unaffected, version pin for translate |
+
+## Key Architectural Decision
+
+**The native passthrough approach was chosen to maintain Onwards' transparent proxy philosophy.**
+
+Previous versions of this plan assumed full request/response deserialization. After reviewing the codebase, this was revised to:
+
+1. **Phase 1 (Native)**: Single line change - add route, reuse existing handler
+2. **Phase 2 (Config)**: Add mode selection per target
+3. **Phase 3+ (Translate)**: Only if needed, follows existing `sanitize_response` pattern
+
+This means:
+- ✅ No new types required for basic support
+- ✅ Unknown fields pass through unchanged
+- ✅ No schema maintenance burden
+- ✅ Performance identical to current passthrough
+- ⚠️ Translation mode (if needed) is opt-in and isolated
 
 ---
 
 ## Open Questions
 
-1. **State storage for `previous_response_id`**: Should we implement a response cache, or require clients to send full context?
+1. **Default mode**: Should the default `open_responses_mode` be `native` (passthrough) or `disabled` (explicit opt-in)?
+   - **Recommendation**: Default to `native` for simplicity - if a provider doesn't support it, they'll return an error anyway.
 
-2. **Reasoning trace handling**: For providers that expose reasoning (like Claude's extended thinking), should we map to Open Responses reasoning fields?
+2. **Model extraction**: The current `ExtractedModel` struct expects `{"model": "..."}`. Open Responses uses the same field name, but should we validate the overall request structure?
+   - **Recommendation**: No - maintain minimal extraction philosophy.
 
-3. **Extension passthrough**: Should provider-specific extensions be preserved or stripped?
+3. **Translate mode priority**: Is `translate` mode actually needed? If most providers will support Open Responses natively (OpenAI, Hugging Face Inference), translation may be low priority.
+   - **Recommendation**: Implement passthrough first, add translation only if there's demand.
 
-4. **Backwards compatibility**: Should `/v1/chat/completions` automatically translate to Open Responses internally?
+4. **Response sanitization for Open Responses**: Should we create an Open Responses-specific sanitizer (like `create_openai_sanitizer()`) for the `native` mode?
+   - **Recommendation**: Only if providers return non-compliant responses. Start without it.
+
+5. **Streaming format differences**: Open Responses uses semantic events (`response.output_text.delta`) while Chat Completions uses `chat.completion.chunk`. In `native` mode, is SSE buffering sufficient?
+   - **Recommendation**: Yes - existing `SseBufferedStream` handles incomplete chunks regardless of event format.
 
 ---
 
