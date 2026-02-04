@@ -489,6 +489,20 @@ pub enum OrchestratorError {
     SleepFailed { model: String, reason: String },
 }
 
+impl Drop for Orchestrator {
+    fn drop(&mut self) {
+        // Kill all child processes to avoid zombies
+        // This is especially important for tests
+        for entry in self.processes.iter() {
+            if let Ok(mut guard) = entry.value().try_lock() {
+                if let Some(ref mut child) = guard.child {
+                    let _ = child.start_kill();
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

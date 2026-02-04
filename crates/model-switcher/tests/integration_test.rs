@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use serial_test::serial;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -145,6 +146,7 @@ impl Drop for MockServer {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_mock_server_basic() {
     let server = MockServer::spawn("test-model").await;
 
@@ -167,6 +169,7 @@ async fn test_mock_server_basic() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_mock_server_sleep_wake() {
     let server = MockServer::spawn("sleepy-model").await;
 
@@ -191,6 +194,7 @@ async fn test_mock_server_sleep_wake() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_mock_server_l2_sleep() {
     let server = MockServer::spawn("deep-model").await;
 
@@ -207,6 +211,7 @@ async fn test_mock_server_l2_sleep() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_mock_server_rejects_while_sleeping() {
     let server = MockServer::spawn("strict-model").await;
 
@@ -229,6 +234,7 @@ async fn test_mock_server_rejects_while_sleeping() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_orchestrator_spawns_and_manages_process() {
     use model_switcher::{ModelConfig, Orchestrator, ProcessState};
     use std::sync::Arc;
@@ -309,6 +315,7 @@ async fn test_orchestrator_spawns_and_manages_process() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_orchestrator_multiple_models() {
     use model_switcher::{ModelConfig, Orchestrator, ProcessState};
     use std::sync::Arc;
@@ -565,6 +572,7 @@ async fn test_switcher_initial_state() {
 // =============================================================================
 
 #[tokio::test]
+#[serial]
 async fn test_switcher_ensure_model_ready() {
     use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
     use std::sync::Arc;
@@ -614,6 +622,7 @@ async fn test_switcher_ensure_model_ready() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_switcher_model_switching() {
     use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
     use std::sync::Arc;
@@ -693,6 +702,7 @@ async fn test_switcher_model_switching() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_switcher_same_model_no_switch() {
     use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
     use std::sync::Arc;
@@ -790,23 +800,31 @@ async fn test_orchestrator_unknown_model() {
 }
 
 // =============================================================================
-// Concurrent Request Tests
+// End-to-End Tests (Full HTTP stack)
 // =============================================================================
 
 #[tokio::test]
-async fn test_concurrent_requests_same_model() {
-    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator};
+#[serial]
+async fn test_end_to_end_single_model() {
+    use axum::Router;
+    use model_switcher::{
+        Config, FifoPolicy, ModelConfig, ModelSwitcher, ModelSwitcherLayer, Orchestrator,
+        PolicyConfig,
+    };
     use std::sync::Arc;
+    use tokio::net::TcpListener;
 
     let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
-    let port = allocate_port();
+    let backend_port = allocate_port();
+    let proxy_port = allocate_port();
 
-    let mut configs = HashMap::new();
-    configs.insert(
-        "model-a".to_string(),
+    // Build config
+    let mut models = HashMap::new();
+    models.insert(
+        "test-model".to_string(),
         ModelConfig {
-            model_path: "model-a".to_string(),
-            port,
+            model_path: "test-model".to_string(),
+            port: backend_port,
             gpu_memory_utilization: 0.9,
             tensor_parallel_size: 1,
             dtype: "auto".to_string(),
@@ -815,22 +833,375 @@ async fn test_concurrent_requests_same_model() {
         },
     );
 
-    let orchestrator = Arc::new(Orchestrator::with_command(configs, mock_vllm_path.to_string()));
-    let policy = Box::new(FifoPolicy::default());
-    let switcher = Arc::new(ModelSwitcher::new(orchestrator, policy));
+    let config = Config {
+        models: models.clone(),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+    };
 
-    // Spawn multiple concurrent requests for the same model
+    // Build the full app stack
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    // Build onwards targets
+    let targets = config.build_onwards_targets().unwrap();
+    let onwards_state = onwards::AppState::new(targets);
+    let onwards_router = onwards::build_router(onwards_state);
+
+    // Wrap with middleware
+    let app: Router = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+
+    // Start server
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Give server time to start
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send request through proxy
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from e2e test!"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("Request failed");
+
+    assert!(
+        response.status().is_success(),
+        "Response status: {}",
+        response.status()
+    );
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("Hello from e2e test!"),
+        "Unexpected response: {}",
+        content
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_end_to_end_model_switching() {
+    use axum::Router;
+    use model_switcher::{
+        Config, FifoPolicy, ModelConfig, ModelSwitcher, ModelSwitcherLayer, Orchestrator,
+        PolicyConfig,
+    };
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+    let proxy_port = allocate_port();
+
+    // Build config with two models
+    let mut models = HashMap::new();
+    models.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    models.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let config = Config {
+        models: models.clone(),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+    };
+
+    // Build the full app stack
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    let targets = config.build_onwards_targets().unwrap();
+    let onwards_state = onwards::AppState::new(targets);
+    let onwards_router = onwards::build_router(onwards_state);
+    let app: Router = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+
+    // Start server
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port);
+
+    // Request to model-a
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "Hello A!"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("Request to model-a failed");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Hello A!"));
+
+    // Switch to model-b
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "model-b",
+            "messages": [{"role": "user", "content": "Hello B!"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("Request to model-b failed");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Hello B!"));
+
+    // Switch back to model-a
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "model": "model-a",
+            "messages": [{"role": "user", "content": "Back to A!"}]
+        }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .expect("Request back to model-a failed");
+
+    assert!(response.status().is_success());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Back to A!"));
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_end_to_end_unknown_model_passthrough() {
+    use axum::Router;
+    use model_switcher::{
+        Config, FifoPolicy, ModelConfig, ModelSwitcher, ModelSwitcherLayer, Orchestrator,
+        PolicyConfig,
+    };
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let backend_port = allocate_port();
+    let proxy_port = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "known-model".to_string(),
+        ModelConfig {
+            model_path: "known-model".to_string(),
+            port: backend_port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let config = Config {
+        models: models.clone(),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+    };
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    let targets = config.build_onwards_targets().unwrap();
+    let onwards_state = onwards::AppState::new(targets);
+    let onwards_router = onwards::build_router(onwards_state);
+    let app: Router = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+
+    // Request to unknown model should be passed through (and fail at onwards level)
+    let response = client
+        .post(format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port))
+        .json(&serde_json::json!({
+            "model": "unknown-model",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .expect("Request failed");
+
+    // Should get a 404 from onwards (model not found in targets)
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_end_to_end_concurrent_requests() {
+    use axum::Router;
+    use model_switcher::{
+        Config, FifoPolicy, ModelConfig, ModelSwitcher, ModelSwitcherLayer, Orchestrator,
+        PolicyConfig,
+    };
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let backend_port = allocate_port();
+    let proxy_port = allocate_port();
+
+    let mut models = HashMap::new();
+    models.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            model_path: "test-model".to_string(),
+            port: backend_port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let config = Config {
+        models: models.clone(),
+        policy: PolicyConfig::default(),
+        port: proxy_port,
+        metrics_port: 0,
+        vllm_command: mock_vllm_path.to_string(),
+    };
+
+    let orchestrator = Arc::new(Orchestrator::with_command(
+        config.models.clone(),
+        config.vllm_command.clone(),
+    ));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator.clone(), policy);
+
+    let targets = config.build_onwards_targets().unwrap();
+    let onwards_state = onwards::AppState::new(targets);
+    let onwards_router = onwards::build_router(onwards_state);
+    let app: Router = onwards_router.layer(ModelSwitcherLayer::new(switcher));
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", proxy_port))
+        .await
+        .unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send multiple concurrent requests
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", proxy_port);
+
     let mut handles = vec![];
-    for _ in 0..5 {
-        let switcher = Arc::clone(&switcher);
+    for i in 0..5 {
+        let client = client.clone();
+        let url = url.clone();
         handles.push(tokio::spawn(async move {
-            switcher.ensure_model_ready("model-a").await
+            client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": format!("Request {}", i)}]
+                }))
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await
         }));
     }
 
     // All should succeed
-    for handle in handles {
-        let result = handle.await.expect("Task panicked");
-        assert!(result.is_ok(), "Request failed: {:?}", result);
+    for (i, handle) in handles.into_iter().enumerate() {
+        let response = handle.await.expect("Task panicked").expect("Request failed");
+        assert!(
+            response.status().is_success(),
+            "Request {} failed with status {}",
+            i,
+            response.status()
+        );
     }
+
+    server.abort();
 }
