@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/onwards", "crates/model-switcher"]
+members = ["onwards", "model-switcher"]
 
 [workspace.package]
 edition = "2024"
@@ -35,4 +35,4 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }
 
 # Internal crates
-onwards = { path = "crates/onwards" }
+onwards = { path = "onwards" }

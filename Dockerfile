@@ -1,34 +1,47 @@
-# Build stage
-FROM rust:1.92.0-slim AS builder
+# Multi-stage build for model-switcher with vLLM
+#
+# This Dockerfile builds the model-switcher binary and packages it with vLLM,
+# enabling zero-reload model switching for multiple models on shared GPU.
 
-# Install build dependencies
+# =============================================================================
+# Stage 1: Build the Rust binary
+# =============================================================================
+FROM --platform=linux/amd64 rust:1.83-bookworm AS builder
+
+WORKDIR /build
+
+# Install dependencies for building
 RUN apt-get update && apt-get install -y \
-  pkg-config \
-  libssl-dev \
-  && rm -rf /var/lib/apt/lists/*
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Create app directory
-WORKDIR /app
-
-# Copy source code and dependencies
+# Copy the workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY onwards ./onwards
+COPY model-switcher ./model-switcher
 
-# Build the application
-RUN cargo build --release
+# Build the model-switcher binary in release mode
+RUN cargo build --release --package model-switcher --bin model-switcher
 
-# Runtime stage - use Ubuntu for better compatibility
-FROM ubuntu:24.04
+# =============================================================================
+# Stage 2: Create the final image with vLLM
+# =============================================================================
+FROM --platform=linux/amd64 vllm/vllm-openai:latest
 
-# Copy the binary from builder stage
-COPY --from=builder /app/target/release/onwards /app/onwards
+# Copy the model-switcher binary from builder
+COPY --from=builder /build/target/release/model-switcher /usr/local/bin/model-switcher
 
-# Set working directory
-WORKDIR /app
+# Create config directory
+RUN mkdir -p /etc/model-switcher
 
-# Expose port (adjust if your app uses a different port)
-EXPOSE 3000
+# Default config location
+ENV MODEL_SWITCHER_CONFIG=/etc/model-switcher/config.json
 
-# Run the application
-ENTRYPOINT ["./onwards"]
-CMD []
+# Expose the proxy port (default 3000) and metrics port (default 9090)
+EXPOSE 3000 9090
+
+# The model-switcher will spawn vLLM processes internally
+# It expects a config file at $MODEL_SWITCHER_CONFIG
+ENTRYPOINT ["/usr/local/bin/model-switcher"]
+CMD ["--config", "/etc/model-switcher/config.json"]
