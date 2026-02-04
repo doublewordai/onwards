@@ -1101,18 +1101,20 @@ If Onwards wants to add custom items/events (e.g., for observability), the spec 
 - Document clearly
 - Don't assume other implementations will honor them
 
-### Translation Limitations
+### Translation Layer Capabilities
 
-When translating Responses → Chat Completions, these features are **lost**:
+When translating Responses → Chat Completions, the translation layer can handle most features:
 
-| Feature | Why |
-|---------|-----|
-| `previous_response_id` | Chat Completions is stateless |
-| Reasoning traces | No equivalent in Chat Completions |
-| Semantic streaming events | Only raw deltas available |
-| Item state machine | No equivalent concept |
-| `allowed_tools` vs `tools` | Chat Completions only has `tools` |
-| `truncation: disabled` | Provider-dependent behavior |
+| Feature | Handled? | How |
+|---------|----------|-----|
+| `previous_response_id` | ✅ Yes | `ResponseStore` trait stores context, expands to messages array on next request |
+| Semantic streaming events | ✅ Yes | `StreamingTranslator` synthesizes `response.*` events from `chat.completion.chunk` |
+| Item state machine | ✅ Yes | Translator tracks state, emits proper `in_progress`/`completed` transitions |
+| `allowed_tools` vs `tools` | ✅ Yes | Pass all `tools` to model (for context), filter/reject calls not in `allowed_tools` |
+| `truncation: disabled` | ⚠️ Partial | Pre-flight token estimation, fail early if would exceed window (imperfect) |
+| Reasoning traces | ❌ No | Upstream must produce them - cannot synthesize model thinking |
+
+**Reasoning traces** are the only feature truly lost in translation - they require the upstream model to actually perform and expose reasoning. Everything else can be handled by the translation layer with appropriate trait implementations.
 
 ---
 
