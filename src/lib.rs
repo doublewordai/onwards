@@ -48,7 +48,9 @@ pub mod load_balancer;
 pub mod models;
 pub mod response_sanitizer;
 pub mod sse;
+pub mod strict;
 pub mod target;
+pub mod traits;
 
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
