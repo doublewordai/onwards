@@ -44,7 +44,7 @@ mod switcher;
 
 pub use config::{ModelConfig, PolicyConfig, Config};
 pub use middleware::{ModelSwitcherLayer, ModelSwitcherService};
-pub use orchestrator::{Orchestrator, ProcessState};
+pub use orchestrator::{Orchestrator, OrchestratorError, ProcessState};
 pub use policy::{SwitchPolicy, FifoPolicy, PolicyContext, PolicyDecision};
 pub use switcher::{ModelSwitcher, SwitcherState, SwitchError, SleepLevel};
 

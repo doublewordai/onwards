@@ -413,7 +413,7 @@ async fn test_orchestrator_multiple_models() {
 }
 
 // =============================================================================
-// Switcher Tests
+// Switcher Tests (Unit - no process spawning)
 // =============================================================================
 
 #[tokio::test]
@@ -454,4 +454,383 @@ async fn test_switcher_basic_registration() {
     assert!(switcher.is_registered("model-a"));
     assert!(switcher.is_registered("model-b"));
     assert!(!switcher.is_registered("model-c"));
+}
+
+#[tokio::test]
+async fn test_switcher_unregistered_model_error() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitchError};
+    use std::sync::Arc;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Request for unregistered model should fail
+    let result = switcher.ensure_model_ready("nonexistent").await;
+    assert!(matches!(result, Err(SwitchError::ModelNotFound(_))));
+}
+
+#[tokio::test]
+async fn test_switcher_in_flight_tracking() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator};
+    use std::sync::Arc;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Initially no in-flight
+    assert_eq!(switcher.in_flight_count("model-a"), 0);
+
+    // Acquire guard
+    let guard1 = switcher.acquire_in_flight("model-a");
+    assert!(guard1.is_some());
+    assert_eq!(switcher.in_flight_count("model-a"), 1);
+
+    // Acquire another
+    let guard2 = switcher.acquire_in_flight("model-a");
+    assert!(guard2.is_some());
+    assert_eq!(switcher.in_flight_count("model-a"), 2);
+
+    // Drop one
+    drop(guard1);
+    assert_eq!(switcher.in_flight_count("model-a"), 1);
+
+    // Drop the other
+    drop(guard2);
+    assert_eq!(switcher.in_flight_count("model-a"), 0);
+
+    // Unregistered model returns None
+    assert!(switcher.acquire_in_flight("nonexistent").is_none());
+}
+
+#[tokio::test]
+async fn test_switcher_initial_state() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Initially idle
+    assert_eq!(switcher.state().await, SwitcherState::Idle);
+    assert_eq!(switcher.active_model().await, None);
+}
+
+// =============================================================================
+// Switcher Integration Tests (with process spawning)
+// =============================================================================
+
+#[tokio::test]
+async fn test_switcher_ensure_model_ready() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "test-model".to_string(),
+        ModelConfig {
+            model_path: "test-model".to_string(),
+            port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(configs, mock_vllm_path.to_string()));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Initially idle
+    assert_eq!(switcher.state().await, SwitcherState::Idle);
+
+    // Request model - should start it and make it active
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        switcher.ensure_model_ready("test-model"),
+    )
+    .await;
+
+    assert!(result.is_ok(), "Timeout");
+    assert!(result.unwrap().is_ok(), "Failed to ensure model ready");
+
+    // Should now be active
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "test-model".to_string()
+        }
+    );
+    assert_eq!(switcher.active_model().await, Some("test-model".to_string()));
+}
+
+#[tokio::test]
+async fn test_switcher_model_switching() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port_a = allocate_port();
+    let port_b = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port: port_a,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+    configs.insert(
+        "model-b".to_string(),
+        ModelConfig {
+            model_path: "model-b".to_string(),
+            port: port_b,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(configs, mock_vllm_path.to_string()));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Start with model-a
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to start model-a");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+
+    // Switch to model-b
+    switcher
+        .ensure_model_ready("model-b")
+        .await
+        .expect("Failed to switch to model-b");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-b".to_string()
+        }
+    );
+
+    // Switch back to model-a
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to switch back to model-a");
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_switcher_same_model_no_switch() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator, SwitcherState};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(configs, mock_vllm_path.to_string()));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = ModelSwitcher::new(orchestrator, policy);
+
+    // Start model-a
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed to start model-a");
+
+    // Request same model again - should return immediately
+    let start = std::time::Instant::now();
+    switcher
+        .ensure_model_ready("model-a")
+        .await
+        .expect("Failed second request");
+    let elapsed = start.elapsed();
+
+    // Should be very fast (no switch needed)
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "Same model request took too long: {:?}",
+        elapsed
+    );
+
+    assert_eq!(
+        switcher.state().await,
+        SwitcherState::Active {
+            model: "model-a".to_string()
+        }
+    );
+}
+
+// =============================================================================
+// Error Handling Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_orchestrator_unknown_model() {
+    use model_switcher::{ModelConfig, Orchestrator, OrchestratorError};
+    use std::sync::Arc;
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "known-model".to_string(),
+        ModelConfig {
+            model_path: "test".to_string(),
+            port: 8001,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::new(configs));
+
+    // Unknown model should return None for state
+    assert_eq!(orchestrator.process_state("unknown").await, None);
+
+    // ensure_running should fail for unknown model
+    let result = orchestrator.ensure_running("unknown").await;
+    assert!(matches!(result, Err(OrchestratorError::ModelNotFound(_))));
+
+    // sleep/wake should fail for unknown model
+    let result = orchestrator
+        .sleep_model("unknown", model_switcher::SleepLevel::L1)
+        .await;
+    assert!(matches!(result, Err(OrchestratorError::ModelNotFound(_))));
+
+    let result = orchestrator.wake_model("unknown").await;
+    assert!(matches!(result, Err(OrchestratorError::ModelNotFound(_))));
+}
+
+// =============================================================================
+// Concurrent Request Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_concurrent_requests_same_model() {
+    use model_switcher::{FifoPolicy, ModelConfig, ModelSwitcher, Orchestrator};
+    use std::sync::Arc;
+
+    let mock_vllm_path = env!("CARGO_BIN_EXE_mock-vllm");
+    let port = allocate_port();
+
+    let mut configs = HashMap::new();
+    configs.insert(
+        "model-a".to_string(),
+        ModelConfig {
+            model_path: "model-a".to_string(),
+            port,
+            gpu_memory_utilization: 0.9,
+            tensor_parallel_size: 1,
+            dtype: "auto".to_string(),
+            extra_args: vec![],
+            sleep_level: 1,
+        },
+    );
+
+    let orchestrator = Arc::new(Orchestrator::with_command(configs, mock_vllm_path.to_string()));
+    let policy = Box::new(FifoPolicy::default());
+    let switcher = Arc::new(ModelSwitcher::new(orchestrator, policy));
+
+    // Spawn multiple concurrent requests for the same model
+    let mut handles = vec![];
+    for _ in 0..5 {
+        let switcher = Arc::clone(&switcher);
+        handles.push(tokio::spawn(async move {
+            switcher.ensure_model_ready("model-a").await
+        }));
+    }
+
+    // All should succeed
+    for handle in handles {
+        let result = handle.await.expect("Task panicked");
+        assert!(result.is_ok(), "Request failed: {:?}", result);
+    }
 }
