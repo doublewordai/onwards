@@ -54,4 +54,6 @@ rand = "0.9"
 axum-test = "18.0.0"
 futures-util = "0.3"
 rstest = "0.26.1"
+tempfile = "3"
+tokio = { version = "1.45.1", features = ["io-util", "process"] }
 tower = "0.5"

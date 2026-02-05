@@ -253,18 +253,25 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
         // Check if the response requires tool action
         if adapter.requires_tool_action(&chat_response) && iteration < max_iterations {
-            debug!("Response requires tool action");
-
             // Extract tool calls
             let tool_calls = adapter.extract_tool_calls(&chat_response);
-            debug!(tool_count = tool_calls.len(), "Extracted tool calls");
+            let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+            info!(
+                iteration,
+                tools = ?tool_names,
+                "Model requested tool calls"
+            );
 
             // Execute tool calls
             let results = adapter.execute_tool_calls(&tool_calls).await;
 
             // Check if there are unhandled tools
             if adapter.has_unhandled_tools(&results) {
-                debug!("Some tools are unhandled, returning to client");
+                info!(
+                    iteration,
+                    tools = ?tool_names,
+                    "Returning unhandled tools to client"
+                );
                 // Return to client with requires_action status
                 let responses_response = adapter.to_responses_response(&chat_response, &request);
 
@@ -294,7 +301,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
 
             // All tools handled - add results to messages and continue loop
-            debug!("All tools handled, continuing loop");
+            debug!(iteration, "All tools handled, continuing loop");
 
             // Get the assistant message from the response
             if let Some(choice) = chat_response.choices.first() {
@@ -310,6 +317,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
 
         // No tool action required or max iterations reached - return final response
+        if adapter.requires_tool_action(&chat_response) && iteration >= max_iterations {
+            warn!(
+                iteration,
+                max = max_iterations,
+                "Tool loop reached max iterations, returning incomplete response"
+            );
+        }
+
         let responses_response = adapter.to_responses_response(&chat_response, &request);
 
         info!(
@@ -482,12 +497,6 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     break;
                 }
 
-                debug!(
-                    iteration,
-                    tool_count = pending.len(),
-                    "Streaming tool loop: executing tools"
-                );
-
                 let tool_calls: Vec<PendingToolCall> = pending
                     .into_iter()
                     .map(|(id, name, args)| PendingToolCall {
@@ -497,12 +506,23 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     })
                     .collect();
 
+                let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+                info!(
+                    iteration,
+                    tools = ?tool_names,
+                    "Streaming: model requested tool calls"
+                );
+
                 let results = adapter.execute_tool_calls(&tool_calls).await;
 
                 // If any tools are unhandled, stop looping — the client
                 // already has the tool_call events and can act on them.
                 if adapter.has_unhandled_tools(&results) {
-                    debug!("Unhandled tools in streaming mode, stopping loop");
+                    info!(
+                        iteration,
+                        tools = ?tool_names,
+                        "Streaming: returning unhandled tools to client"
+                    );
                     break;
                 }
 

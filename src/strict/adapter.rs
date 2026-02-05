@@ -20,7 +20,7 @@ use super::schemas::responses::{
 use crate::traits::{ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// The Open Responses adapter that bridges the Responses API to Chat Completions
 pub struct OpenResponsesAdapter {
@@ -262,6 +262,11 @@ impl OpenResponsesAdapter {
     ) -> Result<ToolCallResult, ToolError> {
         // Check if the executor can handle this tool
         if !self.executor.can_handle(&tool_call.name) {
+            debug!(
+                tool_name = %tool_call.name,
+                tool_call_id = %tool_call.id,
+                "Tool not handled by executor, returning to client"
+            );
             return Ok(ToolCallResult::Unhandled(tool_call.clone()));
         }
 
@@ -269,15 +274,35 @@ impl OpenResponsesAdapter {
         let args: serde_json::Value = serde_json::from_str(&tool_call.arguments)
             .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
 
+        debug!(
+            tool_name = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            arguments = %tool_call.arguments,
+            "Executing tool"
+        );
+
+        let start = std::time::Instant::now();
+
         // Execute the tool
         let result = self
             .executor
             .execute(&tool_call.name, &tool_call.id, &args)
             .await?;
 
+        let duration = start.elapsed();
+        let output = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
+
+        info!(
+            tool_name = %tool_call.name,
+            tool_call_id = %tool_call.id,
+            duration_ms = duration.as_millis() as u64,
+            output_len = output.len(),
+            "Tool executed successfully"
+        );
+
         Ok(ToolCallResult::Executed {
             call_id: tool_call.id.clone(),
-            output: serde_json::to_string(&result).unwrap_or_else(|_| result.to_string()),
+            output,
         })
     }
 
@@ -288,6 +313,12 @@ impl OpenResponsesAdapter {
             match self.execute_tool(tc).await {
                 Ok(result) => results.push(result),
                 Err(e) => {
+                    warn!(
+                        tool_name = %tc.name,
+                        tool_call_id = %tc.id,
+                        error = %e,
+                        "Tool execution failed"
+                    );
                     results.push(ToolCallResult::Error {
                         call_id: tc.id.clone(),
                         error: e.to_string(),
@@ -295,6 +326,25 @@ impl OpenResponsesAdapter {
                 }
             }
         }
+
+        let executed = results
+            .iter()
+            .filter(|r| matches!(r, ToolCallResult::Executed { .. }))
+            .count();
+        let unhandled = results
+            .iter()
+            .filter(|r| matches!(r, ToolCallResult::Unhandled(_)))
+            .count();
+        let errors = results
+            .iter()
+            .filter(|r| matches!(r, ToolCallResult::Error { .. }))
+            .count();
+
+        debug!(
+            total = tool_calls.len(),
+            executed, unhandled, errors, "Tool calls batch complete"
+        );
+
         results
     }
 
