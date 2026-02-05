@@ -68,6 +68,20 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Open Responses API configuration
+    #[serde(default)]
+    pub open_responses: Option<OpenResponsesConfig>,
+}
+
+/// Configuration for Open Responses API behavior
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenResponsesConfig {
+    /// Enable the adapter to provide full Open Responses semantics over Chat Completions.
+    /// When true, /v1/responses requests are converted to /v1/chat/completions internally.
+    /// When false (default), requests are passed through to the upstream.
+    #[serde(default)]
+    pub adapter: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -155,6 +169,10 @@ pub struct PoolSpec {
     #[builder(default)]
     pub sanitize_response: bool,
 
+    /// Open Responses API configuration for all providers in this pool
+    #[serde(default)]
+    pub open_responses: Option<OpenResponsesConfig>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -188,6 +206,10 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
+
+    /// Open Responses API configuration
+    #[serde(default)]
+    pub open_responses: Option<OpenResponsesConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -250,6 +272,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        open_responses: t.open_responses,
                     })
                     .collect();
                 PoolConfig {
@@ -267,6 +290,7 @@ impl TargetSpecOrList {
                 // Single provider: use its keys as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
                 let sanitize_response = spec.sanitize_response;
+                let open_responses = spec.open_responses.clone();
                 let provider = ProviderSpec {
                     url: spec.url,
                     onwards_key: spec.onwards_key,
@@ -278,6 +302,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    open_responses,
                 };
                 PoolConfig {
                     keys,
@@ -329,6 +354,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            open_responses: value.open_responses,
         }
     }
 }
@@ -354,6 +380,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            open_responses: value.open_responses,
         }
     }
 }
@@ -432,6 +459,8 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    /// Open Responses API configuration
+    pub open_responses: Option<OpenResponsesConfig>,
 }
 
 impl Target {
