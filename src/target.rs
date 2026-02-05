@@ -68,6 +68,14 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -188,6 +196,14 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 fn default_weight() -> u32 {
@@ -250,6 +266,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        request_timeout_secs: t.request_timeout_secs,
                     })
                     .collect();
                 PoolConfig {
@@ -278,6 +295,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    request_timeout_secs: spec.request_timeout_secs,
                 };
                 PoolConfig {
                     keys,
@@ -329,6 +347,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }
@@ -354,17 +373,22 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }
 
+/// Error returned when rate limit is exceeded
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitExceeded;
+
 pub trait RateLimiter: std::fmt::Debug + Send + Sync {
-    fn check(&self) -> Result<(), ()>;
+    fn check(&self) -> Result<(), RateLimitExceeded>;
 }
 
 impl RateLimiter for DefaultDirectRateLimiter {
-    fn check(&self) -> Result<(), ()> {
-        self.check().map_err(|_| ())
+    fn check(&self) -> Result<(), RateLimitExceeded> {
+        self.check().map_err(|_| RateLimitExceeded)
     }
 }
 
@@ -432,6 +456,7 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl Target {
@@ -1172,11 +1197,11 @@ mod tests {
     }
 
     impl RateLimiter for MockRateLimiter {
-        fn check(&self) -> Result<(), ()> {
+        fn check(&self) -> Result<(), RateLimitExceeded> {
             if *self.should_allow.lock().unwrap() {
                 Ok(())
             } else {
-                Err(())
+                Err(RateLimitExceeded)
             }
         }
     }
@@ -1733,6 +1758,142 @@ mod tests {
         assert!(
             !first_target.sanitize_response,
             "into_pool should preserve default sanitize_response setting"
+        );
+    }
+
+    #[test]
+    fn test_single_target_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in single-target format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key",
+                    "request_timeout_secs": 30
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_single_target_config_without_timeout() {
+        // Test that request_timeout_secs defaults to None when not specified
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_pool_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in pool/providers format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "request_timeout_secs": 60,
+                            "weight": 1
+                        }
+                    ],
+                    "fallback": {
+                        "enabled": true,
+                        "on_status": [502, 503]
+                    }
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Check both providers have their respective timeouts
+        let providers = pool.providers();
+
+        // First provider should have 30 second timeout
+        let provider1 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.openai.com"))
+            .unwrap();
+        assert_eq!(provider1.target.request_timeout_secs, Some(30));
+
+        // Second provider should have 60 second timeout
+        let provider2 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.azure.com"))
+            .unwrap();
+        assert_eq!(provider2.target.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_pool_config_mixed_timeouts() {
+        // Test that some providers can have timeouts while others don't
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "weight": 1
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let providers = pool.providers();
+
+        // One provider with timeout
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs == Some(30))
+        );
+        // One provider without timeout
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs.is_none())
         );
     }
 }

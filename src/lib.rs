@@ -1205,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_blocks_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that blocks requests
@@ -1213,8 +1213,8 @@ mod tests {
         struct BlockingRateLimiter;
 
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(()) // Always block
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded) // Always block
             }
         }
 
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_allows_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that allows requests
@@ -1273,7 +1273,7 @@ mod tests {
         struct AllowingRateLimiter;
 
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(()) // Always allow
             }
         }
@@ -1321,22 +1321,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_with_mixed_targets() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
         use std::sync::Arc;
 
         // Create different rate limiters
         #[derive(Debug)]
         struct BlockingRateLimiter;
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(())
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
             }
         }
 
         #[derive(Debug)]
         struct AllowingRateLimiter;
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(())
             }
         }

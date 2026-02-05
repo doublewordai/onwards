@@ -452,215 +452,241 @@ pub async fn target_message_handler<T: HttpClient>(
             attempt_req.headers()
         );
 
-        // Make the request
-        match state.http_client.request(attempt_req).await {
-            Ok(mut response) => {
-                let status = response.status().as_u16();
-
-                // Check if we should fallback based on status code
-                if pool.should_fallback_on_status(status) {
+        // Make the request with optional timeout
+        // Note: Timeout only applies to receiving response headers, not reading the full body.
+        // For streaming responses, the body may take much longer than the timeout.
+        let request_result = if let Some(timeout_secs) = target.request_timeout_secs {
+            let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+            match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+                .await
+            {
+                Err(_) => {
+                    // Timeout occurred
                     debug!(
-                        "Provider returned fallback status {}, trying next: {:?}",
-                        status, target.url
+                        "Request to {} timed out after {:?}",
+                        upstream_uri, timeout_duration
                     );
-                    last_error = Some(OnwardsErrorResponse::bad_gateway());
-                    continue;
-                }
-
-                // Check content type for SSE handling
-                let content_type = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("")
-                    .to_string();
-                let is_sse = content_type.contains("text/event-stream");
-
-                // Wrap SSE streams with buffering to handle incomplete chunks from providers.
-                // This must happen before any stream processing (e.g., sanitization) to ensure
-                // downstream consumers receive complete SSE events with valid JSON.
-                if is_sse {
-                    debug!("Wrapping SSE response with buffered stream");
-                    let (parts, body) = response.into_parts();
-                    let byte_stream = body.into_data_stream();
-                    let buffered = SseBufferedStream::new(byte_stream);
-                    let new_body = axum::body::Body::from_stream(buffered);
-                    response = Response::from_parts(parts, new_body);
-                }
-
-                // Apply response transformation if configured
-                // Per-target opt-in via sanitize_response flag, only for 2xx responses
-                if let Some(ref transform_fn) = state.response_transform_fn
-                    && target.sanitize_response
-                    && (200..300).contains(&status)
-                {
-                    debug!(
-                        "Attempting response sanitization for status {}, path {}",
-                        status, path_and_query
-                    );
-
-                    // Extract original model from request extensions
-                    let original_model = req
-                        .extensions()
-                        .get::<OriginalModel>()
-                        .map(|m| m.0.to_string());
-
-                    if is_sse {
-                        // Streaming SSE response - transform chunk-by-chunk
-                        // Note: stream is already buffered above
-                        debug!("Applying streaming sanitization");
-
-                        let sanitizer = crate::response_sanitizer::ResponseSanitizer {
-                            original_model: original_model.clone(),
-                        };
-
-                        use futures_util::StreamExt;
-
-                        let body_stream = http_body_util::BodyExt::into_data_stream(
-                            std::mem::take(response.body_mut()),
-                        );
-
-                        let transformed_stream = body_stream.map(move |chunk_result| {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    // Sanitize this chunk
-                                    match sanitizer.sanitize_streaming(&chunk) {
-                                        Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
-                                        Ok(None) => Ok(chunk),
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to sanitize streaming chunk: {}",
-                                                e
-                                            );
-                                            Ok(chunk) // Pass through on error
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Stream error: {}", e);
-                                    Err(std::io::Error::other(e))
-                                }
-                            }
-                        });
-
-                        *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
+                    last_error = Some(OnwardsErrorResponse::gateway_timeout());
+                    // Only continue to next provider if fallback is enabled
+                    if pool.fallback_enabled() {
+                        continue;
                     } else {
-                        // Non-streaming response - buffer and transform
-                        debug!("Applying non-streaming sanitization");
-
-                        let response_body =
-                            axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
-                                .await
-                                .map_err(|e| {
-                                    error!("Failed to buffer response body: {}", e);
-                                    OnwardsErrorResponse::internal()
-                                })?;
-
-                        debug!(
-                            "Response body buffered: {} bytes, content-type: {}",
-                            response_body.len(),
-                            content_type
-                        );
-                        trace!(
-                            "Response body content: {}",
-                            String::from_utf8_lossy(&response_body)
-                        );
-
-                        // Apply transformation
-                        match transform_fn(
-                            &path_and_query,
-                            response.headers(),
-                            &response_body,
-                            original_model.as_deref(),
-                        ) {
-                            Ok(Some(transformed_body)) => {
-                                // Update response with sanitized body
-                                let content_length = transformed_body.len();
-                                debug!(
-                                    "Sanitization successful: {} bytes -> {} bytes",
-                                    response_body.len(),
-                                    content_length
-                                );
-                                trace!(
-                                    "Sanitized body: {}",
-                                    String::from_utf8_lossy(&transformed_body)
-                                );
-                                *response.body_mut() = axum::body::Body::from(transformed_body);
-
-                                // Remove transfer-encoding since we're setting content-length
-                                response.headers_mut().remove(TRANSFER_ENCODING);
-                                response
-                                    .headers_mut()
-                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
-                            }
-                            Ok(None) => {
-                                // No transformation applied, restore original body
-                                debug!(
-                                    "Sanitization returned None, restoring original {} bytes",
-                                    response_body.len()
-                                );
-                                let content_length = response_body.len();
-                                *response.body_mut() = axum::body::Body::from(response_body);
-
-                                // Ensure proper headers even when not transforming
-                                response.headers_mut().remove(TRANSFER_ENCODING);
-                                response
-                                    .headers_mut()
-                                    .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
-                            }
-                            Err(e) => {
-                                error!("Response sanitization failed: {}", e);
-                                return Err(OnwardsErrorResponse::internal());
-                            }
-                        }
+                        record_response_status(504);
+                        return Err(last_error.unwrap());
                     }
                 }
-
-                // Add custom response headers
-                if let Some(headers) = response_headers {
-                    for (key, value) in headers.iter() {
-                        if let (Ok(header_name), Ok(header_value)) =
-                            (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
-                        {
-                            response.headers_mut().insert(header_name, header_value);
-                        }
-                    }
-                    trace!(
-                        model = %model_name,
-                        headers = ?headers,
-                        "Added custom response headers"
-                    );
-                }
-
-                record_response_status(response.status().as_u16());
-                debug!(
-                    "Returning response with status {}, content-length: {:?}",
-                    response.status(),
-                    response.headers().get(CONTENT_LENGTH)
-                );
-                return Ok(response);
+                Ok(result) => result,
             }
+        } else {
+            // No timeout configured
+            state.http_client.request(attempt_req).await
+        };
+
+        // Handle request errors
+        let mut response = match request_result {
             Err(e) => {
                 error!(
                     "Error forwarding request to target url {}: {}",
                     upstream_uri, e
                 );
                 last_error = Some(OnwardsErrorResponse::bad_gateway());
-
-                // If fallback enabled, try next provider on connection errors
+                // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
-                    debug!("Connection error, trying next provider");
                     continue;
                 } else {
-                    return Err(OnwardsErrorResponse::bad_gateway());
+                    return Err(last_error.unwrap());
+                }
+            }
+            Ok(response) => response,
+        };
+
+        let status = response.status().as_u16();
+
+        // Check if we should fallback based on status code
+        if pool.should_fallback_on_status(status) {
+            debug!(
+                "Provider returned fallback status {}, trying next: {:?}",
+                status, target.url
+            );
+            last_error = Some(OnwardsErrorResponse::bad_gateway());
+            continue;
+        }
+
+        // Check content type for SSE handling
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let is_sse = content_type.contains("text/event-stream");
+
+        // Wrap SSE streams with buffering to handle incomplete chunks from providers.
+        // This must happen before any stream processing (e.g., sanitization) to ensure
+        // downstream consumers receive complete SSE events with valid JSON.
+        if is_sse {
+            debug!("Wrapping SSE response with buffered stream");
+            let (parts, body) = response.into_parts();
+            let byte_stream = body.into_data_stream();
+            let buffered = SseBufferedStream::new(byte_stream);
+            let new_body = axum::body::Body::from_stream(buffered);
+            response = Response::from_parts(parts, new_body);
+        }
+
+        // Apply response transformation if configured
+        // Per-target opt-in via sanitize_response flag, only for 2xx responses
+        if let Some(ref transform_fn) = state.response_transform_fn
+            && target.sanitize_response
+            && (200..300).contains(&status)
+        {
+            debug!(
+                "Attempting response sanitization for status {}, path {}",
+                status, path_and_query
+            );
+
+            // Extract original model from request extensions
+            let original_model = req
+                .extensions()
+                .get::<OriginalModel>()
+                .map(|m| m.0.to_string());
+
+            if is_sse {
+                // Streaming SSE response - transform chunk-by-chunk
+                // Note: stream is already buffered above
+                debug!("Applying streaming sanitization");
+
+                let sanitizer = crate::response_sanitizer::ResponseSanitizer {
+                    original_model: original_model.clone(),
+                };
+
+                use futures_util::StreamExt;
+
+                let body_stream =
+                    http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
+
+                let transformed_stream = body_stream.map(move |chunk_result| {
+                    match chunk_result {
+                        Ok(chunk) => {
+                            // Sanitize this chunk
+                            match sanitizer.sanitize_streaming(&chunk) {
+                                Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
+                                Ok(None) => Ok(chunk),
+                                Err(e) => {
+                                    tracing::error!("Failed to sanitize streaming chunk: {}", e);
+                                    Ok(chunk) // Pass through on error
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Stream error: {}", e);
+                            Err(std::io::Error::other(e))
+                        }
+                    }
+                });
+
+                *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
+            } else {
+                // Non-streaming response - buffer and transform
+                debug!("Applying non-streaming sanitization");
+
+                let response_body =
+                    axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to buffer response body: {}", e);
+                            OnwardsErrorResponse::internal()
+                        })?;
+
+                debug!(
+                    "Response body buffered: {} bytes, content-type: {}",
+                    response_body.len(),
+                    content_type
+                );
+                trace!(
+                    "Response body content: {}",
+                    String::from_utf8_lossy(&response_body)
+                );
+
+                // Apply transformation
+                match transform_fn(
+                    &path_and_query,
+                    response.headers(),
+                    &response_body,
+                    original_model.as_deref(),
+                ) {
+                    Ok(Some(transformed_body)) => {
+                        // Update response with sanitized body
+                        let content_length = transformed_body.len();
+                        debug!(
+                            "Sanitization successful: {} bytes -> {} bytes",
+                            response_body.len(),
+                            content_length
+                        );
+                        trace!(
+                            "Sanitized body: {}",
+                            String::from_utf8_lossy(&transformed_body)
+                        );
+                        *response.body_mut() = axum::body::Body::from(transformed_body);
+
+                        // Remove transfer-encoding since we're setting content-length
+                        response.headers_mut().remove(TRANSFER_ENCODING);
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+                    }
+                    Ok(None) => {
+                        // No transformation applied, restore original body
+                        debug!(
+                            "Sanitization returned None, restoring original {} bytes",
+                            response_body.len()
+                        );
+                        let content_length = response_body.len();
+                        *response.body_mut() = axum::body::Body::from(response_body);
+
+                        // Ensure proper headers even when not transforming
+                        response.headers_mut().remove(TRANSFER_ENCODING);
+                        response
+                            .headers_mut()
+                            .insert(CONTENT_LENGTH, HeaderValue::from(content_length));
+                    }
+                    Err(e) => {
+                        error!("Response sanitization failed: {}", e);
+                        return Err(OnwardsErrorResponse::internal());
+                    }
                 }
             }
         }
+
+        // Add custom response headers
+        if let Some(headers) = response_headers {
+            for (key, value) in headers.iter() {
+                if let (Ok(header_name), Ok(header_value)) =
+                    (key.parse::<HeaderName>(), value.parse::<HeaderValue>())
+                {
+                    response.headers_mut().insert(header_name, header_value);
+                }
+            }
+            trace!(
+                model = %model_name,
+                headers = ?headers,
+                "Added custom response headers"
+            );
+        }
+
+        record_response_status(response.status().as_u16());
+        debug!(
+            "Returning response with status {}, content-length: {:?}",
+            response.status(),
+            response.headers().get(CONTENT_LENGTH)
+        );
+        return Ok(response);
     }
 
     // All providers exhausted
-    record_response_status(502);
-    Err(last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())))
+    let final_error =
+        last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+    record_response_status(final_error.status.as_u16());
+    Err(final_error)
 }
 
 #[instrument(skip(state, req))]
@@ -1332,5 +1358,187 @@ mod tests {
         let result = target_url.join(path_to_join).unwrap();
         // Should NOT strip "v1" since "v1x" is not the same as "v1/"
         assert_eq!(result.as_str(), "https://api.example.com/v1/v1x/something");
+    }
+
+    // Timeout behavior tests
+    // These tests document the expected behavior but can't easily test the actual timeout
+    // functionality without a mock HTTP client. They serve as documentation and type-checking.
+
+    #[test]
+    fn test_timeout_config_can_be_set() {
+        // Test that timeout can be configured on target
+        use crate::target::Target;
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .request_timeout_secs(30)
+            .build();
+
+        assert_eq!(target.request_timeout_secs, Some(30));
+    }
+
+    #[test]
+    fn test_timeout_defaults_to_none() {
+        // Test that timeout defaults to None (unlimited)
+        use crate::target::Target;
+
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
+
+        assert_eq!(target.request_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_gateway_timeout_error_response() {
+        // Test that gateway_timeout returns 504 status
+        let error = OnwardsErrorResponse::gateway_timeout();
+        let response = error.into_response();
+
+        assert_eq!(response.status().as_u16(), 504);
+    }
+
+    #[tokio::test]
+    async fn test_gateway_timeout_error_body() {
+        // Test that gateway_timeout has appropriate error message
+        use http_body_util::BodyExt;
+
+        let error = OnwardsErrorResponse::gateway_timeout();
+        let response = error.into_response();
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Should contain error structure with message and code fields
+        // ErrorResponseBody has: message, type, param, code (no outer "error" wrapper)
+        assert!(body_str.contains("message"));
+        assert!(body_str.contains("code"));
+        assert!(body_str.contains("gateway_timeout"));
+        assert!(body_str.contains("took too long"));
+    }
+
+    // Mock HttpClient that delays responses to test timeout behavior
+    #[derive(Debug, Clone)]
+    struct DelayedMockClient {
+        delay: std::time::Duration,
+        response_status: u16,
+    }
+
+    impl DelayedMockClient {
+        fn new(delay: std::time::Duration, response_status: u16) -> Self {
+            Self {
+                delay,
+                response_status,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for DelayedMockClient {
+        async fn request(
+            &self,
+            _req: axum::extract::Request,
+        ) -> Result<axum::response::Response, Box<dyn std::error::Error + Send + Sync>> {
+            tokio::time::sleep(self.delay).await;
+            Ok(axum::response::Response::builder()
+                .status(self.response_status)
+                .body(axum::body::Body::empty())
+                .unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_client_timeout_fires() {
+        // Test that tokio::time::timeout correctly fires when the mock client delays
+        // This validates the test infrastructure, not the handler behavior
+        use crate::target::Target;
+
+        // Create a target with 1 second timeout
+        let target = Target::builder()
+            .url("https://api.example.com/".parse().unwrap())
+            .request_timeout_secs(1)
+            .build();
+
+        let pool = target.into_pool();
+
+        // Mock client that delays 2 seconds (longer than timeout)
+        let mock_client = DelayedMockClient::new(std::time::Duration::from_secs(2), 200);
+
+        let state = AppState {
+            targets: crate::target::Targets {
+                targets: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
+            },
+            http_client: mock_client,
+            body_transform_fn: None,
+            response_transform_fn: None,
+        };
+
+        // Create a simple POST request
+        let req = axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"model":"gpt-4","messages":[]}"#))
+            .unwrap();
+
+        // Test the timeout logic directly (not the full handler)
+        let target = pool.first_target().unwrap();
+        let timeout_secs = target.request_timeout_secs.unwrap();
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+
+        let result = tokio::time::timeout(timeout_duration, state.http_client.request(req)).await;
+
+        // Should timeout (Err from tokio::time::timeout)
+        assert!(result.is_err(), "Expected timeout but request completed");
+    }
+
+    #[test]
+    fn test_pool_with_fallback_enabled() {
+        // Test that pool configuration correctly enables fallback with multiple providers
+        // This validates pool setup, not actual retry behavior
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+
+        // Create two targets
+        let target1 = Target::builder()
+            .url("https://provider1.example.com/".parse().unwrap())
+            .request_timeout_secs(1)
+            .build();
+
+        let target2 = Target::builder()
+            .url("https://provider2.example.com/".parse().unwrap())
+            .request_timeout_secs(1)
+            .build();
+
+        let providers = vec![
+            Provider {
+                target: target1,
+                weight: 1,
+            },
+            Provider {
+                target: target2,
+                weight: 1,
+            },
+        ];
+
+        let fallback_config = Some(FallbackConfig {
+            enabled: true,
+            on_status: vec![],
+            on_rate_limit: false,
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback_config,
+            LoadBalanceStrategy::Priority,
+        );
+
+        assert!(pool.fallback_enabled(), "Fallback should be enabled");
+        assert_eq!(pool.len(), 2, "Pool should have 2 providers");
     }
 }
