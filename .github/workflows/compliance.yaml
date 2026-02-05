@@ -1,0 +1,77 @@
+name: Open Responses Compliance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/strict/**'
+  workflow_dispatch:
+
+jobs:
+  compliance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [adapter, passthrough]
+    name: compliance (${{ matrix.mode }})
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build onwards
+        run: cargo build --release
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Clone openresponses
+        run: git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
+
+      - name: Install openresponses dependencies
+        run: cd /tmp/openresponses && bun install
+
+      - name: Write config
+        run: |
+          ADAPTER_FLAG=${{ matrix.mode == 'adapter' && 'true' || 'false' }}
+          cat > /tmp/config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "gpt-4o-mini": {
+                "url": "https://api.openai.com/v1",
+                "onwards_key": "${{ secrets.OPENAI_API_KEY }}",
+                "open_responses": {
+                  "adapter": $ADAPTER_FLAG
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Start onwards
+        run: |
+          ./target/release/onwards -f /tmp/config.json &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
+              echo "Server is ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+
+      - name: Run compliance tests
+        run: |
+          cd /tmp/openresponses
+          bun run bin/compliance-test.ts \
+            --base-url http://localhost:3000/v1 \
+            --api-key test \
+            --model gpt-4o-mini
