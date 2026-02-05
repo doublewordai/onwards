@@ -48,6 +48,7 @@ pub mod load_balancer;
 pub mod models;
 pub mod response_sanitizer;
 pub mod sse;
+pub mod strict;
 pub mod target;
 
 use client::{HttpClient, HyperClient};
@@ -749,6 +750,7 @@ mod tests {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -794,6 +796,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(
@@ -864,6 +867,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -961,6 +965,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1033,6 +1038,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1128,6 +1134,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1234,6 +1241,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1294,6 +1302,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1374,6 +1383,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1441,6 +1451,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1485,6 +1496,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client =
@@ -1557,6 +1569,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters,
+            strict_mode: false,
         };
 
         let mock_client =
@@ -1631,6 +1644,7 @@ mod tests {
                 targets,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1806,6 +1820,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1867,6 +1882,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1916,6 +1932,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -1967,6 +1984,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -2042,6 +2060,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create the same transformation function
@@ -2113,6 +2132,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that only transforms specific paths
@@ -2187,6 +2207,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2223,6 +2244,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2264,6 +2286,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(
@@ -2323,6 +2346,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2377,6 +2401,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2417,6 +2442,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2470,6 +2496,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2523,6 +2550,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2584,6 +2612,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2628,6 +2657,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response with provider-specific fields
@@ -2699,6 +2729,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response from upstream has the turbo model
@@ -2761,6 +2792,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let streaming_chunks = vec![
@@ -2815,6 +2847,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let streaming_chunks = vec![
@@ -2866,6 +2899,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response with provider-specific fields
@@ -2925,6 +2959,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response from a different endpoint (e.g., embeddings)
@@ -2991,6 +3026,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_response = r#"{

@@ -1396,6 +1396,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
