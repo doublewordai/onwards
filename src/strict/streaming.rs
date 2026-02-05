@@ -18,8 +18,8 @@
 
 use super::schemas::chat_completions::{ChatCompletionChunk, ChunkChoice};
 use super::schemas::responses::{
-    ContentPart, ItemStatus, MessageContent, MessageItem, ResponseStatus, ResponseUsage,
-    ResponsesResponse,
+    ContentPart, Item, ItemStatus, MessageContent, MessageItem, ResponseStatus, ResponseUsage,
+    ResponsesRequest, ResponsesResponse, TextConfig, TextFormat, TruncationStrategy,
 };
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +41,8 @@ pub struct StreamingState {
     started: bool,
     /// Accumulated usage (from final chunk if include_usage is set)
     usage: Option<ResponseUsage>,
+    /// Original request parameters (for echoing back in response.completed)
+    request: ResponsesRequest,
 }
 
 /// A streaming item being built incrementally
@@ -64,7 +66,7 @@ struct StreamingToolCall {
 
 impl StreamingState {
     /// Create a new streaming state for a response
-    pub fn new(model: &str) -> Self {
+    pub fn new(request: &ResponsesRequest) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -72,12 +74,13 @@ impl StreamingState {
 
         Self {
             response_id: format!("resp_{:016x}", timestamp),
-            model: model.to_string(),
+            model: request.model.clone(),
             created_at: timestamp,
             items: Vec::new(),
             sequence_number: 0,
             started: false,
             usage: None,
+            request: request.clone(),
         }
     }
 
@@ -103,8 +106,12 @@ impl StreamingState {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
                 total_tokens: usage.total_tokens,
-                input_tokens_details: None,
-                output_tokens_details: None,
+                input_tokens_details: super::schemas::responses::InputTokensDetails {
+                    cached_tokens: 0,
+                },
+                output_tokens_details: super::schemas::responses::OutputTokensDetails {
+                    reasoning_tokens: 0,
+                },
             });
         }
 
@@ -204,7 +211,9 @@ impl StreamingState {
                         self.items[index].tool_calls[tc_index].name = name.clone();
                     }
                     if let Some(ref args) = func.arguments {
-                        self.items[index].tool_calls[tc_index].arguments.push_str(args);
+                        self.items[index].tool_calls[tc_index]
+                            .arguments
+                            .push_str(args);
                     }
                 }
             }
@@ -254,13 +263,7 @@ impl StreamingState {
         StreamingEvent {
             event_type: "response.created".to_string(),
             data: StreamingEventData::ResponseCreated {
-                response: ResponseCreatedData {
-                    id: self.response_id.clone(),
-                    object: "response".to_string(),
-                    created_at: self.created_at,
-                    model: self.model.clone(),
-                    status: ResponseStatus::InProgress,
-                },
+                response: self.build_response_snapshot(ResponseStatus::InProgress, vec![], None),
             },
             sequence_number: self.next_sequence(),
         }
@@ -272,16 +275,16 @@ impl StreamingState {
             event_type: "response.output_item.added".to_string(),
             data: StreamingEventData::OutputItemAdded {
                 output_index: index as u32,
-                item: OutputItemData {
-                    id: item.id.clone(),
-                    item_type: "message".to_string(),
+                item: Item::Message(MessageItem {
+                    id: Some(item.id.clone()),
                     role: if item.role.is_empty() {
                         "assistant".to_string()
                     } else {
                         item.role.clone()
                     },
-                    status: ItemStatus::InProgress,
-                },
+                    content: MessageContent::Parts(vec![]),
+                    status: Some(ItemStatus::InProgress),
+                }),
             },
             sequence_number: self.next_sequence(),
         }
@@ -294,9 +297,10 @@ impl StreamingState {
                 item_id: self.items[index].id.clone(),
                 output_index: index as u32,
                 content_index: 0,
-                part: ContentPartData {
-                    part_type: "output_text".to_string(),
+                part: ContentPart::OutputText {
                     text: String::new(),
+                    annotations: vec![],
+                    logprobs: vec![],
                 },
             },
             sequence_number: self.next_sequence(),
@@ -311,6 +315,7 @@ impl StreamingState {
                 output_index: index as u32,
                 content_index: 0,
                 delta: delta.to_string(),
+                logprobs: vec![],
             },
             sequence_number: self.next_sequence(),
         }
@@ -324,9 +329,10 @@ impl StreamingState {
                 item_id: item.id.clone(),
                 output_index: index as u32,
                 content_index: 0,
-                part: ContentPartData {
-                    part_type: "output_text".to_string(),
+                part: ContentPart::OutputText {
                     text: item.content_text.clone(),
+                    annotations: vec![],
+                    logprobs: vec![],
                 },
             },
             sequence_number: self.next_sequence(),
@@ -339,16 +345,20 @@ impl StreamingState {
             event_type: "response.output_item.done".to_string(),
             data: StreamingEventData::OutputItemDone {
                 output_index: index as u32,
-                item: OutputItemData {
-                    id: item.id.clone(),
-                    item_type: "message".to_string(),
+                item: Item::Message(MessageItem {
+                    id: Some(item.id.clone()),
                     role: if item.role.is_empty() {
                         "assistant".to_string()
                     } else {
                         item.role.clone()
                     },
-                    status: ItemStatus::Completed,
-                },
+                    content: MessageContent::Parts(vec![ContentPart::OutputText {
+                        text: item.content_text.clone(),
+                        annotations: vec![],
+                        logprobs: vec![],
+                    }]),
+                    status: Some(ItemStatus::Completed),
+                }),
             },
             sequence_number: self.next_sequence(),
         }
@@ -364,10 +374,74 @@ impl StreamingState {
         }
     }
 
+    /// Build a response snapshot with the given status, output, and usage
+    fn build_response_snapshot(
+        &self,
+        status: ResponseStatus,
+        output: Vec<Item>,
+        usage: Option<ResponseUsage>,
+    ) -> ResponsesResponse {
+        let req = &self.request;
+
+        let tool_choice = req
+            .tool_choice
+            .as_ref()
+            .and_then(|tc| serde_json::to_value(tc).ok())
+            .unwrap_or(serde_json::Value::String("auto".to_string()));
+
+        let completed_at = if status == ResponseStatus::Completed {
+            Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        } else {
+            None
+        };
+
+        ResponsesResponse {
+            id: self.response_id.clone(),
+            object: "response".to_string(),
+            created_at: self.created_at,
+            completed_at,
+            status,
+            incomplete_details: None,
+            model: self.model.clone(),
+            previous_response_id: req.previous_response_id.clone(),
+            instructions: req.instructions.clone(),
+            output,
+            error: None,
+            tools: req.tools.clone().unwrap_or_default(),
+            tool_choice,
+            truncation: req
+                .truncation
+                .clone()
+                .unwrap_or(TruncationStrategy::Disabled),
+            parallel_tool_calls: req.parallel_tool_calls.unwrap_or(true),
+            text: req.text.clone().unwrap_or(TextConfig {
+                format: Some(TextFormat::Text),
+            }),
+            top_p: req.top_p.unwrap_or(1.0),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            top_logprobs: 0,
+            temperature: req.temperature.unwrap_or(1.0),
+            reasoning: req.reasoning.clone(),
+            usage,
+            max_output_tokens: req.max_output_tokens,
+            max_tool_calls: None,
+            store: req.store.unwrap_or(false),
+            background: false,
+            service_tier: "default".to_string(),
+            metadata: req.metadata.clone(),
+            safety_identifier: None,
+            prompt_cache_key: None,
+        }
+    }
+
     /// Build the final response object
     fn build_final_response(&self) -> ResponsesResponse {
-        use super::schemas::responses::Item;
-
         let output: Vec<Item> = self
             .items
             .iter()
@@ -381,26 +455,15 @@ impl StreamingState {
                     },
                     content: MessageContent::Parts(vec![ContentPart::OutputText {
                         text: item.content_text.clone(),
-                        annotations: None,
+                        annotations: vec![],
+                        logprobs: vec![],
                     }]),
                     status: Some(item.status),
                 })
             })
             .collect();
 
-        ResponsesResponse {
-            id: self.response_id.clone(),
-            object: "response".to_string(),
-            created_at: self.created_at,
-            model: self.model.clone(),
-            status: ResponseStatus::Completed,
-            output,
-            error: None,
-            incomplete_details: None,
-            usage: self.usage.clone(),
-            metadata: None,
-            extra: None,
-        }
+        self.build_response_snapshot(ResponseStatus::Completed, output, self.usage.clone())
     }
 }
 
@@ -430,62 +493,38 @@ impl StreamingEvent {
 #[serde(untagged)]
 pub enum StreamingEventData {
     ResponseCreated {
-        response: ResponseCreatedData,
+        response: ResponsesResponse,
     },
     OutputItemAdded {
         output_index: u32,
-        item: OutputItemData,
+        item: Item,
     },
     ContentPartAdded {
         item_id: String,
         output_index: u32,
         content_index: u32,
-        part: ContentPartData,
+        part: ContentPart,
     },
     OutputTextDelta {
         item_id: String,
         output_index: u32,
         content_index: u32,
         delta: String,
+        logprobs: Vec<serde_json::Value>,
     },
     ContentPartDone {
         item_id: String,
         output_index: u32,
         content_index: u32,
-        part: ContentPartData,
+        part: ContentPart,
     },
     OutputItemDone {
         output_index: u32,
-        item: OutputItemData,
+        item: Item,
     },
     ResponseCompleted {
         response: ResponsesResponse,
     },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseCreatedData {
-    pub id: String,
-    pub object: String,
-    pub created_at: u64,
-    pub model: String,
-    pub status: ResponseStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputItemData {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub item_type: String,
-    pub role: String,
-    pub status: ItemStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContentPartData {
-    #[serde(rename = "type")]
-    pub part_type: String,
-    pub text: String,
 }
 
 /// Parse a chat.completion.chunk from SSE data line
@@ -500,6 +539,30 @@ pub fn parse_chat_chunk(data: &str) -> Option<ChatCompletionChunk> {
 mod tests {
     use super::*;
     use crate::strict::schemas::chat_completions::{ChunkChoice, ChunkDelta};
+
+    fn test_request(model: &str) -> ResponsesRequest {
+        ResponsesRequest {
+            model: model.to_string(),
+            input: None,
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            truncation: None,
+            user: None,
+            reasoning: None,
+            text: None,
+            extra: None,
+        }
+    }
 
     fn create_test_chunk(
         id: &str,
@@ -530,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_initial_events() {
-        let mut state = StreamingState::new("gpt-4");
+        let mut state = StreamingState::new(&test_request("gpt-4"));
 
         let chunk = create_test_chunk("chunk_1", None, Some("assistant"), None);
         let events = state.process_chunk(&chunk);
@@ -543,7 +606,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_content_events() {
-        let mut state = StreamingState::new("gpt-4");
+        let mut state = StreamingState::new(&test_request("gpt-4"));
 
         // First chunk with role
         let chunk1 = create_test_chunk("chunk_1", None, Some("assistant"), None);
@@ -561,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_completion_events() {
-        let mut state = StreamingState::new("gpt-4");
+        let mut state = StreamingState::new(&test_request("gpt-4"));
 
         // First chunk
         let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
@@ -572,17 +635,21 @@ mod tests {
         let events = state.process_chunk(&chunk2);
 
         // Should emit content_part.done and output_item.done
-        assert!(events
-            .iter()
-            .any(|e| e.event_type == "response.content_part.done"));
-        assert!(events
-            .iter()
-            .any(|e| e.event_type == "response.output_item.done"));
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "response.content_part.done")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "response.output_item.done")
+        );
     }
 
     #[test]
     fn test_streaming_state_finalize() {
-        let mut state = StreamingState::new("gpt-4");
+        let mut state = StreamingState::new(&test_request("gpt-4"));
 
         let chunk = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), Some("stop"));
         state.process_chunk(&chunk);
@@ -590,9 +657,7 @@ mod tests {
         let events = state.finalize();
 
         // Should emit response.completed
-        assert!(events
-            .iter()
-            .any(|e| e.event_type == "response.completed"));
+        assert!(events.iter().any(|e| e.event_type == "response.completed"));
     }
 
     #[test]
@@ -604,6 +669,7 @@ mod tests {
                 output_index: 0,
                 content_index: 0,
                 delta: "Hello".to_string(),
+                logprobs: vec![],
             },
             sequence_number: 1,
         };
@@ -632,7 +698,7 @@ mod tests {
 
     #[test]
     fn test_sequence_numbers_increase() {
-        let mut state = StreamingState::new("gpt-4");
+        let mut state = StreamingState::new(&test_request("gpt-4"));
 
         let chunk1 = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), None);
         let events1 = state.process_chunk(&chunk1);

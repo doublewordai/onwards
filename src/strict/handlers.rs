@@ -7,16 +7,16 @@ use super::adapter::OpenResponsesAdapter;
 use super::schemas::chat_completions::{ChatCompletionRequest, ChatCompletionResponse};
 use super::schemas::embeddings::EmbeddingsRequest;
 use super::schemas::responses::ResponsesRequest;
-use super::streaming::{parse_chat_chunk, StreamingState};
+use super::streaming::{StreamingState, parse_chat_chunk};
+use crate::AppState;
 use crate::client::HttpClient;
 use crate::handlers::target_message_handler;
 use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
-use crate::AppState;
+use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -158,10 +158,8 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 ) -> Response {
     // Create adapter with no-op implementations for now
     // In production, these would be configurable
-    let adapter = OpenResponsesAdapter::new(
-        Arc::new(NoOpResponseStore),
-        Arc::new(NoOpToolExecutor),
-    );
+    let adapter =
+        OpenResponsesAdapter::new(Arc::new(NoOpResponseStore), Arc::new(NoOpToolExecutor));
 
     // Convert the Responses request to a Chat Completions request
     let mut chat_request = match adapter.to_chat_request(&request).await {
@@ -188,7 +186,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
     loop {
         iteration += 1;
-        debug!(iteration = iteration, max = max_iterations, "Tool loop iteration");
+        debug!(
+            iteration = iteration,
+            max = max_iterations,
+            "Tool loop iteration"
+        );
 
         // Serialize the chat request for non-streaming
         let body_bytes = match serde_json::to_vec(&chat_request) {
@@ -204,9 +206,13 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         };
 
         // Forward to Chat Completions endpoint
-        let response =
-            forward_request_raw(state.clone(), headers.clone(), "/v1/chat/completions", body_bytes)
-                .await;
+        let response = forward_request_raw(
+            state.clone(),
+            headers.clone(),
+            "/v1/chat/completions",
+            body_bytes,
+        )
+        .await;
 
         // Check if the response is successful
         if !response.status().is_success() {
@@ -262,8 +268,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             if adapter.has_unhandled_tools(&results) {
                 debug!("Some tools are unhandled, returning to client");
                 // Return to client with requires_action status
-                let responses_response =
-                    adapter.to_responses_response(&chat_response, &request.model);
+                let responses_response = adapter.to_responses_response(&chat_response, &request);
 
                 let response_bytes = match serde_json::to_vec(&responses_response) {
                     Ok(bytes) => bytes,
@@ -295,8 +300,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
             // Get the assistant message from the response
             if let Some(choice) = chat_response.choices.first() {
-                adapter
-                    .add_tool_results_to_messages(&mut chat_request.messages, &choice.message, &results);
+                adapter.add_tool_results_to_messages(
+                    &mut chat_request.messages,
+                    &choice.message,
+                    &results,
+                );
             }
 
             // Continue to next iteration
@@ -304,7 +312,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
 
         // No tool action required or max iterations reached - return final response
-        let responses_response = adapter.to_responses_response(&chat_response, &request.model);
+        let responses_response = adapter.to_responses_response(&chat_response, &request);
 
         info!(
             response_id = %responses_response.id,
@@ -395,12 +403,11 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     let (parts, body) = response.into_parts();
     let byte_stream = body.into_data_stream();
 
-    // Create the streaming state
-    let model = request.model.clone();
+    let request_model = request.model.clone();
 
     // Create a transformed stream that converts Chat Completions chunks to Open Responses events
     let transformed_stream = async_stream::stream! {
-        let mut state = StreamingState::new(&model);
+        let mut state = StreamingState::new(&request);
         let mut buffer = String::new();
 
         let mut pinned_stream = std::pin::pin!(byte_stream);
@@ -457,7 +464,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         yield Ok::<_, std::io::Error>("data: [DONE]\n\n".to_string().into_bytes());
     };
 
-    info!(model = %request.model, "Streaming adapter response started");
+    info!(model = %request_model, "Streaming adapter response started");
 
     // Build the streaming response
     Response::builder()
@@ -528,10 +535,13 @@ async fn forward_request_raw<T: HttpClient + Clone + Send + Sync + 'static>(
         "application/json".parse().unwrap(),
     );
 
+    // Remove Accept-Encoding so the upstream returns uncompressed responses.
+    // The adapter needs to parse response bodies as JSON, and hyper does not
+    // automatically decompress gzip/br/zstd content.
+    headers.remove(axum::http::header::ACCEPT_ENCODING);
+
     // Build the request to forward
-    let mut request_builder = Request::builder()
-        .method("POST")
-        .uri(path);
+    let mut request_builder = Request::builder().method("POST").uri(path);
 
     // Copy headers to the request
     for (name, value) in headers.iter() {
@@ -632,7 +642,11 @@ mod tests {
 
     #[test]
     fn test_error_response_format() {
-        let response = error_response(StatusCode::BAD_REQUEST, "invalid_request_error", "Test error");
+        let response = error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Test error",
+        );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

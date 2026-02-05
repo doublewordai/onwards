@@ -12,9 +12,10 @@ use super::schemas::chat_completions::{
     MessageContent, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
 };
 use super::schemas::responses::{
-    ContentPart, FunctionCallItem, Input, Item, ItemStatus,
-    MessageContent as ResponseMessageContent, MessageItem, ResponseStatus, ResponseUsage,
-    ResponsesRequest, ResponsesResponse, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
+    ContentPart, FunctionCallItem, Input, InputTokensDetails, Item, ItemStatus,
+    MessageContent as ResponseMessageContent, MessageItem, OutputTokensDetails, ResponseStatus,
+    ResponseUsage, ResponsesRequest, ResponsesResponse, TextConfig, TextFormat,
+    Tool as ResponseTool, ToolChoice as ResponseToolChoice, TruncationStrategy,
 };
 use crate::traits::{ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::sync::Arc;
@@ -133,10 +134,12 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
     }
 
     /// Convert a Chat Completions response to a Responses response
+    ///
+    /// Echoes back request parameters as required by the Open Responses spec.
     pub fn to_responses_response(
         &self,
         chat_response: &ChatCompletionResponse,
-        request_model: &str,
+        request: &ResponsesRequest,
     ) -> ResponsesResponse {
         let output = chat_response
             .choices
@@ -146,32 +149,71 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
 
         let status = determine_response_status(&chat_response.choices);
 
+        let completed_at = if status == ResponseStatus::Completed {
+            Some(chat_response.created)
+        } else {
+            None
+        };
+
+        let tool_choice = request
+            .tool_choice
+            .as_ref()
+            .and_then(|tc| serde_json::to_value(tc).ok())
+            .unwrap_or(serde_json::Value::String("auto".to_string()));
+
         ResponsesResponse {
             id: format!("resp_{}", &chat_response.id),
             object: "response".to_string(),
             created_at: chat_response.created,
-            model: request_model.to_string(),
+            completed_at,
             status,
+            incomplete_details: None,
+            model: request.model.clone(),
+            previous_response_id: request.previous_response_id.clone(),
+            instructions: request.instructions.clone(),
             output,
             error: None,
-            incomplete_details: None,
+            tools: request.tools.clone().unwrap_or_default(),
+            tool_choice,
+            truncation: request
+                .truncation
+                .clone()
+                .unwrap_or(TruncationStrategy::Disabled),
+            parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
+            text: request.text.clone().unwrap_or(TextConfig {
+                format: Some(TextFormat::Text),
+            }),
+            top_p: request.top_p.unwrap_or(1.0),
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            top_logprobs: 0,
+            temperature: request.temperature.unwrap_or(1.0),
+            reasoning: request.reasoning.clone(),
             usage: chat_response.usage.as_ref().map(|u| ResponseUsage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
-                input_tokens_details: None,
-                output_tokens_details: None,
+                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+                output_tokens_details: OutputTokensDetails {
+                    reasoning_tokens: 0,
+                },
             }),
-            metadata: None,
-            extra: None,
+            max_output_tokens: request.max_output_tokens,
+            max_tool_calls: None,
+            store: request.store.unwrap_or(false),
+            background: false,
+            service_tier: chat_response
+                .service_tier
+                .clone()
+                .unwrap_or_else(|| "default".to_string()),
+            metadata: request.metadata.clone(),
+            safety_identifier: None,
+            prompt_cache_key: None,
         }
     }
 
     /// Store a response and return the stored response with ID
-    pub async fn store_response(
-        &self,
-        response: &ResponsesResponse,
-    ) -> Result<String, StoreError> {
+    pub async fn store_response(&self, response: &ResponsesResponse) -> Result<String, StoreError> {
         let value = serde_json::to_value(response)
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
         self.store.store(&value).await
@@ -231,16 +273,12 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
 
         Ok(ToolCallResult::Executed {
             call_id: tool_call.id.clone(),
-            output: serde_json::to_string(&result)
-                .unwrap_or_else(|_| result.to_string()),
+            output: serde_json::to_string(&result).unwrap_or_else(|_| result.to_string()),
         })
     }
 
     /// Execute all tool calls and return results
-    pub async fn execute_tool_calls(
-        &self,
-        tool_calls: &[PendingToolCall],
-    ) -> Vec<ToolCallResult> {
+    pub async fn execute_tool_calls(&self, tool_calls: &[PendingToolCall]) -> Vec<ToolCallResult> {
         let mut results = Vec::new();
         for tc in tool_calls {
             match self.execute_tool(tc).await {
@@ -298,7 +336,9 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
 
     /// Check if there are any unhandled tool calls that need client action
     pub fn has_unhandled_tools(&self, results: &[ToolCallResult]) -> bool {
-        results.iter().any(|r| matches!(r, ToolCallResult::Unhandled(_)))
+        results
+            .iter()
+            .any(|r| matches!(r, ToolCallResult::Unhandled(_)))
     }
 
     /// Get the maximum number of tool iterations
@@ -504,7 +544,7 @@ fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<I
     let status = match finish_reason {
         Some("stop") => Some(ItemStatus::Completed),
         Some("length") => Some(ItemStatus::Incomplete),
-        _ => None,
+        _ => Some(ItemStatus::Completed),
     };
 
     // Add the message item
@@ -532,7 +572,8 @@ fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<I
                 role: message.role.clone(),
                 content: ResponseMessageContent::Parts(vec![ContentPart::OutputText {
                     text: content_text,
-                    annotations: None,
+                    annotations: vec![],
+                    logprobs: vec![],
                 }]),
                 status,
             }));
@@ -565,17 +606,15 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
                 description,
                 parameters,
                 strict,
-            } => {
-                name.as_ref().map(|n| ChatTool {
-                    tool_type: "function".to_string(),
-                    function: super::schemas::chat_completions::FunctionDefinition {
-                        name: n.clone(),
-                        description: description.clone(),
-                        parameters: parameters.clone(),
-                        strict: *strict,
-                    },
-                })
-            }
+            } => name.as_ref().map(|n| ChatTool {
+                tool_type: "function".to_string(),
+                function: super::schemas::chat_completions::FunctionDefinition {
+                    name: n.clone(),
+                    description: description.clone(),
+                    parameters: parameters.clone(),
+                    strict: *strict,
+                },
+            }),
             // Other tool types (code_interpreter, file_search, etc.) don't map to Chat Completions
             _ => {
                 debug!("Skipping non-function tool type in conversion");
@@ -593,7 +632,9 @@ fn convert_tool_choice(choice: &ResponseToolChoice) -> ChatToolChoice {
             if let Some(n) = name {
                 ChatToolChoice::Specific {
                     tool_type: tool_type.clone(),
-                    function: super::schemas::chat_completions::ToolChoiceFunction { name: n.clone() },
+                    function: super::schemas::chat_completions::ToolChoiceFunction {
+                        name: n.clone(),
+                    },
                 }
             } else {
                 ChatToolChoice::Mode("auto".to_string())
@@ -630,15 +671,12 @@ fn generate_item_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::schemas::responses::FunctionCallOutputItem;
+    use super::*;
     use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
 
     fn create_test_adapter() -> OpenResponsesAdapter<NoOpResponseStore, NoOpToolExecutor> {
-        OpenResponsesAdapter::new(
-            Arc::new(NoOpResponseStore),
-            Arc::new(NoOpToolExecutor),
-        )
+        OpenResponsesAdapter::new(Arc::new(NoOpResponseStore), Arc::new(NoOpToolExecutor))
     }
 
     #[test]

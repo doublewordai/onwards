@@ -81,7 +81,8 @@ pub trait ResponseStore: Send + Sync {
     /// * `Ok(Some(Value))` - The stored context if found
     /// * `Ok(None)` - If no response exists with this ID
     /// * `Err(StoreError)` - If retrieval failed
-    async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError>;
+    async fn get_context(&self, response_id: &str)
+    -> Result<Option<serde_json::Value>, StoreError>;
 }
 
 /// No-op implementation that always returns None.
@@ -99,7 +100,10 @@ impl ResponseStore for NoOpResponseStore {
         Ok(format!("noop_{}", uuid_simple()))
     }
 
-    async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get_context(
+        &self,
+        response_id: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
         // Always return None - no state is preserved
         tracing::debug!(
             response_id = %response_id,

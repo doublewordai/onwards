@@ -24,10 +24,10 @@ pub mod handlers;
 pub mod schemas;
 pub mod streaming;
 
-use crate::client::HttpClient;
 use crate::AppState;
-use axum::routing::{get, post};
+use crate::client::HttpClient;
 use axum::Router;
+use axum::routing::{get, post};
 use tracing::info;
 
 pub use adapter::OpenResponsesAdapter;
@@ -231,8 +231,7 @@ mod tests {
         assert!(requests[0].uri.contains("chat/completions"));
 
         // Parse the request body to verify conversion
-        let request_json: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(request_json["model"], "gpt-4o");
 
         // Verify messages array was created from input
@@ -268,8 +267,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
 
         // Parse the request body to verify system message was added
-        let request_json: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let messages = request_json["messages"].as_array().unwrap();
 
         // Should have system message first, then user message
@@ -409,8 +407,7 @@ mod tests {
 
         // Check the request was sent to chat completions with stream: true
         assert!(requests[0].uri.contains("chat/completions"));
-        let request_json: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(request_json["stream"], true);
     }
 }

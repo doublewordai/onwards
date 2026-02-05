@@ -4,7 +4,8 @@ use clap::Parser as _;
 use config::Config;
 use onwards::{
     AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
-    create_openai_sanitizer, strict::build_strict_router,
+    create_openai_sanitizer,
+    strict::build_strict_router,
     target::{Targets, WatchedFile},
 };
 use tokio::{net::TcpListener, task::JoinSet};

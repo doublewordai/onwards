@@ -120,8 +120,8 @@ pub enum Item {
 /// A message item
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageItem {
-    /// Optional unique identifier
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Unique identifier (required in responses, optional in requests)
+    #[serde(default)]
     pub id: Option<String>,
 
     /// The role of the message author
@@ -130,8 +130,8 @@ pub struct MessageItem {
     /// The message content
     pub content: MessageContent,
 
-    /// Current status of this item
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Current status of this item (required in responses, optional in requests)
+    #[serde(default)]
     pub status: Option<ItemStatus>,
 }
 
@@ -155,8 +155,10 @@ pub enum ContentPart {
     #[serde(rename = "output_text")]
     OutputText {
         text: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        annotations: Option<Vec<Annotation>>,
+        #[serde(default)]
+        annotations: Vec<Annotation>,
+        #[serde(default)]
+        logprobs: Vec<serde_json::Value>,
     },
 
     /// Input image content
@@ -194,8 +196,8 @@ pub struct Annotation {
 /// Function call item
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCallItem {
-    /// Unique identifier for this call
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Unique identifier (required in responses, optional in requests)
+    #[serde(default)]
     pub id: Option<String>,
 
     /// The ID to correlate with output
@@ -207,8 +209,8 @@ pub struct FunctionCallItem {
     /// Function arguments as JSON string
     pub arguments: String,
 
-    /// Current status of this item
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Current status of this item (required in responses, optional in requests)
+    #[serde(default)]
     pub status: Option<ItemStatus>,
 }
 
@@ -298,7 +300,7 @@ pub enum Tool {
         description: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         parameters: Option<serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Must always be present (boolean or null) per the spec
         strict: Option<bool>,
     },
 
@@ -413,6 +415,9 @@ pub enum TextFormat {
 }
 
 /// Response from POST /v1/responses
+///
+/// All fields are required by the Open Responses specification.
+/// Nullable fields must serialize as `null`, not be omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesResponse {
     /// Unique identifier for this response
@@ -424,34 +429,89 @@ pub struct ResponsesResponse {
     /// Unix timestamp of creation
     pub created_at: u64,
 
-    /// The model used
-    pub model: String,
+    /// Unix timestamp of completion (null if not yet completed)
+    pub completed_at: Option<u64>,
 
     /// Response status
     pub status: ResponseStatus,
 
+    /// Details about why response is incomplete (null if complete)
+    pub incomplete_details: Option<IncompleteDetails>,
+
+    /// The model used
+    pub model: String,
+
+    /// Reference to previous response (null if none)
+    pub previous_response_id: Option<String>,
+
+    /// System instructions (null if none)
+    pub instructions: Option<String>,
+
     /// Output items
     pub output: Vec<Item>,
 
-    /// Error information (if status is "failed")
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Error information (null if no error)
     pub error: Option<ResponseError>,
 
-    /// Incomplete status details
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_details: Option<IncompleteDetails>,
+    /// Tools available during generation
+    pub tools: Vec<Tool>,
 
-    /// Token usage
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// How the model chose which tool to use
+    pub tool_choice: serde_json::Value,
+
+    /// Context truncation strategy
+    pub truncation: TruncationStrategy,
+
+    /// Whether parallel tool calls were allowed
+    pub parallel_tool_calls: bool,
+
+    /// Text generation configuration
+    pub text: TextConfig,
+
+    /// Nucleus sampling parameter
+    pub top_p: f32,
+
+    /// Presence penalty
+    pub presence_penalty: f32,
+
+    /// Frequency penalty
+    pub frequency_penalty: f32,
+
+    /// Number of top logprobs returned
+    pub top_logprobs: u32,
+
+    /// Sampling temperature
+    pub temperature: f32,
+
+    /// Reasoning configuration (null if not used)
+    pub reasoning: Option<ReasoningConfig>,
+
+    /// Token usage (null if not available)
     pub usage: Option<ResponseUsage>,
 
+    /// Maximum output tokens (null if not set)
+    pub max_output_tokens: Option<u32>,
+
+    /// Maximum tool calls (null if not set)
+    pub max_tool_calls: Option<u32>,
+
+    /// Whether this response was stored
+    pub store: bool,
+
+    /// Whether this request ran in background
+    pub background: bool,
+
+    /// Service tier used
+    pub service_tier: String,
+
     /// Metadata
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 
-    /// Additional fields
-    #[serde(flatten)]
-    pub extra: Option<serde_json::Value>,
+    /// Safety identifier (null if not set)
+    pub safety_identifier: Option<String>,
+
+    /// Prompt cache key (null if not set)
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Response status
@@ -496,24 +556,20 @@ pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_tokens_details: Option<InputTokensDetails>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_tokens_details: Option<OutputTokensDetails>,
+    pub input_tokens_details: InputTokensDetails,
+    pub output_tokens_details: OutputTokensDetails,
 }
 
 /// Details about input tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputTokensDetails {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cached_tokens: Option<u32>,
+    pub cached_tokens: u32,
 }
 
 /// Details about output tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputTokensDetails {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_tokens: Option<u32>,
+    pub reasoning_tokens: u32,
 }
 
 #[cfg(test)]
@@ -582,8 +638,12 @@ mod tests {
             id: "resp_123".to_string(),
             object: "response".to_string(),
             created_at: 1234567890,
+            completed_at: Some(1234567891),
             model: "gpt-4o".to_string(),
             status: ResponseStatus::Completed,
+            incomplete_details: None,
+            previous_response_id: None,
+            instructions: None,
             output: vec![Item::Message(MessageItem {
                 id: Some("item_0".to_string()),
                 role: "assistant".to_string(),
@@ -591,21 +651,44 @@ mod tests {
                 status: Some(ItemStatus::Completed),
             })],
             error: None,
-            incomplete_details: None,
+            tools: vec![],
+            tool_choice: serde_json::Value::String("auto".to_string()),
+            truncation: TruncationStrategy::Disabled,
+            parallel_tool_calls: true,
+            text: TextConfig {
+                format: Some(TextFormat::Text),
+            },
+            top_p: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            top_logprobs: 0,
+            temperature: 1.0,
+            reasoning: None,
             usage: Some(ResponseUsage {
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 15,
-                input_tokens_details: None,
-                output_tokens_details: None,
+                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+                output_tokens_details: OutputTokensDetails {
+                    reasoning_tokens: 0,
+                },
             }),
+            max_output_tokens: None,
+            max_tool_calls: None,
+            store: false,
+            background: false,
+            service_tier: "default".to_string(),
             metadata: None,
-            extra: None,
+            safety_identifier: None,
+            prompt_cache_key: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("resp_123"));
         assert!(json.contains("completed"));
+        // Verify nullable fields are present as null
+        assert!(json.contains("\"previous_response_id\":null"));
+        assert!(json.contains("\"reasoning\":null"));
     }
 
     #[test]
