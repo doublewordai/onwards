@@ -410,4 +410,96 @@ mod tests {
         let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert_eq!(request_json["stream"], true);
     }
+
+    /// Test streaming with tool_calls finish reason.
+    ///
+    /// With the default NoOpToolExecutor, all tools are unhandled, so the
+    /// handler stops after one iteration (correct behavior — unhandled tools
+    /// are passed through to the client). Multi-iteration tool loop mechanics
+    /// are exercised by the streaming::tests unit tests.
+    #[tokio::test]
+    async fn test_streaming_adapter_tool_calls_unhandled() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Streaming response that finishes with tool_calls
+        let chunks = vec![
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_xyz\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"location\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "What's the weather in Paris?",
+            "stream": true,
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+            }]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("text/event-stream"));
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = std::str::from_utf8(&body_bytes).unwrap();
+
+        // With NoOpToolExecutor, tools are unhandled → single iteration, then complete
+        assert!(body_text.contains("response.created"));
+        assert!(body_text.contains("response.output_item.added"));
+        assert!(body_text.contains("response.completed"));
+
+        // Only one upstream request — no second iteration because tools are unhandled
+        let requests = mock_client.get_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "Should make only 1 request (tools are unhandled by NoOpToolExecutor)"
+        );
+        assert!(requests[0].uri.contains("chat/completions"));
+
+        // Verify stream_options.include_usage was set
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(request_json["stream"], true);
+        assert_eq!(
+            request_json["stream_options"]["include_usage"], true,
+            "Should set include_usage for streaming"
+        );
+    }
 }

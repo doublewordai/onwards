@@ -19,21 +19,19 @@ use super::schemas::responses::{
 };
 use crate::traits::{ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, warn};
 
 /// The Open Responses adapter that bridges the Responses API to Chat Completions
-pub struct OpenResponsesAdapter<S: ResponseStore, E: ToolExecutor> {
-    store: Arc<S>,
-    #[allow(dead_code)] // Will be used in tool loop orchestration
-    executor: Arc<E>,
-    #[allow(dead_code)] // Will be used in tool loop orchestration
+pub struct OpenResponsesAdapter {
+    store: Arc<dyn ResponseStore>,
+    executor: Arc<dyn ToolExecutor>,
     max_tool_iterations: u32,
 }
 
-impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
+impl OpenResponsesAdapter {
     /// Create a new adapter with the given store and executor
-    pub fn new(store: Arc<S>, executor: Arc<E>) -> Self {
+    pub fn new(store: Arc<dyn ResponseStore>, executor: Arc<dyn ToolExecutor>) -> Self {
         Self {
             store,
             executor,
@@ -106,7 +104,13 @@ impl<S: ResponseStore, E: ToolExecutor> OpenResponsesAdapter<S, E> {
             top_p: request.top_p,
             n: None,
             stream: request.stream,
-            stream_options: None,
+            stream_options: if request.stream == Some(true) {
+                Some(super::schemas::chat_completions::StreamOptions {
+                    include_usage: Some(true),
+                })
+            } else {
+                None
+            },
             stop: request.stop.clone().map(|s| match s {
                 super::schemas::responses::StopSequence::Single(s) => {
                     super::schemas::chat_completions::StopSequence::Single(s)
@@ -660,13 +664,12 @@ fn determine_response_status(choices: &[Choice]) -> ResponseStatus {
     }
 }
 
+static ITEM_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Generate a unique item ID
 fn generate_item_id() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("item_{:016x}", timestamp)
+    let count = ITEM_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("item_{:016x}", count)
 }
 
 #[cfg(test)]
@@ -675,7 +678,7 @@ mod tests {
     use super::*;
     use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
 
-    fn create_test_adapter() -> OpenResponsesAdapter<NoOpResponseStore, NoOpToolExecutor> {
+    fn create_test_adapter() -> OpenResponsesAdapter {
         OpenResponsesAdapter::new(Arc::new(NoOpResponseStore), Arc::new(NoOpToolExecutor))
     }
 
@@ -843,6 +846,80 @@ mod tests {
         assert_eq!(
             determine_response_status(&choices_tool_calls),
             ResponseStatus::RequiresAction
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_options_set_when_streaming() {
+        let adapter = create_test_adapter();
+
+        let request = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: Some(Input::Text("Hello".to_string())),
+            stream: Some(true),
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            truncation: None,
+            user: None,
+            reasoning: None,
+            text: None,
+            extra: None,
+        };
+
+        let chat_request = adapter.to_chat_request(&request).await.unwrap();
+        let opts = chat_request
+            .stream_options
+            .expect("stream_options should be set");
+        assert_eq!(opts.include_usage, Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_stream_options_none_when_not_streaming() {
+        let adapter = create_test_adapter();
+
+        let request = ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: Some(Input::Text("Hello".to_string())),
+            stream: None,
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            truncation: None,
+            user: None,
+            reasoning: None,
+            text: None,
+            extra: None,
+        };
+
+        let chat_request = adapter.to_chat_request(&request).await.unwrap();
+        assert!(chat_request.stream_options.is_none());
+    }
+
+    #[test]
+    fn test_generate_item_id_unique() {
+        let ids: Vec<String> = (0..100).map(|_| generate_item_id()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "All generated IDs should be unique"
         );
     }
 }

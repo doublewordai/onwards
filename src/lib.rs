@@ -55,6 +55,7 @@ pub mod traits;
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+use traits::{NoOpResponseStore, NoOpToolExecutor, ResponseStore, ToolExecutor};
 
 /// Type alias for body transformation function
 ///
@@ -183,6 +184,8 @@ pub struct AppState<T: HttpClient> {
     pub targets: target::Targets,
     pub body_transform_fn: Option<BodyTransformFn>,
     pub response_transform_fn: Option<ResponseTransformFn>,
+    pub tool_executor: Arc<dyn ToolExecutor>,
+    pub response_store: Arc<dyn ResponseStore>,
 }
 
 impl<T: HttpClient> std::fmt::Debug for AppState<T> {
@@ -198,6 +201,8 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
+            .field("tool_executor", &"<dyn ToolExecutor>")
+            .field("response_store", &"<dyn ResponseStore>")
             .finish()
     }
 }
@@ -211,6 +216,8 @@ impl AppState<HyperClient> {
             targets,
             body_transform_fn: None,
             response_transform_fn: None,
+            tool_executor: Arc::new(NoOpToolExecutor),
+            response_store: Arc::new(NoOpResponseStore),
         }
     }
 
@@ -222,6 +229,8 @@ impl AppState<HyperClient> {
             targets,
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
+            tool_executor: Arc::new(NoOpToolExecutor),
+            response_store: Arc::new(NoOpResponseStore),
         }
     }
 }
@@ -234,6 +243,8 @@ impl<T: HttpClient> AppState<T> {
             targets,
             body_transform_fn: None,
             response_transform_fn: None,
+            tool_executor: Arc::new(NoOpToolExecutor),
+            response_store: Arc::new(NoOpResponseStore),
         }
     }
 
@@ -248,12 +259,26 @@ impl<T: HttpClient> AppState<T> {
             targets,
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
+            tool_executor: Arc::new(NoOpToolExecutor),
+            response_store: Arc::new(NoOpResponseStore),
         }
     }
 
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
+        self
+    }
+
+    /// Set the tool executor for server-side tool handling (builder pattern)
+    pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
+        self.tool_executor = executor;
+        self
+    }
+
+    /// Set the response store for stateful conversations (builder pattern)
+    pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
+        self.response_store = store;
         self
     }
 }
@@ -540,6 +565,37 @@ pub mod test_utils {
                     let stream = stream::iter(
                         chunks
                             .clone()
+                            .into_iter()
+                            .map(|chunk| Ok::<_, std::io::Error>(chunk.into_bytes())),
+                    );
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
+        /// Create a mock that returns a different streaming response for each
+        /// successive call. Useful for testing tool loops where the first call
+        /// returns `tool_calls` and the second returns `stop`.
+        pub fn new_streaming_sequence(status: StatusCode, responses: Vec<Vec<String>>) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+                    use futures_util::stream;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let chunks = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = stream::iter(
+                        chunks
                             .into_iter()
                             .map(|chunk| Ok::<_, std::io::Error>(chunk.into_bytes())),
                     );

@@ -3,15 +3,16 @@
 //! These handlers validate requests using Axum's Json extractor (which uses serde)
 //! before forwarding to the upstream provider.
 
-use super::adapter::OpenResponsesAdapter;
-use super::schemas::chat_completions::{ChatCompletionRequest, ChatCompletionResponse};
+use super::adapter::{OpenResponsesAdapter, PendingToolCall};
+use super::schemas::chat_completions::{
+    ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionCall, ToolCall,
+};
 use super::schemas::embeddings::EmbeddingsRequest;
 use super::schemas::responses::ResponsesRequest;
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::handlers::target_message_handler;
-use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -20,7 +21,6 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
-use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Handler for GET /v1/models
@@ -156,10 +156,8 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     request: ResponsesRequest,
 ) -> Response {
-    // Create adapter with no-op implementations for now
-    // In production, these would be configurable
     let adapter =
-        OpenResponsesAdapter::new(Arc::new(NoOpResponseStore), Arc::new(NoOpToolExecutor));
+        OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
 
     // Convert the Responses request to a Chat Completions request
     let mut chat_request = match adapter.to_chat_request(&request).await {
@@ -351,8 +349,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
 /// Handle a streaming request using the Open Responses adapter
 ///
-/// This function transforms the upstream Chat Completions SSE stream into
-/// Open Responses semantic events using the StreamingState state machine.
+/// Transforms the upstream Chat Completions SSE stream into Open Responses
+/// semantic events. Supports tool loop orchestration: when the upstream
+/// finishes with `tool_calls`, tools are executed server-side, results are
+/// appended to messages, and a new streaming request is made. This repeats
+/// until the upstream finishes without tool calls or max iterations is reached.
 async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     headers: HeaderMap,
@@ -375,15 +376,20 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         }
     };
 
-    // Forward to Chat Completions endpoint
-    let response = forward_request_raw(state, headers, "/v1/chat/completions", body_bytes).await;
+    // Make the first request outside the stream block so we can inspect
+    // the HTTP status and content-type before committing to SSE.
+    let response = forward_request_raw(
+        state.clone(),
+        headers.clone(),
+        "/v1/chat/completions",
+        body_bytes,
+    )
+    .await;
 
-    // Check if the response is successful
     if !response.status().is_success() {
         return response;
     }
 
-    // Check content type to ensure it's SSE
     let content_type = response
         .headers()
         .get("content-type")
@@ -395,78 +401,187 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
             content_type = content_type,
             "Expected SSE stream but got different content type"
         );
-        // Try to handle as non-streaming response
         return response;
     }
 
-    // Get the response body as a stream
-    let (parts, body) = response.into_parts();
-    let byte_stream = body.into_data_stream();
-
+    let (parts, first_body) = response.into_parts();
     let request_model = request.model.clone();
 
-    // Create a transformed stream that converts Chat Completions chunks to Open Responses events
+    let adapter =
+        OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
+    let max_iterations = adapter.max_iterations();
+
+    // Build a transformed stream that converts Chat Completions chunks to
+    // Open Responses events, with tool loop support.
     let transformed_stream = async_stream::stream! {
-        let mut state = StreamingState::new(&request);
-        let mut buffer = String::new();
+        let mut streaming_state = StreamingState::new(&request);
+        let mut messages = chat_request.messages.clone();
+        let mut current_body = Some(first_body);
+        let mut iteration = 0u32;
 
-        let mut pinned_stream = std::pin::pin!(byte_stream);
+        while let Some(body) = current_body.take() {
+            iteration += 1;
+            let byte_stream = body.into_data_stream();
+            let mut buffer = String::new();
+            let mut last_finish_reason: Option<String> = None;
 
-        while let Some(chunk_result) = pinned_stream.next().await {
-            match chunk_result {
-                Ok(bytes) => {
-                    // Append bytes to buffer
-                    if let Ok(text) = std::str::from_utf8(&bytes) {
-                        buffer.push_str(text);
-                    } else {
-                        continue;
-                    }
+            let pinned_stream = std::pin::pin!(byte_stream);
+            let mut stream = pinned_stream;
 
-                    // Process complete SSE events from buffer
-                    while let Some(event_end) = buffer.find("\n\n") {
-                        let event_text = buffer[..event_end].to_string();
-                        buffer = buffer[event_end + 2..].to_string();
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        if let Ok(text) = std::str::from_utf8(&bytes) {
+                            buffer.push_str(text);
+                        } else {
+                            continue;
+                        }
 
-                        // Parse SSE event
-                        for line in event_text.lines() {
-                            if let Some(data) = line.strip_prefix("data: ") {
-                                // Check for [DONE] marker
-                                if data.trim() == "[DONE]" {
-                                    trace!("Received [DONE] marker");
-                                    // Finalize and emit completion events
-                                    let final_events = state.finalize();
-                                    for event in final_events {
-                                        yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+                        while let Some(event_end) = buffer.find("\n\n") {
+                            let event_text = buffer[..event_end].to_string();
+                            buffer = buffer[event_end + 2..].to_string();
+
+                            for line in event_text.lines() {
+                                if let Some(data) = line.strip_prefix("data: ") {
+                                    if data.trim() == "[DONE]" {
+                                        trace!("Received [DONE] marker");
+                                        continue;
                                     }
-                                    continue;
-                                }
 
-                                // Parse as chat completion chunk
-                                if let Some(chunk) = parse_chat_chunk(data) {
-                                    trace!(chunk_id = %chunk.id, "Processing chat chunk");
-                                    let events = state.process_chunk(&chunk);
-                                    for event in events {
-                                        yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+                                    if let Some(chunk) = parse_chat_chunk(data) {
+                                        // Track finish_reason for tool loop decision
+                                        for choice in &chunk.choices {
+                                            if let Some(ref reason) = choice.finish_reason {
+                                                last_finish_reason = Some(reason.clone());
+                                            }
+                                        }
+
+                                        trace!(chunk_id = %chunk.id, "Processing chat chunk");
+                                        let events = streaming_state.process_chunk(&chunk);
+                                        for event in events {
+                                            yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-                Err(e) => {
-                    error!(error = %e, "Error reading stream");
-                    break;
+                    Err(e) => {
+                        error!(error = %e, "Error reading stream");
+                        break;
+                    }
                 }
             }
+
+            // Stream for this iteration is exhausted. Check if we need to
+            // execute tools and loop.
+            if last_finish_reason.as_deref() == Some("tool_calls") && iteration < max_iterations {
+                let pending = streaming_state.extract_tool_calls();
+                if pending.is_empty() {
+                    debug!("finish_reason was tool_calls but no tool calls found");
+                    break;
+                }
+
+                debug!(
+                    iteration,
+                    tool_count = pending.len(),
+                    "Streaming tool loop: executing tools"
+                );
+
+                let tool_calls: Vec<PendingToolCall> = pending
+                    .into_iter()
+                    .map(|(id, name, args)| PendingToolCall {
+                        id,
+                        name,
+                        arguments: args,
+                    })
+                    .collect();
+
+                let results = adapter.execute_tool_calls(&tool_calls).await;
+
+                // If any tools are unhandled, stop looping — the client
+                // already has the tool_call events and can act on them.
+                if adapter.has_unhandled_tools(&results) {
+                    debug!("Unhandled tools in streaming mode, stopping loop");
+                    break;
+                }
+
+                // Build the assistant message (with tool calls) to append
+                // to the conversation for the next iteration.
+                let assistant_msg = ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    name: None,
+                    tool_calls: Some(
+                        tool_calls
+                            .iter()
+                            .map(|tc| ToolCall {
+                                id: tc.id.clone(),
+                                call_type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: tc.name.clone(),
+                                    arguments: tc.arguments.clone(),
+                                },
+                            })
+                            .collect(),
+                    ),
+                    tool_call_id: None,
+                    extra: None,
+                };
+
+                adapter.add_tool_results_to_messages(&mut messages, &assistant_msg, &results);
+
+                // Advance the streaming state so new items get fresh indices.
+                streaming_state.prepare_next_iteration();
+
+                // Build and send the next streaming request.
+                let mut next_request = chat_request.clone();
+                next_request.messages = messages.clone();
+
+                let body_bytes = match serde_json::to_vec(&next_request) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!(error = %e, "Failed to serialize next tool-loop iteration");
+                        break;
+                    }
+                };
+
+                let next_response = forward_request_raw(
+                    state.clone(),
+                    headers.clone(),
+                    "/v1/chat/completions",
+                    body_bytes,
+                )
+                .await;
+
+                if !next_response.status().is_success() {
+                    error!(
+                        status = %next_response.status(),
+                        "Upstream error during streaming tool loop"
+                    );
+                    break;
+                }
+
+                let (_, next_body) = next_response.into_parts();
+                current_body = Some(next_body);
+                continue;
+            }
+
+            // No tool calls or max iterations reached — done.
+            break;
         }
 
-        // Yield final [DONE] marker for Open Responses format
+        // Finalize: emit done events for any remaining items + response.completed
+        let final_events = streaming_state.finalize();
+        for event in final_events {
+            yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
+        }
+
         yield Ok::<_, std::io::Error>("data: [DONE]\n\n".to_string().into_bytes());
     };
 
     info!(model = %request_model, "Streaming adapter response started");
 
-    // Build the streaming response
     Response::builder()
         .status(parts.status)
         .header("content-type", "text/event-stream")
@@ -577,63 +692,6 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     });
 
     (status, Json(body)).into_response()
-}
-
-/// Custom rejection handler for JSON parsing errors
-pub async fn handle_json_rejection(
-    err: axum::extract::rejection::JsonRejection,
-) -> impl IntoResponse {
-    let (status, error_type, message) = match err {
-        axum::extract::rejection::JsonRejection::JsonDataError(e) => {
-            warn!(error = %e, "Invalid JSON data");
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("Invalid JSON: {}", e),
-            )
-        }
-        axum::extract::rejection::JsonRejection::JsonSyntaxError(e) => {
-            warn!(error = %e, "JSON syntax error");
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                format!("JSON syntax error: {}", e),
-            )
-        }
-        axum::extract::rejection::JsonRejection::MissingJsonContentType(e) => {
-            warn!(error = %e, "Missing content type");
-            (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "invalid_request_error",
-                "Content-Type must be application/json".to_string(),
-            )
-        }
-        axum::extract::rejection::JsonRejection::BytesRejection(e) => {
-            warn!(error = %e, "Failed to read request body");
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Failed to read request body".to_string(),
-            )
-        }
-        _ => {
-            error!("Unknown JSON rejection");
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Invalid request".to_string(),
-            )
-        }
-    };
-
-    let body = json!({
-        "error": {
-            "type": error_type,
-            "message": message
-        }
-    });
-
-    (status, Json(body))
 }
 
 #[cfg(test)]
