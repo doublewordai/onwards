@@ -6,17 +6,21 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use onwards::{AppState, build_router, target::Targets};
+//! use onwards::{AppState, build_router, config::Config, target::Targets};
 //! use axum::serve;
 //! use tokio::net::TcpListener;
+//! use clap::Parser;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Parse CLI configuration
+//!     let config = Config::parse();
+//!     
 //!     // Load targets from configuration file
-//!     let targets = Targets::from_config_file(&"config.json".into()).await?;
+//!     let targets = Targets::from_config_file(&config.targets).await?;
 //!
-//!     // Create application state
-//!     let app_state = AppState::new(targets);
+//!     // Create application state with connection pool settings from config
+//!     let app_state = AppState::new(targets, &config);
 //!
 //!     // Build router with proxy routes
 //!     let app = build_router(app_state);
@@ -42,6 +46,7 @@ use tracing::{info, instrument};
 
 pub mod auth;
 pub mod client;
+pub mod config;
 pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
@@ -149,29 +154,33 @@ pub type ResponseTransformFn = Arc<
 ///
 /// Basic setup:
 /// ```no_run
-/// use onwards::{AppState, target::Targets};
+/// use onwards::{AppState, config::Config, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
-/// let app_state = AppState::new(targets);
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
+/// let app_state = AppState::new(targets, &config);
 /// # Ok(())
 /// # }
 /// ```
 ///
 /// With request transformation:
 /// ```no_run
-/// use onwards::{AppState, BodyTransformFn, target::Targets};
+/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
 /// use std::sync::Arc;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 ///
 /// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
 ///     // Custom transformation logic
 ///     None
 /// });
 ///
-/// let app_state = AppState::with_transform(targets, transform);
+/// let app_state = AppState::with_transform(targets, &config, transform);
 /// # Ok(())
 /// # }
 /// ```
@@ -202,8 +211,11 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
 
 impl AppState<HyperClient> {
     /// Create a new AppState with the default Hyper client
-    pub fn new(targets: target::Targets) -> Self {
-        let http_client = client::create_hyper_client();
+    pub fn new(targets: target::Targets, config: &crate::config::Config) -> Self {
+        let http_client = client::create_hyper_client(
+            config.pool_max_idle_per_host,
+            config.pool_idle_timeout_secs,
+        );
         Self {
             http_client,
             targets,
@@ -213,8 +225,15 @@ impl AppState<HyperClient> {
     }
 
     /// Create a new AppState with the default Hyper client and a body transformation function
-    pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let http_client = client::create_hyper_client();
+    pub fn with_transform(
+        targets: target::Targets,
+        config: &crate::config::Config,
+        body_transform_fn: BodyTransformFn,
+    ) -> Self {
+        let http_client = client::create_hyper_client(
+            config.pool_max_idle_per_host,
+            config.pool_idle_timeout_secs,
+        );
         Self {
             http_client,
             targets,
@@ -333,11 +352,13 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Opt
 /// # Examples
 ///
 /// ```no_run
-/// use onwards::{AppState, create_openai_sanitizer, target::Targets};
+/// use onwards::{AppState, config::Config, create_openai_sanitizer, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
-/// let app_state = AppState::new(targets)
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
+/// let app_state = AppState::new(targets, &config)
 ///     .with_response_transform(create_openai_sanitizer());
 /// # Ok(())
 /// # }
@@ -374,10 +395,12 @@ pub fn create_openai_sanitizer() -> ResponseTransformFn {
 /// use onwards::{AppState, build_router, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
-/// let app_state = AppState::new(targets);
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
+/// let app_state = AppState::new(targets, &config);
 /// let router = build_router(app_state);
 ///
 /// let listener = TcpListener::bind("0.0.0.0:3000").await?;
@@ -456,10 +479,12 @@ type MetricsLayerAndHandle = (
 /// use onwards::{AppState, build_router, build_metrics_router, build_metrics_layer_and_handle, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
-/// let app_state = AppState::new(targets);
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
+/// let app_state = AppState::new(targets, &config);
 ///
 /// // Build metrics layer and handle
 /// let (metrics_layer, metrics_handle) = build_metrics_layer_and_handle("myapp");
@@ -1638,7 +1663,18 @@ mod tests {
             let metrics_router = build_metrics_router(handle);
             let metrics_server = TestServer::new(metrics_router).unwrap();
 
-            let app_state = AppState::new(targets);
+            // Create default config for tests
+            let config = crate::config::Config {
+                port: 3000,
+                targets: std::path::PathBuf::from("config.json"),
+                watch: false,
+                metrics: false,
+                metrics_port: 9090,
+                metrics_prefix: "onwards".to_string(),
+                pool_max_idle_per_host: 100,
+                pool_idle_timeout_secs: 90,
+            };
+            let app_state = AppState::new(targets, &config);
             let router = build_router(app_state).layer(prometheus_layer);
             let server = TestServer::new(router).unwrap();
 

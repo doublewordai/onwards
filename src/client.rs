@@ -33,25 +33,22 @@ impl HttpClient for HyperClient {
     }
 }
 
-pub fn create_hyper_client() -> HyperClient {
+/// Create a hyper HTTP client with connection pooling configured
+///
+/// Connection pooling reuses HTTP connections instead of creating new ones for each request,
+/// dramatically reducing file descriptor usage and eliminating TIME_WAIT connection accumulation.
+///
+/// See README for performance tuning guidance based on deployment scenarios.
+pub fn create_hyper_client(
+    pool_max_idle_per_host: usize,
+    pool_idle_timeout_secs: u64,
+) -> HyperClient {
     let https = hyper_tls::HttpsConnector::new();
 
-    // Connection pool configuration via environment variables
-    // Defaults are conservative, increase for high-volume deployments
-    let pool_idle_timeout_secs = std::env::var("ONWARDS_POOL_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(90);
-
-    let pool_max_idle_per_host = std::env::var("ONWARDS_POOL_MAX_IDLE_PER_HOST")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(100);
-
-    tracing::debug!(
-        "HTTP client pool config: idle_timeout={}s, max_idle_per_host={}",
-        pool_idle_timeout_secs,
-        pool_max_idle_per_host
+    tracing::info!(
+        "Creating HTTP client with connection pool: max_idle_per_host={}, idle_timeout={}s",
+        pool_max_idle_per_host,
+        pool_idle_timeout_secs
     );
 
     Client::builder(TokioExecutor::new())
