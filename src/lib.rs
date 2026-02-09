@@ -1205,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_blocks_requests() {
-        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that blocks requests
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_allows_requests() {
-        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that allows requests
@@ -1321,7 +1321,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_with_mixed_targets() {
-        use crate::target::{RateLimiter, RateLimitExceeded, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create different rate limiters

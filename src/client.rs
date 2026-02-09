@@ -36,9 +36,27 @@ impl HttpClient for HyperClient {
 pub fn create_hyper_client() -> HyperClient {
     let https = hyper_tls::HttpsConnector::new();
 
+    // Connection pool configuration via environment variables
+    // Defaults are conservative, increase for high-volume deployments
+    let pool_idle_timeout_secs = std::env::var("ONWARDS_POOL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(90);
+
+    let pool_max_idle_per_host = std::env::var("ONWARDS_POOL_MAX_IDLE_PER_HOST")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100);
+
+    tracing::debug!(
+        "HTTP client pool config: idle_timeout={}s, max_idle_per_host={}",
+        pool_idle_timeout_secs,
+        pool_max_idle_per_host
+    );
+
     Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(100)
+        .pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs))
+        .pool_max_idle_per_host(pool_max_idle_per_host)
         .pool_timer(hyper_util::rt::TokioTimer::new())
         .build(https)
 }
