@@ -7,6 +7,7 @@
 //! - Deserializing third-party responses through our strict schemas (drops extra fields)
 //! - Rewriting model field to match the originally requested model
 //! - Re-serializing with only our defined fields (prevents info leakage)
+//! - Sanitizing error responses to prevent third-party info leakage
 
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
@@ -77,7 +78,8 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
             sanitize_chat_response(response, original_model).await
         }
     } else {
-        response
+        // Sanitize error responses to prevent third-party info leakage
+        sanitize_error_response(response).await
     }
 }
 
@@ -148,7 +150,8 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if response.status().is_success() {
         sanitize_embeddings_response(response, original_model).await
     } else {
-        response
+        // Sanitize error responses to prevent third-party info leakage
+        sanitize_error_response(response).await
     }
 }
 
@@ -352,6 +355,53 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
             response
         }
     }
+}
+
+/// Sanitize error responses from third parties
+///
+/// In strict mode, we never pass through third-party error messages.
+/// Instead, we return standard HTTP error responses based on status code.
+/// The actual error is logged for debugging but never sent to the client.
+async fn sanitize_error_response(mut response: Response) -> Response {
+    let status = response.status();
+
+    // Read and log the actual error for debugging
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read error response body");
+                return standard_error_response(status);
+            }
+        };
+
+    // Log the actual third-party error (never sent to client)
+    error!(
+        status = %status,
+        third_party_error = ?String::from_utf8_lossy(&body_bytes),
+        "Third-party error response (logged, not forwarded)"
+    );
+
+    // Return standard error based on status code
+    standard_error_response(status)
+}
+
+/// Generate standard error response based on HTTP status code
+/// Never includes third-party error details
+fn standard_error_response(status: StatusCode) -> Response {
+    let (error_type, message) = match status.as_u16() {
+        400 => ("invalid_request_error", "Invalid request"),
+        401 => ("authentication_error", "Authentication failed"),
+        403 => ("permission_error", "Permission denied"),
+        404 => ("not_found_error", "Not found"),
+        429 => ("rate_limit_error", "Rate limit exceeded"),
+        500 => ("api_error", "Internal server error"),
+        502 => ("api_error", "Bad gateway"),
+        503 => ("api_error", "Service unavailable"),
+        _ => ("api_error", "An error occurred"),
+    };
+
+    error_response(status, error_type, message)
 }
 
 #[cfg(test)]
@@ -742,5 +792,180 @@ mod tests {
         // Model should be rewritten
         assert!(body_str.contains("\"model\":\"text-embedding-3-small\""));
         assert!(!body_str.contains("text-embedding-3-small-internal"));
+    }
+
+    /// Test that error responses return standard messages (no third-party details)
+    #[tokio::test]
+    async fn test_strict_error_returns_standard_message() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party error with internal fields (should be completely replaced)
+        let mock_error_response = r#"{
+            "error": {
+                "message": "Database connection failed at postgresql://internal-db:5432",
+                "type": "internal_error",
+                "provider": "custom-llm-backend",
+                "internal_trace_id": "xyz-123-abc",
+                "debug_info": "Stack trace: error at line 42"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::BAD_REQUEST, mock_error_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should return standard error message
+        assert!(body_str.contains("\"error\""));
+        assert!(body_str.contains("\"type\":\"invalid_request_error\""));
+        assert!(body_str.contains("\"message\":\"Invalid request\""));
+
+        // Should NOT contain ANY third-party content
+        assert!(!body_str.contains("Database"));
+        assert!(!body_str.contains("postgresql"));
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("internal_trace_id"));
+        assert!(!body_str.contains("debug_info"));
+    }
+
+    /// Test that 500 errors return standard "Internal server error" message
+    #[tokio::test]
+    async fn test_strict_error_500_returns_standard_message() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party error with leaky message
+        let mock_error_response = r#"{
+            "error": {
+                "message": "Contact support@provider.com with trace ID abc-123",
+                "type": "server_error"
+            }
+        }"#;
+
+        let mock_client =
+            MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should return standard 500 error message
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("\"message\":\"Internal server error\""));
+
+        // Should NOT contain third-party contact info
+        assert!(!body_str.contains("support@provider.com"));
+        assert!(!body_str.contains("trace ID abc-123"));
+    }
+
+    /// Test that malformed error responses are handled gracefully
+    #[tokio::test]
+    async fn test_strict_handle_malformed_error_response() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Non-JSON error response (e.g., plain text or HTML)
+        let mock_error_response = "<html><body>Internal Server Error</body></html>";
+
+        let mock_client =
+            MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should return clean JSON error, not HTML
+        assert!(!body_str.contains("<html>"));
+        assert!(!body_str.contains("<body>"));
+        assert!(body_str.contains("\"error\""));
+
+        // Should parse as valid JSON
+        let _: serde_json::Value = serde_json::from_str(&body_str).expect("Should be valid JSON");
     }
 }
