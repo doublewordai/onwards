@@ -2,9 +2,16 @@
 //!
 //! These handlers validate requests using Axum's Json extractor (which uses serde)
 //! before forwarding to the upstream provider.
+//!
+//! For responses, strict mode provides security by:
+//! - Deserializing third-party responses through our strict schemas (drops extra fields)
+//! - Rewriting model field to match the originally requested model
+//! - Re-serializing with only our defined fields (prevents info leakage)
 
-use super::schemas::chat_completions::ChatCompletionRequest;
-use super::schemas::embeddings::EmbeddingsRequest;
+use super::schemas::chat_completions::{
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+};
+use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use super::schemas::responses::ResponsesRequest;
 use crate::AppState;
 use crate::client::HttpClient;
@@ -14,8 +21,9 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 use serde_json::json;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Handler for GET /v1/models
 ///
@@ -36,10 +44,13 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    let original_model = request.model.clone();
+    let is_streaming = request.stream.unwrap_or(false);
+
     debug!(
-        model = %request.model,
+        model = %original_model,
         messages_count = request.messages.len(),
-        stream = ?request.stream,
+        stream = is_streaming,
         "Chat completions request validated"
     );
 
@@ -56,7 +67,18 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    forward_request(state, headers, "/v1/chat/completions", body_bytes).await
+    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
+
+    // Sanitize response to ensure model field matches and extra fields are dropped
+    if response.status().is_success() {
+        if is_streaming {
+            sanitize_streaming_chat_response(response, original_model).await
+        } else {
+            sanitize_chat_response(response, original_model).await
+        }
+    } else {
+        response
+    }
 }
 
 /// Handler for POST /v1/responses
@@ -100,8 +122,10 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     Json(request): Json<EmbeddingsRequest>,
 ) -> Response {
+    let original_model = request.model.clone();
+
     debug!(
-        model = %request.model,
+        model = %original_model,
         "Embeddings request validated"
     );
 
@@ -118,7 +142,14 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    forward_request(state, headers, "/v1/embeddings", body_bytes).await
+    let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
+
+    // Sanitize response
+    if response.status().is_success() {
+        sanitize_embeddings_response(response, original_model).await
+    } else {
+        response
+    }
 }
 
 /// Forward a validated request to the upstream provider
@@ -173,9 +204,166 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     (status, Json(body)).into_response()
 }
 
+/// Sanitize non-streaming chat completion response
+///
+/// Deserializes the response through our strict schema (drops extra fields),
+/// rewrites the model field, and re-serializes.
+async fn sanitize_chat_response(mut response: Response, original_model: String) -> Response {
+    // Read the response body
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read response body for sanitization");
+                return response;
+            }
+        };
+
+    // Deserialize through our strict schema (automatically drops extra fields)
+    let mut chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(error = %e, "Failed to deserialize chat response, passing through");
+            *response.body_mut() = Body::from(body_bytes);
+            return response;
+        }
+    };
+
+    // Rewrite model field to match original request
+    chat_response.model = original_model;
+
+    // Re-serialize with only our defined fields
+    match serde_json::to_vec(&chat_response) {
+        Ok(sanitized_bytes) => {
+            *response.body_mut() = Body::from(sanitized_bytes);
+            debug!("Sanitized non-streaming chat completion response");
+            response
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to serialize sanitized response");
+            *response.body_mut() = Body::from(body_bytes);
+            response
+        }
+    }
+}
+
+/// Sanitize streaming chat completion response
+///
+/// Processes each SSE chunk, deserializes through our strict schema,
+/// rewrites the model field, and re-serializes.
+async fn sanitize_streaming_chat_response(
+    mut response: Response,
+    original_model: String,
+) -> Response {
+    let body_stream =
+        http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
+
+    let sanitized_stream = body_stream.map(move |chunk_result| {
+        match chunk_result {
+            Ok(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+
+                // Process SSE format: "data: {...}\n\n"
+                if chunk_str.starts_with("data: ") {
+                    let json_part = chunk_str.trim_start_matches("data: ").trim();
+
+                    // Handle [DONE] marker
+                    if json_part == "[DONE]" {
+                        return Ok(chunk);
+                    }
+
+                    // Deserialize the chunk through our strict schema
+                    match serde_json::from_str::<ChatCompletionChunk>(json_part) {
+                        Ok(mut chunk_data) => {
+                            // Rewrite model field
+                            chunk_data.model = original_model.clone();
+
+                            // Re-serialize
+                            match serde_json::to_string(&chunk_data) {
+                                Ok(sanitized_json) => {
+                                    let sanitized_chunk = format!("data: {}\n\n", sanitized_json);
+                                    Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                                        sanitized_chunk,
+                                    ))
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "Failed to serialize chunk");
+                                    Ok(chunk)
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to parse SSE chunk, passing through");
+                            Ok(chunk)
+                        }
+                    }
+                } else {
+                    // Non-data line (e.g., event: type), pass through
+                    Ok(chunk)
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "Stream error");
+                Err(std::io::Error::other(e))
+            }
+        }
+    });
+
+    *response.body_mut() = Body::from_stream(sanitized_stream);
+    debug!("Set up streaming chat completion response sanitization");
+    response
+}
+
+/// Sanitize embeddings response
+///
+/// Deserializes the response through our strict schema (drops extra fields),
+/// rewrites the model field, and re-serializes.
+async fn sanitize_embeddings_response(mut response: Response, original_model: String) -> Response {
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read embeddings response body");
+                return response;
+            }
+        };
+
+    let mut embeddings_response: EmbeddingsResponse = match serde_json::from_slice(&body_bytes) {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(error = %e, "Failed to deserialize embeddings response, passing through");
+            *response.body_mut() = Body::from(body_bytes);
+            return response;
+        }
+    };
+
+    // Rewrite model field
+    embeddings_response.model = original_model;
+
+    match serde_json::to_vec(&embeddings_response) {
+        Ok(sanitized_bytes) => {
+            *response.body_mut() = Body::from(sanitized_bytes);
+            debug!("Sanitized embeddings response");
+            response
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to serialize sanitized embeddings response");
+            *response.body_mut() = Body::from(body_bytes);
+            response
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::{Target, Targets};
+    use crate::test_utils::MockHttpClient;
+    use axum::body::Body;
+    use axum::http::Request;
+    use dashmap::DashMap;
+    use std::sync::Arc;
+    use tower::ServiceExt;
 
     #[test]
     fn test_error_response_format() {
@@ -185,5 +373,374 @@ mod tests {
             "Test error",
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Test that non-streaming chat responses drop extra fields from third parties
+    #[tokio::test]
+    async fn test_strict_sanitize_non_streaming_removes_unknown_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party response with extra fields that should be stripped
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider": "custom-llm-provider",
+            "cost": 0.00123,
+            "internal_id": "xyz-123",
+            "custom_field": "should_be_removed"
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify standard fields are present
+        assert!(body_str.contains("\"id\":\"chatcmpl-123\""));
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+        assert!(body_str.contains("\"choices\""));
+
+        // Verify extra fields are NOT present
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("cost"));
+        assert!(!body_str.contains("internal_id"));
+        assert!(!body_str.contains("custom_field"));
+    }
+
+    /// Test that strict mode rewrites the model field to match the requested model
+    #[tokio::test]
+    async fn test_strict_sanitize_rewrites_model_field() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .onwards_model("gpt-4-turbo-2024-04-09".to_string()) // Maps to internal model
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party returns internal model name
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4-turbo-2024-04-09",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Model should be rewritten to the client-requested model
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+        assert!(!body_str.contains("gpt-4-turbo-2024-04-09"));
+    }
+
+    /// Test that streaming responses drop extra fields from third parties
+    #[tokio::test]
+    async fn test_strict_sanitize_streaming_removes_unknown_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        let streaming_chunks = vec![
+            r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}],"provider":"custom-provider","cost":0.001}
+
+"#.to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify extra fields are NOT present
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("cost"));
+        // Verify [DONE] is preserved
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    /// Test that streaming responses rewrite the model field
+    #[tokio::test]
+    async fn test_strict_sanitize_streaming_rewrites_model() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .onwards_model("gpt-4-turbo".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        let streaming_chunks = vec![
+            r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1677652288,"model":"gpt-4-turbo","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+"#.to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Model should be rewritten to client-requested model
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+        assert!(!body_str.contains("gpt-4-turbo"));
+    }
+
+    /// Test that embeddings responses drop extra fields from third parties
+    #[tokio::test]
+    async fn test_strict_sanitize_embeddings_removes_unknown_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "text-embedding-3-small".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party response with extra fields
+        let mock_response = r#"{
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": [0.1, 0.2, 0.3],
+                "index": 0
+            }],
+            "model": "text-embedding-3-small",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            },
+            "provider": "custom-embeddings",
+            "cost": 0.0001,
+            "cache_hit": true
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"text-embedding-3-small","input":"Hello world"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify standard fields are present
+        assert!(body_str.contains("\"object\":\"list\""));
+        assert!(body_str.contains("\"model\":\"text-embedding-3-small\""));
+        assert!(body_str.contains("\"data\""));
+
+        // Verify extra fields are NOT present
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("cost"));
+        assert!(!body_str.contains("cache_hit"));
+    }
+
+    /// Test that embeddings responses rewrite the model field
+    #[tokio::test]
+    async fn test_strict_sanitize_embeddings_rewrites_model() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "text-embedding-3-small".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .onwards_model("text-embedding-3-small-internal".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        let mock_response = r#"{
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "embedding": [0.1, 0.2],
+                "index": 0
+            }],
+            "model": "text-embedding-3-small-internal",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"text-embedding-3-small","input":"Hello"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Model should be rewritten
+        assert!(body_str.contains("\"model\":\"text-embedding-3-small\""));
+        assert!(!body_str.contains("text-embedding-3-small-internal"));
     }
 }
