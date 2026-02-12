@@ -1,0 +1,147 @@
+# Strict Mode
+
+Strict mode provides enhanced security and API compliance by using typed request/response handlers instead of the default wildcard passthrough router. This feature:
+
+- **Validates all requests** against OpenAI API schemas before forwarding
+- **Sanitizes all responses** by removing third-party provider metadata
+- **Standardizes error messages** to prevent information leakage
+- **Ensures model field consistency** between requests and responses
+- **Supports streaming and non-streaming** for all endpoints
+
+This is useful when you need guaranteed API compatibility, security hardening, or protection against third-party response variations.
+
+## Enabling strict mode
+
+Strict mode is a **global configuration** that applies to all targets in your gateway. Add `strict_mode: true` at the top level of your configuration (not inside individual targets).
+
+```json
+{
+  "strict_mode": true,
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-openai-key"
+    },
+    "claude": {
+      "url": "https://api.anthropic.com",
+      "onwards_key": "sk-ant-key"
+    }
+  }
+}
+```
+
+When enabled, all requests to all targets will use strict mode validation and sanitization.
+
+## How it works
+
+When `strict_mode: true` is enabled:
+
+1. **Request validation**: Incoming requests are deserialized through OpenAI schemas. Invalid requests receive immediate `400 Bad Request` errors with clear messages.
+2. **Response sanitization**: Third-party responses are deserialized (automatically dropping unknown fields), the model field is rewritten to match the original request, then re-serialized as clean OpenAI responses.
+3. **Error standardization**: Third-party errors are logged internally but never forwarded to clients. Clients receive standardized OpenAI-format errors based only on HTTP status codes.
+4. **Streaming support**: SSE streams are parsed line-by-line, each chunk is sanitized, and re-emitted as clean events.
+
+## Security benefits
+
+**Prevents information leakage:**
+- Third-party stack traces, database errors, and debug information are never exposed
+- Error responses contain only standard HTTP status codes and generic messages
+- No provider-specific metadata (trace IDs, internal IDs, costs) reaches clients
+
+**Ensures consistency:**
+- Responses always match OpenAI's API format exactly
+- The `model` field always reflects what the client requested, not what the provider returned
+- Extra fields like `provider`, `cost`, `trace_id` are automatically dropped
+
+**Fast failure:**
+- Invalid requests fail immediately with clear, actionable error messages
+- No wasted upstream requests for malformed input
+- Reduces debugging time for integration issues
+
+## Error standardization
+
+When strict mode is enabled, all error responses follow OpenAI's error format exactly:
+
+```json
+{
+  "error": {
+    "message": "Invalid request",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": null
+  }
+}
+```
+
+**Status code mapping:**
+
+| HTTP Status | Error Type | Message |
+|------------|------------|---------|
+| 400 | `invalid_request_error` | Invalid request |
+| 401 | `authentication_error` | Authentication failed |
+| 403 | `permission_error` | Permission denied |
+| 404 | `not_found_error` | Not found |
+| 429 | `rate_limit_error` | Rate limit exceeded |
+| 500 | `api_error` | Internal server error |
+| 502 | `api_error` | Bad gateway |
+| 503 | `api_error` | Service unavailable |
+
+Third-party error details are always logged server-side but never sent to clients.
+
+## Supported endpoints
+
+Strict mode currently supports:
+
+- `/v1/chat/completions` (streaming and non-streaming)
+- `/v1/embeddings`
+- `/v1/models`
+
+Requests to unsupported endpoints will return `404 Not Found` when strict mode is enabled.
+
+## Comparison with response sanitization
+
+| Feature | Response Sanitization | Strict Mode |
+|---------|----------------------|-------------|
+| Request validation | ✗ No | ✓ Yes |
+| Response sanitization | ✓ Yes | ✓ Yes |
+| Error standardization | ✗ No | ✓ Yes |
+| Endpoint coverage | `/v1/chat/completions` only | Multiple endpoints |
+| Router type | Wildcard passthrough | Typed handlers |
+| Use case | Simple response cleaning | Production security & compliance |
+
+**When to use strict mode:**
+- Production deployments requiring security hardening
+- Compliance requirements around error message content
+- Multi-provider setups needing guaranteed response consistency
+- Applications that need request validation before forwarding
+
+**When to use response sanitization:**
+- Simple use cases where you only need response cleaning
+- Non-security-critical deployments
+- Maximum flexibility with endpoint coverage
+
+## Implementation details
+
+For developers working on the Onwards codebase:
+
+**Router architecture:**
+- Strict mode uses typed Axum handlers defined in `src/strict/handlers.rs`
+- Each endpoint has dedicated request/response schema types in `src/strict/schemas/`
+- Requests are deserialized using serde, which automatically validates structure
+
+**Response sanitization:**
+- Responses are deserialized through strict schemas (extra fields automatically dropped by serde)
+- Model field is rewritten to match the original request model
+- Re-serialized to ensure only defined fields are present
+- Applies to both non-streaming responses and SSE chunks
+
+**Error handling:**
+- Third-party errors are intercepted in `sanitize_error_response()`
+- Original error logged with `error!()` macro for server-side debugging
+- Standard error generated based only on HTTP status code
+- OpenAI-compatible format guaranteed via `error_response()` helper
+
+**Testing:**
+- Request/response schema tests in each schema module
+- Integration tests in `src/strict/handlers.rs` verify sanitization behavior
+- Tests ensure malformed responses are handled gracefully with fallback to passthrough
