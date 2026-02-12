@@ -92,9 +92,16 @@ Third-party error details are always logged server-side but never sent to client
 
 Strict mode currently supports:
 
-- `/v1/chat/completions` (streaming and non-streaming)
-- `/v1/embeddings`
-- `/v1/models`
+- `/v1/chat/completions` (streaming and non-streaming) - Full sanitization
+- `/v1/embeddings` - Full sanitization
+- `/v1/responses` (Open Responses API, non-streaming) - Full sanitization
+- `/v1/models` - Model listing (no sanitization needed)
+
+All supported endpoints include:
+- **Request validation** - Invalid requests fail immediately with clear error messages
+- **Response sanitization** - Third-party metadata automatically removed
+- **Model field rewriting** - Ensures consistency with client request
+- **Error standardization** - Third-party error details never exposed
 
 Requests to unsupported endpoints will return `404 Not Found` when strict mode is enabled.
 
@@ -105,7 +112,7 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 | Request validation | ✗ No | ✓ Yes |
 | Response sanitization | ✓ Yes | ✓ Yes |
 | Error standardization | ✗ No | ✓ Yes |
-| Endpoint coverage | `/v1/chat/completions` only | Multiple endpoints |
+| Endpoint coverage | `/v1/chat/completions` only | Chat, Embeddings, Responses, Models |
 | Router type | Wildcard passthrough | Typed handlers |
 | Use case | Simple response cleaning | Production security & compliance |
 

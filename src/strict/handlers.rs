@@ -13,7 +13,7 @@ use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
 };
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
-use super::schemas::responses::ResponsesRequest;
+use super::schemas::responses::{ResponsesRequest, ResponsesResponse};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::handlers::target_message_handler;
@@ -92,10 +92,13 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     Json(request): Json<ResponsesRequest>,
 ) -> Response {
+    let original_model = request.model.clone();
+    let is_streaming = request.stream.unwrap_or(false);
+
     debug!(
-        model = %request.model,
+        model = %original_model,
         has_previous_response_id = request.previous_response_id.is_some(),
-        stream = ?request.stream,
+        stream = is_streaming,
         "Responses request validated"
     );
 
@@ -112,7 +115,21 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    forward_request(state, headers, "/v1/responses", body_bytes).await
+    let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
+
+    // Sanitize response to ensure model field matches and extra fields are dropped
+    if response.status().is_success() {
+        if is_streaming {
+            // TODO: Add streaming sanitization when Open Responses streaming format is defined
+            warn!("Streaming responses not yet sanitized");
+            response
+        } else {
+            sanitize_responses_response(response, original_model).await
+        }
+    } else {
+        // Sanitize error responses to prevent third-party info leakage
+        sanitize_error_response(response).await
+    }
 }
 
 /// Handler for POST /v1/embeddings
@@ -356,6 +373,46 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
         }
         Err(e) => {
             error!(error = %e, "Failed to serialize sanitized embeddings response");
+            *response.body_mut() = Body::from(body_bytes);
+            response
+        }
+    }
+}
+
+/// Sanitize responses API response
+///
+/// Deserializes the response through our strict schema (drops extra fields),
+/// rewrites the model field, and re-serializes.
+async fn sanitize_responses_response(mut response: Response, original_model: String) -> Response {
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read responses API response body");
+                return response;
+            }
+        };
+
+    let mut responses_response: ResponsesResponse = match serde_json::from_slice(&body_bytes) {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(error = %e, "Failed to deserialize responses API response, passing through");
+            *response.body_mut() = Body::from(body_bytes);
+            return response;
+        }
+    };
+
+    // Rewrite model field
+    responses_response.model = original_model;
+
+    match serde_json::to_vec(&responses_response) {
+        Ok(sanitized_bytes) => {
+            *response.body_mut() = Body::from(sanitized_bytes);
+            debug!("Sanitized responses API response");
+            response
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to serialize sanitized responses API response");
             *response.body_mut() = Body::from(body_bytes);
             response
         }
@@ -1040,5 +1097,231 @@ mod tests {
 
         // Should parse as valid JSON
         let _: serde_json::Value = serde_json::from_str(&body_str).expect("Should be valid JSON");
+    }
+
+    /// Test that responses API drops extra fields from third parties
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_removes_unknown_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party response with extra fields
+        let mock_response = r#"{
+            "id": "resp_abc123",
+            "object": "response",
+            "created_at": 1677652288,
+            "completed_at": 1677652290,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "auto",
+            "parallel_tool_calls": true,
+            "text": {},
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null,
+            "provider": "custom-provider",
+            "cost": 0.0123,
+            "internal_trace_id": "xyz-789"
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Verify standard fields are present
+        assert!(body_str.contains("\"id\":\"resp_abc123\""));
+        assert!(body_str.contains("\"model\":\"gpt-4o\""));
+        assert!(body_str.contains("\"status\":\"completed\""));
+
+        // Verify extra fields are NOT present
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("cost"));
+        assert!(!body_str.contains("internal_trace_id"));
+    }
+
+    /// Test that responses API rewrites the model field
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_rewrites_model() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .onwards_model("gpt-4o-2024-05-13".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        let mock_response = r#"{
+            "id": "resp_abc123",
+            "object": "response",
+            "created_at": 1677652288,
+            "completed_at": 1677652290,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o-2024-05-13",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "auto",
+            "parallel_tool_calls": true,
+            "text": {},
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Model should be rewritten to client-requested model
+        assert!(body_str.contains("\"model\":\"gpt-4o\""));
+        assert!(!body_str.contains("gpt-4o-2024-05-13"));
+    }
+
+    /// Test that responses API errors are sanitized
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_error() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Third-party error with internal details
+        let mock_error_response = r#"{
+            "error": {
+                "message": "Internal error in provider backend at server xyz-123.internal.com",
+                "type": "server_error",
+                "provider": "custom-provider",
+                "trace_id": "abc-def-ghi"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Should return standard error message
+        assert!(body_str.contains("\"type\":\"api_error\""));
+        assert!(body_str.contains("\"message\":\"Internal server error\""));
+
+        // Should NOT contain third-party details
+        assert!(!body_str.contains("Internal error in provider backend"));
+        assert!(!body_str.contains("xyz-123.internal.com"));
+        assert!(!body_str.contains("provider"));
+        assert!(!body_str.contains("trace_id"));
     }
 }
