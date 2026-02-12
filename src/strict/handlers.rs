@@ -196,11 +196,16 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
 }
 
 /// Create an OpenAI-compatible error response
+///
+/// Format matches OpenAI's error structure:
+/// https://platform.openai.com/docs/guides/error-codes
 fn error_response(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = json!({
         "error": {
+            "message": message,
             "type": error_type,
-            "message": message
+            "param": null,
+            "code": null
         }
     });
 
@@ -423,6 +428,74 @@ mod tests {
             "Test error",
         );
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Test that error responses match OpenAI's exact format
+    #[tokio::test]
+    async fn test_error_response_matches_openai_format() {
+        // Our error response
+        let response = error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Invalid request",
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let our_error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // OpenAI's error format (from their API docs)
+        // https://platform.openai.com/docs/guides/error-codes
+        let openai_format = json!({
+            "error": {
+                "message": "Invalid request",
+                "type": "invalid_request_error",
+                "param": null,
+                "code": null
+            }
+        });
+
+        // Verify structure matches exactly
+        assert_eq!(our_error, openai_format);
+
+        // Verify all required fields are present
+        assert!(our_error["error"]["message"].is_string());
+        assert!(our_error["error"]["type"].is_string());
+        assert!(our_error["error"]["param"].is_null());
+        assert!(our_error["error"]["code"].is_null());
+    }
+
+    /// Test that different error types use correct OpenAI error type names
+    #[tokio::test]
+    async fn test_error_types_match_openai_conventions() {
+        // Test various status codes map to correct OpenAI error types
+        let test_cases = vec![
+            (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (StatusCode::UNAUTHORIZED, "authentication_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+            (StatusCode::NOT_FOUND, "not_found_error"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
+            (StatusCode::BAD_GATEWAY, "api_error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "api_error"),
+        ];
+
+        for (status, expected_type) in test_cases {
+            let response = standard_error_response(status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+            assert_eq!(
+                error["error"]["type"].as_str().unwrap(),
+                expected_type,
+                "Status {} should map to error type {}",
+                status,
+                expected_type
+            );
+        }
     }
 
     /// Test that non-streaming chat responses drop extra fields from third parties
