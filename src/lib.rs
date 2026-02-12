@@ -1253,10 +1253,10 @@ mod tests {
         // Should get 429 Too Many Requests
         assert_eq!(response.status_code(), 429);
 
-        // Should return proper error structure
+        // Should return proper error structure wrapped in OpenAI error envelope
         let response_body: serde_json::Value = response.json();
-        assert_eq!(response_body["type"], "rate_limit_error");
-        assert_eq!(response_body["code"], "rate_limit");
+        assert_eq!(response_body["error"]["type"], "rate_limit_error");
+        assert_eq!(response_body["error"]["code"], "rate_limit");
 
         // Verify no request was made to the upstream (since it was rate limited)
         let requests = mock_client.get_requests();
@@ -1517,7 +1517,7 @@ mod tests {
                 // Second request should be rejected (concurrency limit exceeded)
                 assert_eq!(response2.status_code(), 429);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -1597,7 +1597,7 @@ mod tests {
                 // Second request should be rejected (per-key concurrency limit exceeded)
                 assert_eq!(response2.status_code(), 429);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -3021,6 +3021,166 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_replaces_4xx_body() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Upstream returns 422 with provider-specific error details
+            let upstream_error = r#"{
+                "error": {
+                    "message": "Internal provider Novita returned error: model not loaded on GPU cluster eu-west-3",
+                    "type": "provider_error",
+                    "code": "novita_internal_error",
+                    "metadata": {"provider": "novita", "region": "eu-west-3"}
+                }
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::UNPROCESSABLE_ENTITY, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            // Status code should be preserved
+            assert_eq!(response.status_code(), 422);
+
+            let body: serde_json::Value = response.json();
+            // Should have OpenAI error envelope with generic message
+            assert_eq!(
+                body["error"]["message"],
+                "The upstream provider rejected the request."
+            );
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["code"], "upstream_error");
+            // Should NOT contain any upstream provider details
+            let body_str = serde_json::to_string(&body).unwrap();
+            assert!(!body_str.contains("Novita"));
+            assert!(!body_str.contains("novita"));
+            assert!(!body_str.contains("eu-west-3"));
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_preserves_5xx_status() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Upstream returns 503 with internal details
+            let upstream_error = r#"{"error": "GPU cluster overloaded", "retry_after": 30}"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            // Original 503 status should be preserved
+            assert_eq!(response.status_code(), 503);
+
+            let body: serde_json::Value = response.json();
+            // Should have generic error body, not upstream details
+            assert_eq!(
+                body["error"]["message"],
+                "An internal error occurred. Please try again later."
+            );
+            assert_eq!(body["error"]["type"], "internal_error");
+            assert_eq!(body["error"]["code"], "internal_error");
+            // Should NOT contain upstream details
+            let body_str = serde_json::to_string(&body).unwrap();
+            assert!(!body_str.contains("GPU cluster"));
+            assert!(!body_str.contains("retry_after"));
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_disabled_passes_through() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(false)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+            };
+
+            // Upstream returns 422 with provider-specific details
+            let upstream_error = r#"{"error": {"message": "provider-specific detail"}}"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::UNPROCESSABLE_ENTITY, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 422);
+
+            // When sanitization is disabled, upstream error body should pass through
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["message"], "provider-specific detail");
         }
     }
 }
