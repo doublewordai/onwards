@@ -68,15 +68,21 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
-
     // Check if this target is trusted - if so, bypass all sanitization
-    if let Some(pool) = state.targets.targets.get(&original_model) {
-        if pool.providers().first().map(|p| p.target.trusted).unwrap_or(false) {
-            debug!(model = %original_model, "Bypassing sanitization for trusted target");
-            return response;
-        }
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| {
+            pool.providers().first()
+                .map(|p| p.target.trusted)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        return forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
     }
+
+    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
 
     // Sanitize response to ensure model field matches and extra fields are dropped
     if response.status().is_success() {
@@ -123,15 +129,21 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
-
     // Check if this target is trusted - if so, bypass all sanitization
-    if let Some(pool) = state.targets.targets.get(&original_model) {
-        if pool.providers().first().map(|p| p.target.trusted).unwrap_or(false) {
-            debug!(model = %original_model, "Bypassing sanitization for trusted target");
-            return response;
-        }
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| {
+            pool.providers().first()
+                .map(|p| p.target.trusted)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        return forward_request(state, headers, "/v1/responses", body_bytes).await;
     }
+
+    let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
 
     // Sanitize response to ensure model field matches and extra fields are dropped
     if response.status().is_success() {
@@ -177,15 +189,21 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
-
     // Check if this target is trusted - if so, bypass all sanitization
-    if let Some(pool) = state.targets.targets.get(&original_model) {
-        if pool.providers().first().map(|p| p.target.trusted).unwrap_or(false) {
-            debug!(model = %original_model, "Bypassing sanitization for trusted target");
-            return response;
-        }
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| {
+            pool.providers().first()
+                .map(|p| p.target.trusted)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        return forward_request(state, headers, "/v1/embeddings", body_bytes).await;
     }
+
+    let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
 
     // Sanitize response
     if response.status().is_success() {
