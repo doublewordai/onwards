@@ -68,6 +68,16 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Mark this provider as trusted to bypass strict mode sanitization.
+    /// When strict_mode is enabled globally AND trusted is true for a target,
+    /// all sanitization (both success and error responses) is skipped.
+    /// WARNING: Trusted providers can leak metadata and non-standard responses.
+    /// Only use for providers you fully control or trust.
+    /// Defaults to false.
+    #[serde(default)]
+    #[builder(default)]
+    pub trusted: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -188,6 +198,12 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
+
+    /// Mark this provider as trusted to bypass strict mode sanitization.
+    /// Defaults to false.
+    #[serde(default)]
+    #[builder(default)]
+    pub trusted: bool,
 }
 
 fn default_weight() -> u32 {
@@ -250,6 +266,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        trusted: t.trusted,
                     })
                     .collect();
                 PoolConfig {
@@ -278,6 +295,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    trusted: spec.trusted,
                 };
                 PoolConfig {
                     keys,
@@ -329,6 +347,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            trusted: value.trusted,
         }
     }
 }
@@ -354,6 +373,7 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            trusted: value.trusted,
         }
     }
 }
@@ -432,6 +452,9 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    /// Mark this provider as trusted to bypass strict mode sanitization
+    #[builder(default)]
+    pub trusted: bool,
 }
 
 impl Target {
