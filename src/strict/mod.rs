@@ -158,8 +158,39 @@ mod tests {
         let mock_response = r#"{
             "id": "resp_abc123",
             "object": "response",
+            "created_at": 1234567890,
+            "completed_at": 1234567900,
             "status": "completed",
-            "output": []
+            "incomplete_details": null,
+            "model": "gpt-4o",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": true,
+            "text": {
+                "format": {
+                    "type": "text"
+                }
+            },
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null
         }"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
         let state = AppState::with_client(targets, mock_client.clone());

@@ -504,6 +504,7 @@ pub mod test_utils {
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
         response_builder: Arc<dyn Fn() -> axum::response::Response + Send + Sync>,
+        custom_headers: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -526,6 +527,7 @@ pub mod test_utils {
                         .body(axum::body::Body::from(body.clone()))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -551,11 +553,19 @@ pub mod test_utils {
                         .body(Body::from_stream(stream))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         pub fn get_requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        pub fn set_header(&mut self, name: &str, value: String) {
+            self.custom_headers
+                .lock()
+                .unwrap()
+                .push((name.to_string(), value));
         }
     }
 
@@ -573,6 +583,7 @@ pub mod test_utils {
             Self {
                 requests: Arc::clone(&self.requests),
                 response_builder: Arc::clone(&self.response_builder),
+                custom_headers: Arc::clone(&self.custom_headers),
             }
         }
     }
@@ -607,8 +618,18 @@ pub mod test_utils {
             };
             self.requests.lock().unwrap().push(mock_request);
 
+            // Build the response and apply custom headers
+            let mut response = (self.response_builder)();
+            let custom_headers = self.custom_headers.lock().unwrap();
+            for (name, value) in custom_headers.iter() {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+
             // Return the configured response
-            Ok((self.response_builder)())
+            Ok(response)
         }
     }
 

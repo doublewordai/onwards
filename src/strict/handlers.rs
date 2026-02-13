@@ -20,7 +20,7 @@ use crate::handlers::target_message_handler;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -248,9 +248,18 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
     let mut chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
-            warn!(error = %e, "Failed to deserialize chat response, passing through");
-            *response.body_mut() = Body::from(body_bytes);
-            return response;
+            // Failed to deserialize - provider returned malformed response
+            // Log the error but return standard error instead of passing through
+            error!(
+                error = %e,
+                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                "Failed to deserialize chat response from provider, returning standard error"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Bad gateway",
+            );
         }
     };
 
@@ -260,14 +269,26 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
     // Re-serialize with only our defined fields
     match serde_json::to_vec(&chat_response) {
         Ok(sanitized_bytes) => {
+            // Set Content-Length to match the new sanitized body size
+            let content_length = sanitized_bytes.len();
             *response.body_mut() = Body::from(sanitized_bytes);
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from(content_length),
+            );
             debug!("Sanitized non-streaming chat completion response");
             response
         }
         Err(e) => {
-            error!(error = %e, "Failed to serialize sanitized response");
-            *response.body_mut() = Body::from(body_bytes);
-            response
+            error!(
+                error = %e,
+                "Failed to serialize sanitized chat response, returning standard error"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Internal server error",
+            )
         }
     }
 }
@@ -312,14 +333,18 @@ async fn sanitize_streaming_chat_response(
                                     ))
                                 }
                                 Err(e) => {
-                                    error!(error = %e, "Failed to serialize chunk");
-                                    Ok(chunk)
+                                    error!(error = %e, "Failed to serialize chunk, terminating stream");
+                                    Err(std::io::Error::other("Failed to serialize chunk"))
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!(error = %e, "Failed to parse SSE chunk, passing through");
-                            Ok(chunk)
+                            error!(
+                                error = %e,
+                                chunk_sample = ?String::from_utf8_lossy(&chunk).chars().take(200).collect::<String>(),
+                                "Failed to parse SSE chunk from provider, terminating stream"
+                            );
+                            Err(std::io::Error::other("Malformed SSE chunk from provider"))
                         }
                     }
                 } else {
@@ -335,6 +360,8 @@ async fn sanitize_streaming_chat_response(
     });
 
     *response.body_mut() = Body::from_stream(sanitized_stream);
+    // Remove Content-Length header - streaming responses should use chunked encoding
+    response.headers_mut().remove(header::CONTENT_LENGTH);
     debug!("Set up streaming chat completion response sanitization");
     response
 }
@@ -356,9 +383,16 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
     let mut embeddings_response: EmbeddingsResponse = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
-            warn!(error = %e, "Failed to deserialize embeddings response, passing through");
-            *response.body_mut() = Body::from(body_bytes);
-            return response;
+            error!(
+                error = %e,
+                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                "Failed to deserialize embeddings response from provider, returning standard error"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Bad gateway",
+            );
         }
     };
 
@@ -367,14 +401,26 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
 
     match serde_json::to_vec(&embeddings_response) {
         Ok(sanitized_bytes) => {
+            // Set Content-Length to match the new sanitized body size
+            let content_length = sanitized_bytes.len();
             *response.body_mut() = Body::from(sanitized_bytes);
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from(content_length),
+            );
             debug!("Sanitized embeddings response");
             response
         }
         Err(e) => {
-            error!(error = %e, "Failed to serialize sanitized embeddings response");
-            *response.body_mut() = Body::from(body_bytes);
-            response
+            error!(
+                error = %e,
+                "Failed to serialize sanitized embeddings response, returning standard error"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Internal server error",
+            )
         }
     }
 }
@@ -396,9 +442,16 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
     let mut responses_response: ResponsesResponse = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
-            warn!(error = %e, "Failed to deserialize responses API response, passing through");
-            *response.body_mut() = Body::from(body_bytes);
-            return response;
+            error!(
+                error = %e,
+                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                "Failed to deserialize responses API response from provider, returning standard error"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Bad gateway",
+            );
         }
     };
 
@@ -407,14 +460,26 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
 
     match serde_json::to_vec(&responses_response) {
         Ok(sanitized_bytes) => {
+            // Set Content-Length to match the new sanitized body size
+            let content_length = sanitized_bytes.len();
             *response.body_mut() = Body::from(sanitized_bytes);
+            response.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                header::HeaderValue::from(content_length),
+            );
             debug!("Sanitized responses API response");
             response
         }
         Err(e) => {
-            error!(error = %e, "Failed to serialize sanitized responses API response");
-            *response.body_mut() = Body::from(body_bytes);
-            response
+            error!(
+                error = %e,
+                "Failed to serialize sanitized responses API response, returning standard error"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "Internal server error",
+            )
         }
     }
 }
@@ -1323,5 +1388,242 @@ mod tests {
         assert!(!body_str.contains("xyz-123.internal.com"));
         assert!(!body_str.contains("provider"));
         assert!(!body_str.contains("trace_id"));
+    }
+
+    /// Test that Content-Length header is updated correctly after chat completion sanitization
+    #[tokio::test]
+    async fn test_chat_sanitization_updates_content_length_header() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Response with extra fields that will be removed during sanitization
+        // This changes the body size, making the original Content-Length incorrect
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "provider-model-name",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider": "custom-provider",
+            "cost": 0.00123,
+            "trace_id": "abc-xyz-123",
+            "custom_metadata": "will be dropped"
+        }"#;
+
+        // Set up mock with incorrect Content-Length that would be wrong after sanitization
+        let mut mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        // The mock response is larger than what will remain after sanitization
+        mock_client.set_header("content-length", mock_response.len().to_string());
+
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify the body can be read completely with correct Content-Length
+        // If Content-Length wasn't updated, the body would be truncated or hang
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        // Verify body is valid JSON and doesn't contain removed fields
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "gpt-4"); // Model rewritten
+        assert!(body_json.get("provider").is_none()); // Extra field removed
+        assert!(body_json.get("cost").is_none()); // Extra field removed
+        assert!(body_json.get("trace_id").is_none()); // Extra field removed
+    }
+
+    /// Test that Content-Length header is updated correctly after embeddings sanitization
+    #[tokio::test]
+    async fn test_embeddings_sanitization_updates_content_length_header() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "text-embedding-ada-002".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Response with extra provider-specific fields
+        let mock_response = r#"{
+            "object": "list",
+            "data": [{
+                "object": "embedding",
+                "index": 0,
+                "embedding": [0.1, 0.2, 0.3]
+            }],
+            "model": "provider-embedding-model",
+            "usage": {
+                "prompt_tokens": 5,
+                "total_tokens": 5
+            },
+            "provider_metadata": "extra_data",
+            "cost": 0.0001,
+            "processing_time_ms": 123
+        }"#;
+
+        let mut mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        mock_client.set_header("content-length", mock_response.len().to_string());
+
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"text-embedding-ada-002","input":"test"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify body is readable and sanitized
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "text-embedding-ada-002"); // Model rewritten
+        assert!(body_json.get("provider_metadata").is_none()); // Extra field removed
+        assert!(body_json.get("cost").is_none()); // Extra field removed
+        assert!(body_json.get("processing_time_ms").is_none()); // Extra field removed
+    }
+
+    /// Test that Content-Length header is updated correctly after Responses API sanitization
+    #[tokio::test]
+    async fn test_responses_sanitization_updates_content_length_header() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Response with extra provider-specific fields
+        let mock_response = r#"{
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 1234567890,
+            "completed_at": 1234567900,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "provider-model",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": true,
+            "text": {
+                "format": {
+                    "type": "text"
+                }
+            },
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null,
+            "provider_trace_id": "xyz-123",
+            "internal_cost": 0.456,
+            "custom_field": "should_be_removed"
+        }"#;
+
+        let mut mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        mock_client.set_header("content-length", mock_response.len().to_string());
+
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o","input":"test"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify body is readable and sanitized
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["model"], "gpt-4o"); // Model rewritten
+        assert!(body_json.get("provider_trace_id").is_none()); // Extra field removed
+        assert!(body_json.get("internal_cost").is_none()); // Extra field removed
+        assert!(body_json.get("custom_field").is_none()); // Extra field removed
     }
 }
