@@ -68,7 +68,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    let response = forward_request(state.clone(), headers, "/v1/chat/completions", body_bytes).await;
+    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
 
     // Check if this target is trusted - if so, bypass all sanitization
     if let Some(pool) = state.targets.targets.get(&original_model) {
@@ -123,7 +123,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    let response = forward_request(state.clone(), headers, "/v1/responses", body_bytes).await;
+    let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
 
     // Check if this target is trusted - if so, bypass all sanitization
     if let Some(pool) = state.targets.targets.get(&original_model) {
@@ -177,7 +177,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    let response = forward_request(state.clone(), headers, "/v1/embeddings", body_bytes).await;
+    let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
 
     // Check if this target is trusted - if so, bypass all sanitization
     if let Some(pool) = state.targets.targets.get(&original_model) {
@@ -187,7 +187,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     }
 
-    // Sanitize response to ensure model field matches and extra fields are dropped
+    // Sanitize response
     if response.status().is_success() {
         sanitize_embeddings_response(response, original_model).await
     } else {
