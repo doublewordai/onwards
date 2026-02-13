@@ -131,6 +131,57 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 - Non-security-critical deployments
 - Maximum flexibility with endpoint coverage
 
+## Trusted Targets
+
+In strict mode, you can mark specific targets as trusted to bypass all sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their exact responses and error messages passed through.
+
+### Configuration
+
+Add `trusted: true` to any target configuration:
+
+```json
+{
+  "strict_mode": true,
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-...",
+      "trusted": true
+    },
+    "third-party": {
+      "url": "https://some-provider.com",
+      "onwards_key": "sk-..."
+    }
+  }
+}
+```
+
+In this example, `gpt-4` responses bypass all sanitization, while `third-party` responses receive full strict mode sanitization.
+
+### Behavior
+
+When a target is marked as `trusted: true`:
+
+- **Success responses**: Passed through completely with all provider metadata intact
+- **Error responses**: Original error messages and metadata forwarded to clients
+- **No model field rewriting**: Response model field matches provider's response exactly
+- **No Content-Length updates**: Headers passed through as-is
+- **No SSE sanitization**: Streaming responses passed through without line-by-line parsing
+
+### Security Warning
+
+⚠️ **Use trusted targets carefully.** Marking a target as trusted bypasses all strict mode security guarantees:
+
+- Provider-specific metadata may leak to clients (costs, trace IDs, internal identifiers)
+- Third-party error details and stack traces will be exposed
+- Responses may not match OpenAI schema exactly
+- Non-standard fields may confuse client applications
+
+**Only mark targets as trusted when you fully control or trust the provider.** This typically means:
+- Your own OpenAI/Anthropic accounts
+- Self-hosted models you operate
+- Internal services you maintain
+
 ## Implementation details
 
 For developers working on the Onwards codebase:
