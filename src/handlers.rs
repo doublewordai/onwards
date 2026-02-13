@@ -537,9 +537,11 @@ pub async fn target_message_handler<T: HttpClient>(
 
                 // Apply response transformation if configured
                 // Per-target opt-in via sanitize_response flag, only for 2xx responses
+                // Skip if strict mode is enabled - strict handlers do their own sanitization
                 if let Some(ref transform_fn) = state.response_transform_fn
                     && target.sanitize_response
                     && (200..300).contains(&status)
+                    && !state.targets.strict_mode
                 {
                     debug!(
                         "Attempting response sanitization for status {}, path {}",

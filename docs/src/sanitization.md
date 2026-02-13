@@ -10,6 +10,8 @@ Onwards can enforce strict OpenAI API schema compliance for `/v1/chat/completion
 
 This is useful when proxying to non-OpenAI providers that add custom fields, or when using `onwards_model` to rewrite model names upstream.
 
+> **Note:** For production deployments requiring additional security (request validation, error standardization), consider using [Strict Mode](strict-mode.md) instead, which includes response sanitization plus comprehensive security features.
+
 ## Enabling response sanitization
 
 Add `sanitize_response: true` to any target or provider in your configuration.

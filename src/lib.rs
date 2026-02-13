@@ -48,6 +48,7 @@ pub mod load_balancer;
 pub mod models;
 pub mod response_sanitizer;
 pub mod sse;
+pub mod strict;
 pub mod target;
 
 use client::{HttpClient, HyperClient};
@@ -503,6 +504,7 @@ pub mod test_utils {
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
         response_builder: Arc<dyn Fn() -> axum::response::Response + Send + Sync>,
+        custom_headers: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -525,6 +527,7 @@ pub mod test_utils {
                         .body(axum::body::Body::from(body.clone()))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -550,11 +553,19 @@ pub mod test_utils {
                         .body(Body::from_stream(stream))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
         pub fn get_requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
+        }
+
+        pub fn set_header(&mut self, name: &str, value: String) {
+            self.custom_headers
+                .lock()
+                .unwrap()
+                .push((name.to_string(), value));
         }
     }
 
@@ -572,6 +583,7 @@ pub mod test_utils {
             Self {
                 requests: Arc::clone(&self.requests),
                 response_builder: Arc::clone(&self.response_builder),
+                custom_headers: Arc::clone(&self.custom_headers),
             }
         }
     }
@@ -606,8 +618,18 @@ pub mod test_utils {
             };
             self.requests.lock().unwrap().push(mock_request);
 
+            // Build the response and apply custom headers
+            let mut response = (self.response_builder)();
+            let custom_headers = self.custom_headers.lock().unwrap();
+            for (name, value) in custom_headers.iter() {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+
             // Return the configured response
-            Ok((self.response_builder)())
+            Ok(response)
         }
     }
 
@@ -749,6 +771,7 @@ mod tests {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -794,6 +817,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(
@@ -864,6 +888,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -961,6 +986,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1033,6 +1059,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1128,6 +1155,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1234,6 +1262,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1294,6 +1323,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1374,6 +1404,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1441,6 +1472,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1485,6 +1517,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client =
@@ -1557,6 +1590,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters,
+            strict_mode: false,
         };
 
         let mock_client =
@@ -1631,6 +1665,7 @@ mod tests {
                 targets,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1806,6 +1841,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1867,6 +1903,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1916,6 +1953,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -1967,6 +2005,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -2042,6 +2081,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create the same transformation function
@@ -2113,6 +2153,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create a transformation function that only transforms specific paths
@@ -2187,6 +2228,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2223,6 +2265,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2264,6 +2307,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(
@@ -2323,6 +2367,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2377,6 +2422,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2417,6 +2463,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2470,6 +2517,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2523,6 +2571,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2584,6 +2633,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2628,6 +2678,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response with provider-specific fields
@@ -2699,6 +2750,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response from upstream has the turbo model
@@ -2761,6 +2813,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let streaming_chunks = vec![
@@ -2815,6 +2868,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let streaming_chunks = vec![
@@ -2866,6 +2920,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response with provider-specific fields
@@ -2925,6 +2980,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Response from a different endpoint (e.g., embeddings)
@@ -2991,6 +3047,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             let mock_response = r#"{
@@ -3041,6 +3098,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 422 with provider-specific error details
@@ -3103,6 +3161,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 503 with internal details
@@ -3157,6 +3216,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 422 with provider-specific details
