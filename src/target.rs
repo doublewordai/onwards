@@ -1781,4 +1781,117 @@ mod tests {
             "into_pool should preserve default sanitize_response setting"
         );
     }
+
+    #[test]
+    fn test_trusted_field_defaults_to_false() {
+        let json = r#"{
+            "targets": {
+                "test-model": {
+                    "url": "https://api.example.com",
+                    "onwards_key": "sk-test"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
+        assert!(!target.trusted, "trusted should default to false");
+    }
+
+    #[test]
+    fn test_trusted_field_set_to_true() {
+        let json = r#"{
+            "targets": {
+                "test-model": {
+                    "url": "https://api.example.com",
+                    "onwards_key": "sk-test",
+                    "trusted": true
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("test-model").unwrap();
+        let target = pool.first_target().unwrap();
+        assert!(target.trusted, "trusted should be true when explicitly set");
+    }
+
+    #[test]
+    fn test_trusted_field_preserved_in_conversions() {
+        // Test TargetSpec -> Target conversion
+        let target_spec = TargetSpec::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .trusted(true)
+            .build();
+
+        let target: Target = target_spec.into();
+        assert!(target.trusted, "TargetSpec conversion should preserve trusted field");
+
+        // Test ProviderSpec -> Target conversion with minimal required fields
+        let provider_spec = ProviderSpec {
+            url: "https://api.example.com".parse().unwrap(),
+            onwards_key: None,
+            onwards_model: None,
+            rate_limit: None,
+            concurrency_limit: None,
+            upstream_auth_header_name: None,
+            upstream_auth_header_prefix: None,
+            response_headers: None,
+            weight: 1,
+            sanitize_response: false,
+            trusted: true,
+        };
+
+        let target: Target = provider_spec.into();
+        assert!(target.trusted, "ProviderSpec conversion should preserve trusted field");
+    }
+
+    #[test]
+    fn test_trusted_field_in_pool_config() {
+        let json = r#"{
+            "targets": {
+                "pool-model": {
+                    "providers": [
+                        {
+                            "url": "https://api1.example.com",
+                            "trusted": true
+                        },
+                        {
+                            "url": "https://api2.example.com",
+                            "trusted": false
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("pool-model").unwrap();
+
+        // Get all providers via the public API
+        let providers = pool.providers();
+        let trusted_count = providers.iter().filter(|p| p.target.trusted).count();
+        let untrusted_count = providers.iter().filter(|p| !p.target.trusted).count();
+
+        assert_eq!(trusted_count, 1, "Should have exactly one trusted provider");
+        assert_eq!(untrusted_count, 1, "Should have exactly one untrusted provider");
+
+        // Verify by URL which one is trusted
+        let trusted_provider = providers.iter()
+            .find(|p| p.target.url.as_str().contains("api1"))
+            .expect("Should find api1 provider");
+        assert!(trusted_provider.target.trusted, "api1 provider should be trusted");
+
+        let untrusted_provider = providers.iter()
+            .find(|p| p.target.url.as_str().contains("api2"))
+            .expect("Should find api2 provider");
+        assert!(!untrusted_provider.target.trusted, "api2 provider should not be trusted");
+    }
 }
