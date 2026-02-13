@@ -1667,6 +1667,90 @@ mod tests {
         assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
     }
 
+    #[tokio::test]
+    async fn test_trusted_target_bypasses_error_sanitization() {
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .trusted(true)
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream error with provider-specific details
+        let mock_error = r#"{
+            "error": {
+                "message": "Internal provider error: GPU cluster unavailable in eu-west-3",
+                "type": "provider_error",
+                "code": "internal_error",
+                "metadata": {
+                    "provider": "openai",
+                    "region": "eu-west-3",
+                    "trace_id": "trace-abc-123"
+                }
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify ORIGINAL error is passed through for trusted target:
+        // 1. Original error message preserved
+        assert_eq!(
+            response_json["error"]["message"],
+            "Internal provider error: GPU cluster unavailable in eu-west-3",
+            "Trusted target should preserve original error message"
+        );
+
+        // 2. Provider-specific error code preserved
+        assert_eq!(response_json["error"]["code"], "internal_error");
+
+        // 3. Provider metadata preserved
+        assert!(response_json["error"]["metadata"].is_object());
+        assert_eq!(response_json["error"]["metadata"]["provider"], "openai");
+        assert_eq!(response_json["error"]["metadata"]["region"], "eu-west-3");
+        assert_eq!(response_json["error"]["metadata"]["trace_id"], "trace-abc-123");
+    }
+
     /// Test that Content-Length header is updated correctly after Responses API sanitization
     #[tokio::test]
     async fn test_responses_sanitization_updates_content_length_header() {
