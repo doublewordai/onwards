@@ -2274,4 +2274,97 @@ mod tests {
         // - No double sanitization occurs (which could corrupt responses)
         // - response_transform_fn is properly skipped in strict mode
     }
+
+    #[tokio::test]
+    async fn test_untrusted_target_still_sanitized() {
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "third-party".to_string(),
+            Target::builder()
+                .url("https://third-party.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                // NO trusted flag - defaults to false
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream response with provider-specific fields
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "provider-internal-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider_metadata": {
+                "should": "be removed"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "third-party",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify strict mode sanitization STILL APPLIES for untrusted:
+        // 1. Model field rewritten to match request
+        assert_eq!(
+            response_json["model"], "third-party",
+            "Untrusted target should have model field rewritten"
+        );
+
+        // 2. Provider metadata removed
+        assert!(
+            response_json.get("provider_metadata").is_none(),
+            "Untrusted target should have provider metadata removed"
+        );
+
+        // 3. Standard fields preserved
+        assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
+    }
 }
