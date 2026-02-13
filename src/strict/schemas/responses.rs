@@ -93,35 +93,123 @@ pub enum Input {
 }
 
 /// An item in the input/output
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[derive(Debug, Clone)]
 pub enum Item {
     /// A message item
-    #[serde(rename = "message")]
     Message(MessageItem),
 
     /// A function call item
-    #[serde(rename = "function_call")]
     FunctionCall(FunctionCallItem),
 
     /// A function call output item
-    #[serde(rename = "function_call_output")]
     FunctionCallOutput(FunctionCallOutputItem),
 
     /// A reasoning item
-    #[serde(rename = "reasoning")]
     Reasoning(ReasoningItem),
 
     /// Unknown item type (for forward compatibility)
-    #[serde(other)]
-    Unknown,
+    /// Preserves the raw JSON to avoid data loss
+    Unknown(serde_json::Value),
+}
+
+// Custom deserialization for Item to preserve unknown types
+impl<'de> serde::Deserialize<'de> for Item {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // First deserialize to a generic Value
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // Check the "type" field
+        let item_type = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+
+        // Match against known types
+        match item_type {
+            "message" => {
+                let item: MessageItem = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Item::Message(item))
+            }
+            "function_call" => {
+                let item: FunctionCallItem = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Item::FunctionCall(item))
+            }
+            "function_call_output" => {
+                let item: FunctionCallOutputItem = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Item::FunctionCallOutput(item))
+            }
+            "reasoning" => {
+                let item: ReasoningItem = serde_json::from_value(value)
+                    .map_err(serde::de::Error::custom)?;
+                Ok(Item::Reasoning(item))
+            }
+            // Unknown type - preserve the entire raw value
+            _ => Ok(Item::Unknown(value)),
+        }
+    }
+}
+
+// Custom serialization for Item to handle unknown types
+impl serde::Serialize for Item {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Item::Message(msg) => {
+                // Serialize with type tag
+                let mut map = serde_json::Map::new();
+                map.insert("type".to_string(), serde_json::Value::String("message".to_string()));
+                let value = serde_json::to_value(msg).map_err(serde::ser::Error::custom)?;
+                if let serde_json::Value::Object(obj) = value {
+                    map.extend(obj);
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+            Item::FunctionCall(fc) => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".to_string(), serde_json::Value::String("function_call".to_string()));
+                let value = serde_json::to_value(fc).map_err(serde::ser::Error::custom)?;
+                if let serde_json::Value::Object(obj) = value {
+                    map.extend(obj);
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+            Item::FunctionCallOutput(fco) => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".to_string(), serde_json::Value::String("function_call_output".to_string()));
+                let value = serde_json::to_value(fco).map_err(serde::ser::Error::custom)?;
+                if let serde_json::Value::Object(obj) = value {
+                    map.extend(obj);
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+            Item::Reasoning(r) => {
+                let mut map = serde_json::Map::new();
+                map.insert("type".to_string(), serde_json::Value::String("reasoning".to_string()));
+                let value = serde_json::to_value(r).map_err(serde::ser::Error::custom)?;
+                if let serde_json::Value::Object(obj) = value {
+                    map.extend(obj);
+                }
+                serde_json::Value::Object(map).serialize(serializer)
+            }
+            // Unknown type - serialize the raw value as-is
+            Item::Unknown(value) => value.serialize(serializer),
+        }
+    }
 }
 
 /// A message item
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageItem {
     /// Unique identifier (required in responses, optional in requests)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
     /// The role of the message author
@@ -131,7 +219,7 @@ pub struct MessageItem {
     pub content: MessageContent,
 
     /// Current status of this item (required in responses, optional in requests)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ItemStatus>,
 }
 
@@ -197,7 +285,7 @@ pub struct Annotation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCallItem {
     /// Unique identifier (required in responses, optional in requests)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 
     /// The ID to correlate with output
@@ -210,7 +298,7 @@ pub struct FunctionCallItem {
     pub arguments: String,
 
     /// Current status of this item (required in responses, optional in requests)
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<ItemStatus>,
 }
 

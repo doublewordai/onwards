@@ -295,8 +295,9 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
 
 /// Sanitize streaming chat completion response
 ///
-/// Processes each SSE chunk, deserializes through our strict schema,
-/// rewrites the model field, and re-serializes.
+/// Processes each SSE chunk line-by-line, deserializes through our strict schema,
+/// rewrites the model field, and re-serializes. Ignores comment lines and other
+/// non-data SSE fields to prevent metadata leakage.
 async fn sanitize_streaming_chat_response(
     mut response: Response,
     original_model: String,
@@ -308,49 +309,74 @@ async fn sanitize_streaming_chat_response(
         match chunk_result {
             Ok(chunk) => {
                 let chunk_str = String::from_utf8_lossy(&chunk);
+                let mut sanitized_lines = Vec::new();
 
-                // Process SSE format: "data: {...}\n\n"
-                if chunk_str.starts_with("data: ") {
-                    let json_part = chunk_str.trim_start_matches("data: ").trim();
+                // Process SSE line-by-line to handle multi-line data events,
+                // comment lines, and event type lines
+                for line in chunk_str.lines() {
+                    if let Some(data_part) = line.strip_prefix("data: ") {
+                        // This is a data line
 
-                    // Handle [DONE] marker
-                    if json_part == "[DONE]" {
-                        return Ok(chunk);
-                    }
+                        // Handle [DONE] marker
+                        if data_part.trim() == "[DONE]" {
+                            sanitized_lines.push(line.to_string());
+                            continue;
+                        }
 
-                    // Deserialize the chunk through our strict schema
-                    match serde_json::from_str::<ChatCompletionChunk>(json_part) {
-                        Ok(mut chunk_data) => {
-                            // Rewrite model field
-                            chunk_data.model = original_model.clone();
+                        // Deserialize the chunk through our strict schema
+                        match serde_json::from_str::<ChatCompletionChunk>(data_part) {
+                            Ok(mut chunk_data) => {
+                                // Rewrite model field
+                                chunk_data.model = original_model.clone();
 
-                            // Re-serialize
-                            match serde_json::to_string(&chunk_data) {
-                                Ok(sanitized_json) => {
-                                    let sanitized_chunk = format!("data: {}\n\n", sanitized_json);
-                                    Ok::<_, std::io::Error>(axum::body::Bytes::from(
-                                        sanitized_chunk,
-                                    ))
-                                }
-                                Err(e) => {
-                                    error!(error = %e, "Failed to serialize chunk, terminating stream");
-                                    Err(std::io::Error::other("Failed to serialize chunk"))
+                                // Re-serialize
+                                match serde_json::to_string(&chunk_data) {
+                                    Ok(sanitized_json) => {
+                                        sanitized_lines.push(format!("data: {}", sanitized_json));
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to serialize chunk, terminating stream");
+                                        return Err(std::io::Error::other(
+                                            "Failed to serialize chunk",
+                                        ));
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    "Failed to parse SSE data line from provider, terminating stream"
+                                );
+                                return Err(std::io::Error::other(
+                                    "Malformed SSE data from provider",
+                                ));
+                            }
                         }
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                chunk_sample = ?String::from_utf8_lossy(&chunk).chars().take(200).collect::<String>(),
-                                "Failed to parse SSE chunk from provider, terminating stream"
-                            );
-                            Err(std::io::Error::other("Malformed SSE chunk from provider"))
-                        }
+                    } else if line.is_empty() {
+                        // Preserve empty lines (SSE event delimiters)
+                        sanitized_lines.push(String::new());
                     }
-                } else {
-                    // Non-data line (e.g., event: type), pass through
-                    Ok(chunk)
+                    // Ignore all other lines (comments, event types, etc.) - don't leak metadata
                 }
+
+                // Reconstruct the chunk with sanitized content
+                // Preserve trailing newlines from original chunk
+                let mut sanitized_chunk = sanitized_lines.join("\n");
+
+                // Count trailing newlines in input and restore them
+                let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
+                let output_trailing = sanitized_chunk
+                    .chars()
+                    .rev()
+                    .take_while(|&c| c == '\n')
+                    .count();
+
+                for _ in output_trailing..input_trailing {
+                    sanitized_chunk.push('\n');
+                }
+
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
             }
             Err(e) => {
                 error!(error = %e, "Stream error");
@@ -1625,5 +1651,333 @@ mod tests {
         assert!(body_json.get("provider_trace_id").is_none()); // Extra field removed
         assert!(body_json.get("internal_cost").is_none()); // Extra field removed
         assert!(body_json.get("custom_field").is_none()); // Extra field removed
+    }
+
+    /// Test that multi-line SSE data events are properly sanitized
+    /// Multi-line data events have multiple "data: " lines that should be concatenated
+    #[tokio::test]
+    async fn test_streaming_multiline_sse_events_are_sanitized() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Multi-line SSE event with provider-specific fields in the JSON
+        // This is a valid SSE format where the data is split across multiple data: lines
+        let chunk1 = r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"provider-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}],"provider":"leaked-provider","cost":0.001}
+
+"#;
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, vec![chunk1.to_string()]);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}],"stream":true}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read the streaming response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // The response should have the model rewritten
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+
+        // Provider-specific fields should be removed
+        assert!(!body_str.contains("provider"), "Provider field should be removed");
+        assert!(!body_str.contains("cost"), "Cost field should be removed");
+        assert!(!body_str.contains("leaked-provider"), "Provider name should not leak");
+    }
+
+    /// Test that SSE events with comment lines don't leak provider metadata
+    #[tokio::test]
+    async fn test_streaming_sse_comments_dont_leak_metadata() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // SSE stream with comment line containing provider-specific info
+        // Comment lines start with : and should be stripped in strict mode
+        let chunks = vec![
+            ": provider=custom-llm cost=0.001 trace_id=xyz-123\n".to_string(),
+            r#"data: {"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"provider-model","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+
+"#
+            .to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}],"stream":true}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Read the streaming response
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        // Comment lines with provider metadata should NOT appear in output
+        assert!(
+            !body_str.contains("provider=custom-llm"),
+            "Provider metadata in comments should be stripped"
+        );
+        assert!(!body_str.contains("trace_id=xyz-123"), "Trace ID should be stripped");
+        assert!(!body_str.contains("cost=0.001"), "Cost should be stripped");
+
+        // But the actual data should be sanitized and present
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+    }
+
+    /// Test that optional request fields are not injected as explicit nulls
+    /// When a field is omitted in the request, it should remain omitted when forwarded
+    #[tokio::test]
+    async fn test_responses_api_omitted_fields_not_injected_as_null() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock client that captures the forwarded request
+        let mock_response = r#"{
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 1234567890,
+            "completed_at": 1234567900,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": true,
+            "text": { "format": { "type": "text" } },
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        // Request with MessageItem that omits optional id and status fields
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "Hello"
+            }]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let _response = router.oneshot(request).await.unwrap();
+
+        // Check what was forwarded to the upstream
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let forwarded_body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let forwarded_json: serde_json::Value = serde_json::from_str(&forwarded_body).unwrap();
+
+        // The input array should have the message item
+        let input_items = forwarded_json["input"].as_array().unwrap();
+        assert_eq!(input_items.len(), 1);
+
+        let message_item = &input_items[0];
+
+        // CRITICAL: id and status fields should NOT be present (not even as null)
+        // If they are serialized as "id": null or "status": null, this test will fail
+        assert!(
+            !message_item.as_object().unwrap().contains_key("id"),
+            "Optional 'id' field should not be present when omitted in request, found: {:?}",
+            message_item
+        );
+        assert!(
+            !message_item.as_object().unwrap().contains_key("status"),
+            "Optional 'status' field should not be present when omitted in request, found: {:?}",
+            message_item
+        );
+    }
+
+    /// Test that unknown item types preserve their original payload
+    /// When an unknown item type is encountered, it should be forwarded unchanged
+    #[tokio::test]
+    async fn test_responses_api_unknown_item_types_preserved() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        let mock_response = r#"{
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 1234567890,
+            "completed_at": 1234567900,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": true,
+            "text": { "format": { "type": "text" } },
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        // Request with a future unknown item type (e.g., "web_search")
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": [{
+                "type": "web_search",
+                "query": "latest news",
+                "max_results": 10,
+                "custom_field": "should be preserved"
+            }]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let _response = router.oneshot(request).await.unwrap();
+
+        // Check what was forwarded
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let forwarded_body = String::from_utf8(requests[0].body.clone()).unwrap();
+        let forwarded_json: serde_json::Value = serde_json::from_str(&forwarded_body).unwrap();
+
+        let input_items = forwarded_json["input"].as_array().unwrap();
+        assert_eq!(input_items.len(), 1);
+
+        let unknown_item = &input_items[0];
+
+        // CRITICAL: All fields from the unknown item should be preserved
+        assert_eq!(unknown_item["type"], "web_search");
+        assert_eq!(unknown_item["query"], "latest news");
+        assert_eq!(unknown_item["max_results"], 10);
+        assert_eq!(
+            unknown_item["custom_field"], "should be preserved",
+            "Unknown item fields should be preserved, but got: {:?}",
+            unknown_item
+        );
     }
 }
