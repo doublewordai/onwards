@@ -68,16 +68,6 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
-
-    /// Mark this provider as trusted to bypass strict mode sanitization.
-    /// When strict_mode is enabled globally AND trusted is true for a target,
-    /// all sanitization (both success and error responses) is skipped.
-    /// WARNING: Trusted providers can leak metadata and non-standard responses.
-    /// Only use for providers you fully control or trust.
-    /// Defaults to false.
-    #[serde(default)]
-    #[builder(default)]
-    pub trusted: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -165,6 +155,16 @@ pub struct PoolSpec {
     #[builder(default)]
     pub sanitize_response: bool,
 
+    /// Mark this pool as trusted to bypass strict mode sanitization.
+    /// When strict_mode is enabled globally AND trusted is true for a pool,
+    /// all sanitization (both success and error responses) is skipped.
+    /// WARNING: Trusted pools can leak metadata and non-standard responses.
+    /// Only use for providers you fully control or trust.
+    /// Defaults to false.
+    #[serde(default)]
+    #[builder(default)]
+    pub trusted: bool,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -199,7 +199,8 @@ pub struct TargetSpec {
     #[builder(default)]
     pub sanitize_response: bool,
 
-    /// Mark this provider as trusted to bypass strict mode sanitization.
+    /// Mark this target as trusted to bypass strict mode sanitization.
+    /// For single-provider configs, this becomes the pool-level trusted flag.
     /// Defaults to false.
     #[serde(default)]
     #[builder(default)]
@@ -232,6 +233,7 @@ pub struct PoolConfig {
     pub fallback: Option<FallbackConfig>,
     pub strategy: LoadBalanceStrategy,
     pub sanitize_response: bool,
+    pub trusted: bool,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -247,12 +249,14 @@ impl TargetSpecOrList {
                 fallback: pool.fallback,
                 strategy: pool.strategy,
                 sanitize_response: pool.sanitize_response,
+                trusted: pool.trusted,
                 providers: pool.providers,
             },
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
-                // Take keys from first provider for backwards compatibility
+                // Take keys and trusted from first provider for backwards compatibility
                 let keys = list.first().and_then(|t| t.keys.clone());
+                let trusted = list.first().map(|t| t.trusted).unwrap_or(false);
                 let providers = list
                     .into_iter()
                     .map(|t| ProviderSpec {
@@ -266,7 +270,6 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
-                        trusted: t.trusted,
                     })
                     .collect();
                 PoolConfig {
@@ -277,13 +280,15 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response: false,
+                    trusted,
                     providers,
                 }
             }
             TargetSpecOrList::Single(spec) => {
-                // Single provider: use its keys as pool-level, convert to ProviderSpec
+                // Single provider: use its keys and trusted as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
                 let sanitize_response = spec.sanitize_response;
+                let trusted = spec.trusted;
                 let provider = ProviderSpec {
                     url: spec.url,
                     onwards_key: spec.onwards_key,
@@ -295,7 +300,6 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
-                    trusted: spec.trusted,
                 };
                 PoolConfig {
                     keys,
@@ -305,6 +309,7 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response,
+                    trusted,
                     providers: vec![provider],
                 }
             }
@@ -347,7 +352,6 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            trusted: value.trusted,
         }
     }
 }
@@ -373,7 +377,6 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            trusted: value.trusted,
         }
     }
 }
@@ -452,9 +455,6 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
-    /// Mark this provider as trusted to bypass strict mode sanitization
-    #[builder(default)]
-    pub trusted: bool,
 }
 
 impl Target {
@@ -473,6 +473,7 @@ impl Target {
             None,
             None,
             LoadBalanceStrategy::default(),
+            false, // trusted defaults to false
         )
     }
 }
@@ -733,6 +734,7 @@ impl Targets {
                 pool_concurrency_limiter,
                 pool_config.fallback,
                 pool_config.strategy,
+                pool_config.trusted,
             );
             debug!(
                 "Created provider pool '{}' with {} provider(s), fallback enabled: {}, strategy: {:?}",
@@ -1797,8 +1799,7 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
-        assert!(!target.trusted, "trusted should default to false");
+        assert!(!pool.is_trusted(), "trusted should default to false");
     }
 
     #[test]
@@ -1817,55 +1818,44 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
-        assert!(target.trusted, "trusted should be true when explicitly set");
+        assert!(pool.is_trusted(), "trusted should be true when explicitly set");
     }
 
     #[test]
-    fn test_trusted_field_preserved_in_conversions() {
-        // Test TargetSpec -> Target conversion
-        let target_spec = TargetSpec::builder()
-            .url("https://api.example.com".parse().unwrap())
-            .trusted(true)
-            .build();
-
-        let target: Target = target_spec.into();
-        assert!(target.trusted, "TargetSpec conversion should preserve trusted field");
-
-        // Test ProviderSpec -> Target conversion with minimal required fields
-        let provider_spec = ProviderSpec {
-            url: "https://api.example.com".parse().unwrap(),
-            onwards_key: None,
-            onwards_model: None,
+    fn test_trusted_field_preserved_in_pool_conversion() {
+        // Test PoolSpec -> PoolConfig conversion
+        let pool_spec = PoolSpec {
+            keys: None,
             rate_limit: None,
             concurrency_limit: None,
-            upstream_auth_header_name: None,
-            upstream_auth_header_prefix: None,
             response_headers: None,
-            weight: 1,
+            fallback: None,
+            strategy: LoadBalanceStrategy::default(),
             sanitize_response: false,
             trusted: true,
+            providers: vec![ProviderSpec {
+                url: "https://api.example.com".parse().unwrap(),
+                onwards_key: None,
+                onwards_model: None,
+                rate_limit: None,
+                concurrency_limit: None,
+                upstream_auth_header_name: None,
+                upstream_auth_header_prefix: None,
+                response_headers: None,
+                weight: 1,
+                sanitize_response: false,
+            }],
         };
 
-        let target: Target = provider_spec.into();
-        assert!(target.trusted, "ProviderSpec conversion should preserve trusted field");
-    }
+        let pool_config = TargetSpecOrList::Pool(pool_spec).into_pool_config();
+        assert!(pool_config.trusted, "PoolSpec conversion should preserve trusted field");
 
-    #[test]
-    fn test_trusted_field_in_pool_config() {
+        // Test TargetSpec (single provider) -> PoolConfig conversion via JSON
         let json = r#"{
             "targets": {
-                "pool-model": {
-                    "providers": [
-                        {
-                            "url": "https://api1.example.com",
-                            "trusted": true
-                        },
-                        {
-                            "url": "https://api2.example.com",
-                            "trusted": false
-                        }
-                    ]
+                "test-model": {
+                    "url": "https://api.example.com",
+                    "trusted": true
                 }
             }
         }"#;
@@ -1873,25 +1863,53 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("pool-model").unwrap();
+        let pool = targets.targets.get("test-model").unwrap();
+        assert!(pool.is_trusted(), "Single TargetSpec with trusted: true should create trusted pool");
+    }
 
-        // Get all providers via the public API
-        let providers = pool.providers();
-        let trusted_count = providers.iter().filter(|p| p.target.trusted).count();
-        let untrusted_count = providers.iter().filter(|p| !p.target.trusted).count();
+    #[test]
+    fn test_trusted_field_in_pool_config() {
+        // Test pool with trusted flag set
+        let json_trusted = r#"{
+            "targets": {
+                "trusted-pool": {
+                    "trusted": true,
+                    "providers": [
+                        {
+                            "url": "https://api1.example.com"
+                        },
+                        {
+                            "url": "https://api2.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
 
-        assert_eq!(trusted_count, 1, "Should have exactly one trusted provider");
-        assert_eq!(untrusted_count, 1, "Should have exactly one untrusted provider");
+        let config: ConfigFile = serde_json::from_str(json_trusted).unwrap();
+        let targets = Targets::from_config(config).unwrap();
 
-        // Verify by URL which one is trusted
-        let trusted_provider = providers.iter()
-            .find(|p| p.target.url.as_str().contains("api1"))
-            .expect("Should find api1 provider");
-        assert!(trusted_provider.target.trusted, "api1 provider should be trusted");
+        let pool = targets.targets.get("trusted-pool").unwrap();
+        assert!(pool.is_trusted(), "Pool with trusted: true should be trusted");
+        assert_eq!(pool.len(), 2, "Pool should have 2 providers");
 
-        let untrusted_provider = providers.iter()
-            .find(|p| p.target.url.as_str().contains("api2"))
-            .expect("Should find api2 provider");
-        assert!(!untrusted_provider.target.trusted, "api2 provider should not be trusted");
+        // Test pool without trusted flag (defaults to false)
+        let json_untrusted = r#"{
+            "targets": {
+                "untrusted-pool": {
+                    "providers": [
+                        {
+                            "url": "https://api1.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json_untrusted).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("untrusted-pool").unwrap();
+        assert!(!pool.is_trusted(), "Pool without trusted flag should default to false");
     }
 }

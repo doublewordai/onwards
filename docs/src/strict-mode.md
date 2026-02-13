@@ -131,13 +131,15 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 - Non-security-critical deployments
 - Maximum flexibility with endpoint coverage
 
-## Trusted Targets
+## Trusted Pools
 
-In strict mode, you can mark specific targets as trusted to bypass all sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their exact responses and error messages passed through.
+In strict mode, you can mark entire provider pools as trusted to bypass all sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their exact responses and error messages passed through.
+
+**Note:** The `trusted` flag is set at the pool level, meaning all providers in a trusted pool bypass sanitization. You cannot mix trusted and untrusted providers within the same pool.
 
 ### Configuration
 
-Add `trusted: true` to any target configuration:
+**Single-provider configuration:**
 
 ```json
 {
@@ -156,11 +158,34 @@ Add `trusted: true` to any target configuration:
 }
 ```
 
-In this example, `gpt-4` responses bypass all sanitization, while `third-party` responses receive full strict mode sanitization.
+**Multi-provider pool configuration:**
+
+```json
+{
+  "strict_mode": true,
+  "targets": {
+    "gpt-4-pool": {
+      "trusted": true,
+      "providers": [
+        {
+          "url": "https://api.openai.com",
+          "onwards_key": "sk-primary-..."
+        },
+        {
+          "url": "https://api.openai.com",
+          "onwards_key": "sk-backup-..."
+        }
+      ]
+    }
+  }
+}
+```
+
+In these examples, `gpt-4` and `gpt-4-pool` responses bypass all sanitization, while `third-party` responses receive full strict mode sanitization.
 
 ### Behavior
 
-When a target is marked as `trusted: true`:
+When a pool is marked as `trusted: true`:
 
 - **Success responses**: Passed through completely with all provider metadata intact
 - **Error responses**: Original error messages and metadata forwarded to clients
@@ -170,17 +195,19 @@ When a target is marked as `trusted: true`:
 
 ### Security Warning
 
-⚠️ **Use trusted targets carefully.** Marking a target as trusted bypasses all strict mode security guarantees:
+⚠️ **Use trusted pools carefully.** Marking a pool as trusted bypasses all strict mode security guarantees for all providers in that pool:
 
 - Provider-specific metadata may leak to clients (costs, trace IDs, internal identifiers)
 - Third-party error details and stack traces will be exposed
 - Responses may not match OpenAI schema exactly
 - Non-standard fields may confuse client applications
 
-**Only mark targets as trusted when you fully control or trust the provider.** This typically means:
-- Your own OpenAI/Anthropic accounts
-- Self-hosted models you operate
-- Internal services you maintain
+**Only mark pools as trusted when you fully control or trust ALL providers in that pool.** This typically means:
+- Your own OpenAI/Anthropic accounts (all providers using your API keys)
+- Self-hosted models you operate (all instances)
+- Internal services you maintain (all endpoints)
+
+**Do not mix trusted and untrusted providers** - if you have mixed trust levels, create separate pools for trusted and untrusted providers.
 
 ## Implementation details
 

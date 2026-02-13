@@ -68,17 +68,13 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    // Check if this target is trusted - if so, bypass all sanitization
+    // Check if this pool is trusted - if so, bypass all sanitization
     let is_trusted = state.targets.targets.get(&original_model)
-        .map(|pool| {
-            pool.providers().first()
-                .map(|p| p.target.trusted)
-                .unwrap_or(false)
-        })
+        .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
     if is_trusted {
-        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
         return forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
     }
 
@@ -129,17 +125,13 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Check if this target is trusted - if so, bypass all sanitization
+    // Check if this pool is trusted - if so, bypass all sanitization
     let is_trusted = state.targets.targets.get(&original_model)
-        .map(|pool| {
-            pool.providers().first()
-                .map(|p| p.target.trusted)
-                .unwrap_or(false)
-        })
+        .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
     if is_trusted {
-        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
         return forward_request(state, headers, "/v1/responses", body_bytes).await;
     }
 
@@ -189,17 +181,13 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Check if this target is trusted - if so, bypass all sanitization
+    // Check if this pool is trusted - if so, bypass all sanitization
     let is_trusted = state.targets.targets.get(&original_model)
-        .map(|pool| {
-            pool.providers().first()
-                .map(|p| p.target.trusted)
-                .unwrap_or(false)
-        })
+        .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
     if is_trusted {
-        debug!(model = %original_model, "Bypassing sanitization for trusted target");
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
         return forward_request(state, headers, "/v1/embeddings", body_bytes).await;
     }
 
@@ -1606,7 +1594,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_trusted_target_bypasses_sanitization() {
-        use crate::target::{Target, Targets};
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
         use crate::test_utils::MockHttpClient;
         use axum::body::Body;
         use axum::http::Request;
@@ -1615,15 +1604,23 @@ mod tests {
         use tower::ServiceExt;
 
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .onwards_key("sk-test".to_string())
-                .trusted(true) // Mark as trusted
-                .build()
-                .into_pool(),
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
         );
+        targets_map.insert("gpt-4".to_string(), pool);
 
         let targets = Targets {
             targets: targets_map,
@@ -1703,7 +1700,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_trusted_target_bypasses_error_sanitization() {
-        use crate::target::{Target, Targets};
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
         use crate::test_utils::MockHttpClient;
         use axum::body::Body;
         use axum::http::Request;
@@ -1712,15 +1710,23 @@ mod tests {
         use tower::ServiceExt;
 
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .onwards_key("sk-test".to_string())
-                .trusted(true)
-                .build()
-                .into_pool(),
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
         );
+        targets_map.insert("gpt-4".to_string(), pool);
 
         let targets = Targets {
             targets: targets_map,
@@ -2404,7 +2410,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_trusted_streaming_responses_passthrough() {
-        use crate::target::{Target, Targets};
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
         use crate::test_utils::MockHttpClient;
         use axum::body::Body;
         use axum::http::Request;
@@ -2413,15 +2420,23 @@ mod tests {
         use tower::ServiceExt;
 
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            Target::builder()
-                .url("https://api.openai.com".parse().unwrap())
-                .onwards_key("sk-test".to_string())
-                .trusted(true)
-                .build()
-                .into_pool(),
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
         );
+        targets_map.insert("gpt-4".to_string(), pool);
 
         let targets = Targets {
             targets: targets_map,
