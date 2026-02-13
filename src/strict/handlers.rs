@@ -68,7 +68,15 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
+    let response = forward_request(state.clone(), headers, "/v1/chat/completions", body_bytes).await;
+
+    // Check if this target is trusted - if so, bypass all sanitization
+    if let Some(pool) = state.targets.targets.get(&original_model) {
+        if pool.providers().first().map(|p| p.target.trusted).unwrap_or(false) {
+            debug!(model = %original_model, "Bypassing sanitization for trusted target");
+            return response;
+        }
+    }
 
     // Sanitize response to ensure model field matches and extra fields are dropped
     if response.status().is_success() {
@@ -1560,6 +1568,103 @@ mod tests {
         assert!(body_json.get("provider_metadata").is_none()); // Extra field removed
         assert!(body_json.get("cost").is_none()); // Extra field removed
         assert!(body_json.get("processing_time_ms").is_none()); // Extra field removed
+    }
+
+    #[tokio::test]
+    async fn test_trusted_target_bypasses_sanitization() {
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .trusted(true) // Mark as trusted
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream response with provider-specific fields
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4-actual-provider-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider_metadata": {
+                "cost": 0.001,
+                "trace_id": "trace-123"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify ORIGINAL response is passed through for trusted target:
+        // 1. Model field NOT rewritten (still provider's model)
+        assert_eq!(
+            response_json["model"], "gpt-4-actual-provider-model",
+            "Trusted target should preserve original model field"
+        );
+
+        // 2. Provider-specific fields NOT removed
+        assert!(
+            response_json.get("provider_metadata").is_some(),
+            "Trusted target should preserve provider metadata"
+        );
+        assert_eq!(response_json["provider_metadata"]["cost"], 0.001);
+        assert_eq!(response_json["provider_metadata"]["trace_id"], "trace-123");
+
+        // 3. Standard fields still present
+        assert_eq!(response_json["object"], "chat.completion");
+        assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
     }
 
     /// Test that Content-Length header is updated correctly after Responses API sanitization
