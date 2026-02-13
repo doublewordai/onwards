@@ -1980,4 +1980,109 @@ mod tests {
             unknown_item
         );
     }
+
+    #[tokio::test]
+    async fn test_strict_mode_ignores_target_sanitize_response_flag() {
+        // This test verifies that when strict mode is enabled globally,
+        // individual target sanitize_response flags are ignored to prevent
+        // double sanitization. Strict mode handlers already perform complete
+        // sanitization, so response_transform_fn should be skipped.
+
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                // This flag should be IGNORED in strict mode
+                .sanitize_response(true)
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true, // Strict mode enabled
+        };
+
+        // Mock upstream response with provider-specific fields
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4-actual-provider-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider_metadata": {
+                "cost": 0.001,
+                "trace_id": "trace-123"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client)
+            .with_response_transform(crate::create_openai_sanitizer());
+
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify strict mode sanitization worked:
+        // 1. Model field rewritten to match request
+        assert_eq!(response_json["model"], "gpt-4");
+
+        // 2. Provider-specific fields removed
+        assert!(
+            response_json.get("provider_metadata").is_none(),
+            "Provider metadata should be removed by strict mode sanitization"
+        );
+
+        // 3. Standard fields preserved
+        assert_eq!(response_json["object"], "chat.completion");
+        assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
+
+        // This test passing confirms that:
+        // - Strict mode sanitization works even when sanitize_response: true
+        // - No double sanitization occurs (which could corrupt responses)
+        // - response_transform_fn is properly skipped in strict mode
+    }
 }

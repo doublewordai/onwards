@@ -118,6 +118,8 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 | Router type | Wildcard passthrough | Typed handlers |
 | Use case | Simple response cleaning | Production security & compliance |
 
+**Important:** When strict mode is enabled globally, the per-target `sanitize_response` flag is automatically ignored. Strict mode handlers perform complete sanitization themselves, so enabling `sanitize_response: true` on individual targets has no effect and won't cause double sanitization.
+
 **When to use strict mode:**
 - Production deployments requiring security hardening
 - Compliance requirements around error message content
@@ -137,6 +139,7 @@ For developers working on the Onwards codebase:
 - Strict mode uses typed Axum handlers defined in `src/strict/handlers.rs`
 - Each endpoint has dedicated request/response schema types in `src/strict/schemas/`
 - Requests are deserialized using serde, which automatically validates structure
+- `response_transform_fn` is skipped when strict mode is enabled to prevent double sanitization
 
 **Response sanitization:**
 - Responses are deserialized through strict schemas (extra fields automatically dropped by serde)
