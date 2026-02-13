@@ -2383,4 +2383,71 @@ mod tests {
         // 3. Standard fields preserved
         assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
     }
+
+    #[tokio::test]
+    async fn test_trusted_streaming_responses_passthrough() {
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .trusted(true)
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock SSE streaming response with provider metadata in chunks
+        let mock_stream = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4-provider\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}],\"provider_cost\":0.001}\n\n";
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Verify stream is passed through without sanitization
+        assert!(
+            response_str.contains("\"model\":\"gpt-4-provider\""),
+            "Trusted streaming should preserve original model"
+        );
+        assert!(
+            response_str.contains("\"provider_cost\":0.001"),
+            "Trusted streaming should preserve provider metadata"
+        );
+    }
 }
