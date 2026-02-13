@@ -6,7 +6,7 @@
 use crate::AppState;
 use crate::auth;
 use crate::client::HttpClient;
-use crate::errors::OnwardsErrorResponse;
+use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
 use crate::target::Target;
@@ -15,7 +15,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, HeaderValue, Uri,
+        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -465,6 +465,53 @@ pub async fn target_message_handler<T: HttpClient>(
                     );
                     last_error = Some(OnwardsErrorResponse::bad_gateway());
                     continue;
+                }
+
+                // Sanitize error responses when sanitize_response is enabled.
+                // Replace upstream error bodies with generic messages to prevent
+                // information leakage (provider names, URLs, internal model names).
+                if target.sanitize_response && !(200..300).contains(&status) {
+                    // Buffer and log the original error for debugging/tracing
+                    let error_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .ok();
+
+                    error!(
+                        status = status,
+                        upstream = %target.url,
+                        body = error_body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b))
+                            .unwrap_or_default()
+                            .as_ref(),
+                        "Upstream provider returned error, sanitizing before forwarding to client"
+                    );
+
+                    let sanitized_error = if (400..500).contains(&status) {
+                        OnwardsErrorResponse::builder()
+                            .body(ErrorResponseBody {
+                                message: "The upstream provider rejected the request.".to_string(),
+                                r#type: "invalid_request_error".to_string(),
+                                param: None,
+                                code: "upstream_error".to_string(),
+                            })
+                            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                            .build()
+                    } else {
+                        OnwardsErrorResponse::builder()
+                            .body(ErrorResponseBody {
+                                message: "An internal error occurred. Please try again later."
+                                    .to_string(),
+                                r#type: "internal_error".to_string(),
+                                param: None,
+                                code: "internal_error".to_string(),
+                            })
+                            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                            .build()
+                    };
+
+                    record_response_status(status);
+                    return Err(sanitized_error);
                 }
 
                 // Check content type for SSE handling

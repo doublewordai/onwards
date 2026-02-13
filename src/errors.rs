@@ -138,11 +138,62 @@ impl OnwardsErrorResponse {
     }
 }
 
+/// OpenAI-compatible error envelope: `{"error": {...}}`
+#[derive(Debug, Clone, Serialize)]
+struct ErrorEnvelope<'a> {
+    error: &'a ErrorResponseBody,
+}
+
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
         match self.body {
-            Some(body) => (self.status, Json(body)).into_response(),
+            Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn test_error_response_has_openai_envelope() {
+        let error = OnwardsErrorResponse::rate_limited();
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Must be wrapped in {"error": {...}} envelope
+        assert!(body.get("error").is_some(), "Missing error envelope");
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit");
+        assert_eq!(
+            body["error"]["message"],
+            "You are sending requests too quickly. Please slow down."
+        );
+
+        // Must NOT have fields at the top level
+        assert!(body.get("type").is_none());
+        assert!(body.get("code").is_none());
+        assert!(body.get("message").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_error_response_no_body() {
+        let error = OnwardsErrorResponse::builder()
+            .status(StatusCode::NO_CONTENT)
+            .build();
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(body_bytes.is_empty());
     }
 }
