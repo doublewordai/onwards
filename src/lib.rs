@@ -3098,6 +3098,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 422 with provider-specific error details
@@ -3160,6 +3161,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 503 with internal details
@@ -3214,6 +3216,7 @@ mod tests {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
             };
 
             // Upstream returns 422 with provider-specific details
