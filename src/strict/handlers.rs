@@ -68,6 +68,16 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
+    // Check if this pool is trusted - if so, bypass all sanitization
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| pool.is_trusted())
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
+        return forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
+    }
+
     let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
 
     // Sanitize response to ensure model field matches and extra fields are dropped
@@ -115,6 +125,16 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
+    // Check if this pool is trusted - if so, bypass all sanitization
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| pool.is_trusted())
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
+        return forward_request(state, headers, "/v1/responses", body_bytes).await;
+    }
+
     let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
 
     // Sanitize response to ensure model field matches and extra fields are dropped
@@ -160,6 +180,16 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
             );
         }
     };
+
+    // Check if this pool is trusted - if so, bypass all sanitization
+    let is_trusted = state.targets.targets.get(&original_model)
+        .map(|pool| pool.is_trusted())
+        .unwrap_or(false);
+
+    if is_trusted {
+        debug!(model = %original_model, "Bypassing sanitization for trusted pool");
+        return forward_request(state, headers, "/v1/embeddings", body_bytes).await;
+    }
 
     let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
 
@@ -1562,6 +1592,205 @@ mod tests {
         assert!(body_json.get("processing_time_ms").is_none()); // Extra field removed
     }
 
+    #[tokio::test]
+    async fn test_trusted_target_bypasses_sanitization() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream response with provider-specific fields
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4-actual-provider-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider_metadata": {
+                "cost": 0.001,
+                "trace_id": "trace-123"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify ORIGINAL response is passed through for trusted target:
+        // 1. Model field NOT rewritten (still provider's model)
+        assert_eq!(
+            response_json["model"], "gpt-4-actual-provider-model",
+            "Trusted target should preserve original model field"
+        );
+
+        // 2. Provider-specific fields NOT removed
+        assert!(
+            response_json.get("provider_metadata").is_some(),
+            "Trusted target should preserve provider metadata"
+        );
+        assert_eq!(response_json["provider_metadata"]["cost"], 0.001);
+        assert_eq!(response_json["provider_metadata"]["trace_id"], "trace-123");
+
+        // 3. Standard fields still present
+        assert_eq!(response_json["object"], "chat.completion");
+        assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
+    }
+
+    #[tokio::test]
+    async fn test_trusted_target_bypasses_error_sanitization() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream error with provider-specific details
+        let mock_error = r#"{
+            "error": {
+                "message": "Internal provider error: GPU cluster unavailable in eu-west-3",
+                "type": "provider_error",
+                "code": "internal_error",
+                "metadata": {
+                    "provider": "openai",
+                    "region": "eu-west-3",
+                    "trace_id": "trace-abc-123"
+                }
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify ORIGINAL error is passed through for trusted target:
+        // 1. Original error message preserved
+        assert_eq!(
+            response_json["error"]["message"],
+            "Internal provider error: GPU cluster unavailable in eu-west-3",
+            "Trusted target should preserve original error message"
+        );
+
+        // 2. Provider-specific error code preserved
+        assert_eq!(response_json["error"]["code"], "internal_error");
+
+        // 3. Provider metadata preserved
+        assert!(response_json["error"]["metadata"].is_object());
+        assert_eq!(response_json["error"]["metadata"]["provider"], "openai");
+        assert_eq!(response_json["error"]["metadata"]["region"], "eu-west-3");
+        assert_eq!(response_json["error"]["metadata"]["trace_id"], "trace-abc-123");
+    }
+
     /// Test that Content-Length header is updated correctly after Responses API sanitization
     #[tokio::test]
     async fn test_responses_sanitization_updates_content_length_header() {
@@ -2084,5 +2313,174 @@ mod tests {
         // - Strict mode sanitization works even when sanitize_response: true
         // - No double sanitization occurs (which could corrupt responses)
         // - response_transform_fn is properly skipped in strict mode
+    }
+
+    #[tokio::test]
+    async fn test_untrusted_target_still_sanitized() {
+        use crate::target::{Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "third-party".to_string(),
+            Target::builder()
+                .url("https://third-party.com".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                // NO trusted flag - defaults to false
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream response with provider-specific fields
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "provider-internal-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15
+            },
+            "provider_metadata": {
+                "should": "be removed"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "third-party",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify strict mode sanitization STILL APPLIES for untrusted:
+        // 1. Model field rewritten to match request
+        assert_eq!(
+            response_json["model"], "third-party",
+            "Untrusted target should have model field rewritten"
+        );
+
+        // 2. Provider metadata removed
+        assert!(
+            response_json.get("provider_metadata").is_none(),
+            "Untrusted target should have provider metadata removed"
+        );
+
+        // 3. Standard fields preserved
+        assert_eq!(response_json["choices"][0]["message"]["content"], "Hello!");
+    }
+
+    #[tokio::test]
+    async fn test_trusted_streaming_responses_passthrough() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock SSE streaming response with provider metadata in chunks
+        let mock_stream = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4-provider\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0}],\"provider_cost\":0.001}\n\n";
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Verify stream is passed through without sanitization
+        assert!(
+            response_str.contains("\"model\":\"gpt-4-provider\""),
+            "Trusted streaming should preserve original model"
+        );
+        assert!(
+            response_str.contains("\"provider_cost\":0.001"),
+            "Trusted streaming should preserve provider metadata"
+        );
     }
 }
