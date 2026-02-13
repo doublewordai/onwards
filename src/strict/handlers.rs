@@ -311,8 +311,8 @@ async fn sanitize_streaming_chat_response(
                 let chunk_str = String::from_utf8_lossy(&chunk);
                 let mut sanitized_lines = Vec::new();
 
-                // Process SSE line-by-line to handle multi-line data events,
-                // comment lines, and event type lines
+                // Process SSE line-by-line for streaming chunks,
+                // preserving empty lines and ignoring comment/event-type lines
                 for line in chunk_str.lines() {
                     if let Some(data_part) = line.strip_prefix("data: ") {
                         // This is a data line
