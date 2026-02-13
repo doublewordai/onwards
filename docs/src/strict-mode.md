@@ -37,9 +37,9 @@ When enabled, all requests to all targets will use strict mode validation and sa
 When `strict_mode: true` is enabled:
 
 1. **Request validation**: Incoming requests are deserialized through OpenAI schemas. Invalid requests receive immediate `400 Bad Request` errors with clear messages.
-2. **Response sanitization**: Third-party responses are deserialized (automatically dropping unknown fields), the model field is rewritten to match the original request, then re-serialized as clean OpenAI responses.
+2. **Response sanitization**: Third-party responses are deserialized (automatically dropping unknown fields). If deserialization fails, a standard error is returned - malformed responses are never passed through. The model field is rewritten to match the original request, then re-serialized as clean OpenAI responses with correct Content-Length headers.
 3. **Error standardization**: Third-party errors are logged internally but never forwarded to clients. Clients receive standardized OpenAI-format errors based only on HTTP status codes.
-4. **Streaming support**: SSE streams are parsed line-by-line, each chunk is sanitized, and re-emitted as clean events.
+4. **Streaming support**: SSE streams are parsed line-by-line to handle multi-line data events and strip comment lines, each chunk is sanitized, and re-emitted as clean events.
 
 ## Security benefits
 
@@ -47,6 +47,8 @@ When `strict_mode: true` is enabled:
 - Third-party stack traces, database errors, and debug information are never exposed
 - Error responses contain only standard HTTP status codes and generic messages
 - No provider-specific metadata (trace IDs, internal IDs, costs) reaches clients
+- Malformed provider responses fail closed with standard errors (never leaked)
+- SSE comment lines stripped to prevent metadata leakage in streaming responses
 
 **Ensures consistency:**
 - Responses always match OpenAI's API format exactly
@@ -138,17 +140,23 @@ For developers working on the Onwards codebase:
 
 **Response sanitization:**
 - Responses are deserialized through strict schemas (extra fields automatically dropped by serde)
+- Malformed responses fail closed with standard errors - never passed through
 - Model field is rewritten to match the original request model
 - Re-serialized to ensure only defined fields are present
+- Content-Length headers updated to match sanitized response size
 - Applies to both non-streaming responses and SSE chunks
+- SSE streams processed line-by-line to handle multi-line events and strip comments
 
 **Error handling:**
 - Third-party errors are intercepted in `sanitize_error_response()`
 - Original error logged with `error!()` macro for server-side debugging
 - Standard error generated based only on HTTP status code
 - OpenAI-compatible format guaranteed via `error_response()` helper
+- Deserialization failures return standard errors, never leak malformed responses
 
 **Testing:**
 - Request/response schema tests in each schema module
 - Integration tests in `src/strict/handlers.rs` verify sanitization behavior
-- Tests ensure malformed responses are handled gracefully with fallback to passthrough
+- Tests verify fail-closed behavior on malformed responses (no passthrough)
+- Tests verify SSE multi-line events and comment stripping
+- Tests verify Content-Length header correctness after sanitization
