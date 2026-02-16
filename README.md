@@ -75,6 +75,7 @@ Onwards uses HTTP connection pooling to dramatically improve performance under l
     "idle_timeout_secs": 90
   }
 }
+```
 
 **When to increase `pool-max-idle-per-host`:**
 
@@ -87,7 +88,7 @@ The pool limit is applied **per upstream host**. Choose based on your deployment
 - **Why:** Traffic spreads across many upstreams, each gets moderate volume
 - **Math:** 10 providers × 200 connections = 2,000 total pooled connections
 
-```bash
+```json
 # Fan-out configuration
 {
   "http_pool": {
@@ -104,7 +105,7 @@ The pool limit is applied **per upstream host**. Choose based on your deployment
 - **Why:** ALL traffic goes to one host - needs high capacity to avoid creating new connections
 - **Math:** Peak 2000 concurrent requests → 2000 pooled connections reused across all requests
 
-```bash
+```json
 # Single upstream configuration
 {
   "http_pool": {
@@ -113,6 +114,8 @@ The pool limit is applied **per upstream host**. Choose based on your deployment
   }
 }
 ```
+
+Default values: If http_pool is omitted, defaults are 100 max idle connections per host and 90 second timeout.
 
 **Rule of thumb:** Set `pool-max-idle-per-host` >= your expected peak concurrent requests per upstream host. If the pool is too small, new connections will be created beyond the pool limit, reducing the performance benefit.
 
