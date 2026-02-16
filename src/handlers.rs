@@ -466,8 +466,15 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Request to {} timed out after {:?}",
                         upstream_uri, timeout_duration
                     );
-                    last_error = Some(OnwardsErrorResponse::bad_gateway());
-                    continue;
+                    last_error = Some(OnwardsErrorResponse::gateway_timeout());
+
+                    // Only retry on timeout if fallback is enabled
+                    if pool.fallback_enabled() {
+                        continue;
+                    } else {
+                        record_response_status(504);
+                        return Err(last_error.unwrap());
+                    }
                 }
                 Ok(result) => result,
             }
@@ -1512,7 +1519,7 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
-                http_pool_config: None
+                http_pool_config: None,
             },
             http_client: mock_client,
             body_transform_fn: None,

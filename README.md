@@ -60,12 +60,21 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 
 Onwards uses HTTP connection pooling to dramatically improve performance under load by reusing connections instead of creating new ones for each request. This eliminates the 1:1 request-to-file-descriptor ratio and prevents TIME_WAIT connection accumulation.
 
-**Default settings (suitable for most deployments):**
-```bash
-onwards -f config.json \
-  --pool-max-idle-per-host 100 \
-  --pool-idle-timeout-secs 90
-```
+**Configure via config file:**
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "url": "https://api.openai.com",
+      "onwards_key": "sk-your-openai-key"
+    }
+  },
+  "http_pool": {
+    "max_idle_per_host": 100,
+    "idle_timeout_secs": 90
+  }
+}
 
 **When to increase `pool-max-idle-per-host`:**
 
@@ -74,29 +83,35 @@ The pool limit is applied **per upstream host**. Choose based on your deployment
 #### Scenario 1: Fan-out (Multiple Upstreams)
 *Example: Main server routes to 10+ different model providers*
 
-- **Recommendation:** `--pool-max-idle-per-host 200-300`
+- **Recommendation:** `max_idle_per_host: 200-300`
 - **Why:** Traffic spreads across many upstreams, each gets moderate volume
 - **Math:** 10 providers × 200 connections = 2,000 total pooled connections
 
 ```bash
 # Fan-out configuration
-onwards -f config.json \
-  --pool-max-idle-per-host 300 \
-  --pool-idle-timeout-secs 90
+{
+  "http_pool": {
+    "max_idle_per_host": 300,
+    "idle_timeout_secs": 90
+  }
+}
 ```
 
 #### Scenario 2: Single Upstream (High Concurrency)
 *Example: Gateway in front of a single vLLM server handling all traffic*
 
-- **Recommendation:** `--pool-max-idle-per-host 1000-2000`
+- **Recommendation:** `max_idle_per_host: 1000-2000`
 - **Why:** ALL traffic goes to one host - needs high capacity to avoid creating new connections
 - **Math:** Peak 2000 concurrent requests → 2000 pooled connections reused across all requests
 
 ```bash
 # Single upstream configuration
-onwards -f config.json \
-  --pool-max-idle-per-host 2000 \
-  --pool-idle-timeout-secs 120
+{
+  "http_pool": {
+    "max_idle_per_host": 2000,
+    "idle_timeout_secs": 120
+  }
+}
 ```
 
 **Rule of thumb:** Set `pool-max-idle-per-host` >= your expected peak concurrent requests per upstream host. If the pool is too small, new connections will be created beyond the pool limit, reducing the performance benefit.

@@ -784,6 +784,10 @@ impl Targets {
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
+    /// Note: This method updates targets, key_rate_limiters, and key_concurrency_limiters,
+    /// but does NOT update http_pool_config or strict_mode. Changes to these settings
+    /// in the config file require a restart. The HTTP client pool is created once in
+    /// AppState::new and cannot be reconfigured at runtime.
     pub async fn receive_updates<W>(&self, targets_stream: W) -> Result<(), W::Error>
     where
         W: TargetsStream + Send + 'static,
@@ -942,7 +946,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
-            http_pool_config: None
+            http_pool_config: None,
         }
     }
 
@@ -1004,7 +1008,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
-            http_pool_config: None
+            http_pool_config: None,
         };
 
         // Create sequence of target updates
@@ -1068,7 +1072,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
-            http_pool_config: None
+            http_pool_config: None,
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -1119,7 +1123,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1159,7 +1163,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1192,7 +1196,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1219,7 +1223,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1307,7 +1311,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1328,7 +1332,7 @@ mod tests {
             targets: HashMap::new(),
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1359,7 +1363,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1399,7 +1403,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1487,7 +1491,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1515,7 +1519,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1593,7 +1597,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1628,7 +1632,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
-            http_pool: None
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
