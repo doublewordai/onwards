@@ -20,7 +20,7 @@ use crate::handlers::target_message_handler;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -255,11 +255,7 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize chat response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -414,11 +410,7 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize embeddings response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -473,11 +465,7 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize responses API response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -664,6 +652,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields that should be stripped
@@ -742,6 +731,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party returns internal model name
@@ -801,6 +791,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let streaming_chunks = vec![
@@ -857,6 +848,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let streaming_chunks = vec![
@@ -908,6 +900,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields
@@ -976,6 +969,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -1033,6 +1027,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with internal fields (should be completely replaced)
@@ -1097,6 +1092,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with leaky message
@@ -1155,6 +1151,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Non-JSON error response (e.g., plain text or HTML)
@@ -1208,6 +1205,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields
@@ -1296,6 +1294,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -1373,6 +1372,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with internal details
@@ -1385,7 +1385,8 @@ mod tests {
             }
         }"#;
 
-        let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
+        let mock_client =
+            MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
         let state = AppState::with_client(targets, mock_client);
         let router = crate::strict::build_strict_router(state);
 
@@ -1434,6 +1435,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra fields that will be removed during sanitization
@@ -1513,6 +1515,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra provider-specific fields
@@ -1580,6 +1583,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra provider-specific fields
@@ -1672,6 +1676,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Multi-line SSE event with provider-specific fields in the JSON
@@ -1706,9 +1711,15 @@ mod tests {
         assert!(body_str.contains("\"model\":\"gpt-4\""));
 
         // Provider-specific fields should be removed
-        assert!(!body_str.contains("provider"), "Provider field should be removed");
+        assert!(
+            !body_str.contains("provider"),
+            "Provider field should be removed"
+        );
         assert!(!body_str.contains("cost"), "Cost field should be removed");
-        assert!(!body_str.contains("leaked-provider"), "Provider name should not leak");
+        assert!(
+            !body_str.contains("leaked-provider"),
+            "Provider name should not leak"
+        );
     }
 
     /// Test that SSE events with comment lines don't leak provider metadata
@@ -1729,6 +1740,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // SSE stream with comment line containing provider-specific info
@@ -1768,7 +1780,10 @@ mod tests {
             !body_str.contains("provider=custom-llm"),
             "Provider metadata in comments should be stripped"
         );
-        assert!(!body_str.contains("trace_id=xyz-123"), "Trace ID should be stripped");
+        assert!(
+            !body_str.contains("trace_id=xyz-123"),
+            "Trace ID should be stripped"
+        );
         assert!(!body_str.contains("cost=0.001"), "Cost should be stripped");
 
         // But the actual data should be sanitized and present
@@ -1794,6 +1809,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock client that captures the forwarded request
@@ -1899,6 +1915,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -2013,6 +2030,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true, // Strict mode enabled
+            http_pool_config: None,
         };
 
         // Mock upstream response with provider-specific fields
