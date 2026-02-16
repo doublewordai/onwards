@@ -106,6 +106,16 @@ pub struct FallbackConfig {
     /// If true, hitting a local rate limit will try the next provider instead of returning 429.
     #[serde(default)]
     pub on_rate_limit: bool,
+
+    /// When true, weighted random failover samples with replacement,
+    /// allowing the same provider to be retried. Only affects WeightedRandom strategy.
+    #[serde(default)]
+    pub with_replacement: bool,
+
+    /// Maximum number of failover attempts. Defaults to provider count.
+    /// Most useful with `with_replacement: true` to allow more attempts than providers.
+    #[serde(default)]
+    pub max_attempts: Option<usize>,
 }
 
 impl FallbackConfig {
@@ -1651,6 +1661,7 @@ mod tests {
             enabled: true,
             on_status: vec![5, 429], // 5 = all 5xx codes, 429 = exact match
             on_rate_limit: false,
+            ..Default::default()
         };
 
         // 5 should match all 5xx codes
@@ -1674,6 +1685,7 @@ mod tests {
             enabled: true,
             on_status: vec![50, 52], // 50 = 500-509, 52 = 520-529
             on_rate_limit: false,
+            ..Default::default()
         };
 
         // 50 matches 500-509
@@ -1694,6 +1706,7 @@ mod tests {
             enabled: false,
             on_status: vec![5, 429],
             on_rate_limit: true,
+            ..Default::default()
         };
 
         // Even matching codes should return false when disabled
