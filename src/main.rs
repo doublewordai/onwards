@@ -3,6 +3,7 @@ use onwards::{
     AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
     config::Config,
     create_openai_sanitizer,
+    strict::build_strict_router,
     target::{Targets, WatchedFile},
 };
 use tokio::{net::TcpListener, task::JoinSet};
@@ -24,6 +25,9 @@ pub async fn main() -> anyhow::Result<()> {
     let targets = Targets::from_config_file(&config.targets)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create targets from config: {}", e))?;
+
+    // Check if strict mode is enabled
+    let strict_mode = targets.strict_mode;
 
     // Start file watcher if a config file was specified
     if config.watch {
@@ -53,6 +57,14 @@ pub async fn main() -> anyhow::Result<()> {
     let app_state =
         AppState::new(targets, &config).with_response_transform(create_openai_sanitizer());
     let mut router = build_router(app_state);
+
+    // Use strict router if strict_mode is enabled, otherwise use standard router
+    let mut router = if strict_mode {
+        info!("Strict mode enabled - using typed request validation");
+        build_strict_router(app_state)
+    } else {
+        build_router(app_state)
+    };
     // If we have a metrics layer, add it to the router.
     if let Some(prometheus_layer) = prometheus_layer {
         router = router.layer(prometheus_layer)

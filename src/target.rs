@@ -500,6 +500,11 @@ pub struct Auth {
 pub struct ConfigFile {
     pub targets: HashMap<String, TargetSpecOrList>,
     pub auth: Option<Auth>,
+    /// Enable strict mode with schema validation and typed handlers.
+    /// When false (default), all requests are passed through transparently.
+    /// When true, only known OpenAI API paths are accepted and validated.
+    #[serde(default)]
+    pub strict_mode: bool,
 }
 
 /// The live-updating collection of targets.
@@ -511,6 +516,8 @@ pub struct Targets {
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
     /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
     pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
+    /// Enable strict mode with schema validation
+    pub strict_mode: bool,
 }
 
 #[async_trait]
@@ -743,6 +750,7 @@ impl Targets {
             targets,
             key_rate_limiters,
             key_concurrency_limiters,
+            strict_mode: config_file.strict_mode,
         })
     }
 
@@ -904,6 +912,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         }
     }
 
@@ -964,6 +973,7 @@ mod tests {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         // Create sequence of target updates
@@ -1026,6 +1036,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: false,
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -1075,6 +1086,7 @@ mod tests {
                 global_keys,
                 key_definitions: None,
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1113,6 +1125,7 @@ mod tests {
                 global_keys,
                 key_definitions: None,
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1144,6 +1157,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1169,6 +1183,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1255,6 +1270,7 @@ mod tests {
                 global_keys: std::collections::HashSet::new(),
                 key_definitions: Some(key_definitions),
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1274,6 +1290,7 @@ mod tests {
         let config_file = ConfigFile {
             targets: HashMap::new(),
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1303,6 +1320,7 @@ mod tests {
                 global_keys: std::collections::HashSet::new(),
                 key_definitions: Some(key_definitions),
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1341,6 +1359,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1427,6 +1446,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1453,6 +1473,7 @@ mod tests {
         let config_file = ConfigFile {
             targets,
             auth: None,
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1529,6 +1550,7 @@ mod tests {
                 global_keys: std::collections::HashSet::new(),
                 key_definitions: Some(key_definitions),
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1562,6 +1584,7 @@ mod tests {
                 global_keys: std::collections::HashSet::new(),
                 key_definitions: Some(key_definitions),
             }),
+            strict_mode: false,
         };
 
         let targets = Targets::from_config(config_file).unwrap();

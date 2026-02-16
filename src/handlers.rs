@@ -6,7 +6,7 @@
 use crate::AppState;
 use crate::auth;
 use crate::client::HttpClient;
-use crate::errors::OnwardsErrorResponse;
+use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
 use crate::target::Target;
@@ -15,7 +15,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, HeaderValue, Uri,
+        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -466,10 +466,136 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Request to {} timed out after {:?}",
                         upstream_uri, timeout_duration
                     );
-                    last_error = Some(OnwardsErrorResponse::gateway_timeout());
-                    // Only continue to next provider if fallback is enabled
-                    if pool.fallback_enabled() {
-                        continue;
+                    last_error = Some(OnwardsErrorResponse::bad_gateway());
+                    continue;
+                }
+
+                // Sanitize error responses when sanitize_response is enabled.
+                // Replace upstream error bodies with generic messages to prevent
+                // information leakage (provider names, URLs, internal model names).
+                if target.sanitize_response && !(200..300).contains(&status) {
+                    // Buffer and log the original error for debugging/tracing
+                    let error_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .ok();
+
+                    error!(
+                        status = status,
+                        upstream = %target.url,
+                        body = error_body
+                            .as_ref()
+                            .map(|b| String::from_utf8_lossy(b))
+                            .unwrap_or_default()
+                            .as_ref(),
+                        "Upstream provider returned error, sanitizing before forwarding to client"
+                    );
+
+                    let sanitized_error = if (400..500).contains(&status) {
+                        OnwardsErrorResponse::builder()
+                            .body(ErrorResponseBody {
+                                message: "The upstream provider rejected the request.".to_string(),
+                                r#type: "invalid_request_error".to_string(),
+                                param: None,
+                                code: "upstream_error".to_string(),
+                            })
+                            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                            .build()
+                    } else {
+                        OnwardsErrorResponse::builder()
+                            .body(ErrorResponseBody {
+                                message: "An internal error occurred. Please try again later."
+                                    .to_string(),
+                                r#type: "internal_error".to_string(),
+                                param: None,
+                                code: "internal_error".to_string(),
+                            })
+                            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                            .build()
+                    };
+
+                    record_response_status(status);
+                    return Err(sanitized_error);
+                }
+
+                // Check content type for SSE handling
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let is_sse = content_type.contains("text/event-stream");
+
+                // Wrap SSE streams with buffering to handle incomplete chunks from providers.
+                // This must happen before any stream processing (e.g., sanitization) to ensure
+                // downstream consumers receive complete SSE events with valid JSON.
+                if is_sse {
+                    debug!("Wrapping SSE response with buffered stream");
+                    let (parts, body) = response.into_parts();
+                    let byte_stream = body.into_data_stream();
+                    let buffered = SseBufferedStream::new(byte_stream);
+                    let new_body = axum::body::Body::from_stream(buffered);
+                    response = Response::from_parts(parts, new_body);
+                }
+
+                // Apply response transformation if configured
+                // Per-target opt-in via sanitize_response flag, only for 2xx responses
+                // Skip if strict mode is enabled - strict handlers do their own sanitization
+                if let Some(ref transform_fn) = state.response_transform_fn
+                    && target.sanitize_response
+                    && (200..300).contains(&status)
+                    && !state.targets.strict_mode
+                {
+                    debug!(
+                        "Attempting response sanitization for status {}, path {}",
+                        status, path_and_query
+                    );
+
+                    // Extract original model from request extensions
+                    let original_model = req
+                        .extensions()
+                        .get::<OriginalModel>()
+                        .map(|m| m.0.to_string());
+
+                    if is_sse {
+                        // Streaming SSE response - transform chunk-by-chunk
+                        // Note: stream is already buffered above
+                        debug!("Applying streaming sanitization");
+
+                        let sanitizer = crate::response_sanitizer::ResponseSanitizer {
+                            original_model: original_model.clone(),
+                        };
+
+                        use futures_util::StreamExt;
+
+                        let body_stream = http_body_util::BodyExt::into_data_stream(
+                            std::mem::take(response.body_mut()),
+                        );
+
+                        let transformed_stream = body_stream.map(move |chunk_result| {
+                            match chunk_result {
+                                Ok(chunk) => {
+                                    // Sanitize this chunk
+                                    match sanitizer.sanitize_streaming(&chunk) {
+                                        Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
+                                        Ok(None) => Ok(chunk),
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to sanitize streaming chunk: {}",
+                                                e
+                                            );
+                                            Ok(chunk) // Pass through on error
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Stream error: {}", e);
+                                    Err(std::io::Error::other(e))
+                                }
+                            }
+                        });
+
+                        *response.body_mut() = axum::body::Body::from_stream(transformed_stream);
                     } else {
                         record_response_status(504);
                         return Err(last_error.unwrap());

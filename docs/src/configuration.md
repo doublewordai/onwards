@@ -2,6 +2,14 @@
 
 Onwards is configured through a JSON file. Each key in the `targets` object defines a model alias that clients can request.
 
+## Global options
+
+| Option | Type | Required | Description |
+|--------|------|----------|-------------|
+| `strict_mode` | bool | No | Enable strict mode globally for all targets (see [Strict Mode](strict-mode.md)). Default: false |
+| `auth` | object | No | Global authentication configuration (see [Authentication](authentication.md)) |
+| `targets` | object | Yes | Map of model aliases to target configurations |
+
 ## Target options
 
 | Option | Type | Required | Description |
@@ -15,7 +23,7 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `upstream_auth_header_name` | string | No | Custom header name for upstream auth (default: `Authorization`) |
 | `upstream_auth_header_prefix` | string | No | Custom prefix for upstream auth header value (default: `Bearer `) |
 | `response_headers` | object | No | Key-value pairs to add or override in the response headers |
-| `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance (see [Sanitization](sanitization.md)) |
+| `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance for responses only (see [Sanitization](sanitization.md)) |
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |
@@ -61,6 +69,7 @@ See [Authentication](authentication.md) for details.
 
 ```json
 {
+  "strict_mode": true,
   "auth": {
     "global_keys": ["global-api-key-1"],
     "key_definitions": {

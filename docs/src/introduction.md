@@ -15,7 +15,8 @@ A Rust-based AI Gateway that provides a unified interface for routing requests t
 - **Concurrency limiting** per-target and per-API-key
 - **Load balancing** with weighted random and priority strategies
 - **Automatic failover** across multiple providers
-- **Response sanitization** for strict OpenAI schema compliance
+- **Strict mode** for request validation, response sanitization, and error standardization
+- **Response sanitization** for OpenAI schema compliance
 - **Prometheus metrics** for monitoring
 - **Custom response headers** for pricing and metadata
 - **Upstream auth customization** for non-standard providers
