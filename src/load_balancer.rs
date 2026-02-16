@@ -202,12 +202,19 @@ impl ProviderPool {
 
     /// Select providers in priority order for fallback scenarios.
     /// Returns an iterator yielding (index, &Target) based on the configured strategy:
-    /// - WeightedRandom: Repeatedly samples from remaining pool using weighted random
+    /// - WeightedRandom: Repeatedly samples from the pool using weighted random.
+    ///   By default samples without replacement (each provider appears once).
+    ///   With `fallback.with_replacement: true`, the same provider can appear multiple times.
     /// - Priority: Returns providers in definition order (first provider is primary)
     ///
+    /// The number of attempts is controlled by `fallback.max_attempts` (defaults to provider count).
     /// Optimized for common cases: single provider returns immediately without allocation.
     pub fn select_ordered(&self) -> impl Iterator<Item = (usize, &Target)> {
-        let mut order = Vec::with_capacity(self.providers.len());
+        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
+        let max_attempts = self.fallback.as_ref().and_then(|f| f.max_attempts);
+        let attempt_count = max_attempts.unwrap_or(self.providers.len());
+
+        let mut order = Vec::with_capacity(attempt_count);
 
         if self.providers.is_empty() {
             return order.into_iter();
@@ -215,19 +222,53 @@ impl ProviderPool {
 
         // Fast path: single provider (most common case)
         if self.providers.len() == 1 {
-            order.push((0, &self.providers[0].target));
+            let count = if with_replacement { attempt_count } else { 1 };
+            for _ in 0..count {
+                order.push((0, &self.providers[0].target));
+            }
             return order.into_iter();
         }
 
         match self.strategy {
             LoadBalanceStrategy::Priority => {
-                // Simple: return providers in definition order
-                for (idx, provider) in self.providers.iter().enumerate() {
+                // Return providers in definition order, capped at attempt_count
+                for (idx, provider) in self.providers.iter().enumerate().take(attempt_count) {
                     order.push((idx, &provider.target));
                 }
             }
+            LoadBalanceStrategy::WeightedRandom if with_replacement => {
+                // Sample with replacement: pick from full pool each time
+                let weights: Vec<(usize, u32)> = self
+                    .providers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i, p.weight))
+                    .collect();
+                let mut rng = rand::rng();
+
+                for _ in 0..attempt_count {
+                    let total: u32 = weights.iter().map(|(_, w)| w).sum();
+                    let random_weight: u32 = if total > 0 {
+                        rng.random_range(0..total)
+                    } else {
+                        0
+                    };
+
+                    let mut cumulative = 0;
+                    let mut selected_idx = 0;
+                    for &(idx, weight) in &weights {
+                        cumulative += weight;
+                        if random_weight < cumulative {
+                            selected_idx = idx;
+                            break;
+                        }
+                    }
+
+                    order.push((selected_idx, &self.providers[selected_idx].target));
+                }
+            }
             LoadBalanceStrategy::WeightedRandom => {
-                // Repeatedly sample from remaining pool using weighted random
+                // Sample without replacement (default): each provider appears at most once
                 let mut remaining: Vec<(usize, u32)> = self
                     .providers
                     .iter()
@@ -236,7 +277,8 @@ impl ProviderPool {
                     .collect();
                 let mut rng = rand::rng();
 
-                while !remaining.is_empty() {
+                let cap = attempt_count.min(self.providers.len());
+                while order.len() < cap && !remaining.is_empty() {
                     let total: u32 = remaining.iter().map(|(_, w)| w).sum();
                     let random_weight: u32 = if total > 0 {
                         rng.random_range(0..total)
@@ -529,5 +571,273 @@ mod tests {
             assert_eq!(order.len(), 1);
             assert_eq!(order[0].1.url.as_str(), "https://only.example.com/");
         }
+    }
+
+    #[test]
+    fn test_select_ordered_with_replacement_allows_duplicates() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://api1.example.com"),
+                weight: 9,
+            },
+            Provider {
+                target: create_test_target("https://api2.example.com"),
+                weight: 1,
+            },
+        ];
+
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            with_replacement: true,
+            max_attempts: Some(5),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        // With replacement + max_attempts=5, should get exactly 5 entries
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(order.len(), 5);
+
+        // With weight 9:1, the heavy provider should appear multiple times
+        // across many iterations
+        let mut found_duplicate = false;
+        for _ in 0..100 {
+            let order: Vec<_> = pool.select_ordered().collect();
+            let indices: Vec<usize> = order.iter().map(|(idx, _)| *idx).collect();
+            let unique: std::collections::HashSet<_> = indices.iter().collect();
+            if unique.len() < indices.len() {
+                found_duplicate = true;
+                break;
+            }
+        }
+        assert!(
+            found_duplicate,
+            "With replacement should allow the same provider to appear multiple times"
+        );
+    }
+
+    #[test]
+    fn test_select_ordered_max_attempts_controls_length() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://api1.example.com"),
+                weight: 1,
+            },
+            Provider {
+                target: create_test_target("https://api2.example.com"),
+                weight: 1,
+            },
+            Provider {
+                target: create_test_target("https://api3.example.com"),
+                weight: 1,
+            },
+        ];
+
+        // max_attempts=2 with replacement=false: should return only 2 providers
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            max_attempts: Some(2),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(
+            order.len(),
+            2,
+            "max_attempts should cap the ordering length"
+        );
+
+        // All entries should be unique (without replacement)
+        let indices: std::collections::HashSet<_> = order.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(
+            indices.len(),
+            2,
+            "Without replacement, all entries should be unique"
+        );
+    }
+
+    #[test]
+    fn test_select_ordered_max_attempts_with_priority() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://primary.example.com"),
+                weight: 1,
+            },
+            Provider {
+                target: create_test_target("https://secondary.example.com"),
+                weight: 1,
+            },
+            Provider {
+                target: create_test_target("https://tertiary.example.com"),
+                weight: 1,
+            },
+        ];
+
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            max_attempts: Some(2),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+        );
+
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
+        assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+    }
+
+    #[test]
+    fn test_select_ordered_defaults_preserve_current_behavior() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://api1.example.com"),
+                weight: 3,
+            },
+            Provider {
+                target: create_test_target("https://api2.example.com"),
+                weight: 1,
+            },
+        ];
+
+        // No fallback config at all (default) should behave as before:
+        // without replacement, ordering length = provider count
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(order.len(), 2);
+
+        // All entries should be unique (without replacement)
+        let urls: std::collections::HashSet<_> =
+            order.iter().map(|(_, t)| t.url.as_str()).collect();
+        assert!(urls.contains("https://api1.example.com/"));
+        assert!(urls.contains("https://api2.example.com/"));
+    }
+
+    #[test]
+    fn test_select_ordered_with_replacement_single_provider() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![Provider {
+            target: create_test_target("https://only.example.com"),
+            weight: 1,
+        }];
+
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            with_replacement: true,
+            max_attempts: Some(3),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        let order: Vec<_> = pool.select_ordered().collect();
+        assert_eq!(
+            order.len(),
+            3,
+            "Single provider with replacement should repeat"
+        );
+        for (idx, target) in &order {
+            assert_eq!(*idx, 0);
+            assert_eq!(target.url.as_str(), "https://only.example.com/");
+        }
+    }
+
+    #[test]
+    fn test_select_ordered_with_replacement_respects_weights() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider {
+                target: create_test_target("https://heavy.example.com"),
+                weight: 99,
+            },
+            Provider {
+                target: create_test_target("https://light.example.com"),
+                weight: 1,
+            },
+        ];
+
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            with_replacement: true,
+            max_attempts: Some(10),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::WeightedRandom,
+        );
+
+        // Over many runs, the heavy provider should dominate
+        let mut heavy_count = 0;
+        let iterations = 100;
+        for _ in 0..iterations {
+            let order: Vec<_> = pool.select_ordered().collect();
+            heavy_count += order
+                .iter()
+                .filter(|(_, t)| t.url.as_str() == "https://heavy.example.com/")
+                .count();
+        }
+
+        let total = iterations * 10;
+        let percentage = (heavy_count * 100) / total;
+        assert!(
+            percentage > 90,
+            "Heavy provider (99:1 weight) should appear >90% of the time, got {}%",
+            percentage
+        );
     }
 }
