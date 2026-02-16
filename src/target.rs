@@ -1818,7 +1818,10 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("test-model").unwrap();
-        assert!(pool.is_trusted(), "trusted should be true when explicitly set");
+        assert!(
+            pool.is_trusted(),
+            "trusted should be true when explicitly set"
+        );
     }
 
     #[test]
@@ -1848,7 +1851,10 @@ mod tests {
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec).into_pool_config();
-        assert!(pool_config.trusted, "PoolSpec conversion should preserve trusted field");
+        assert!(
+            pool_config.trusted,
+            "PoolSpec conversion should preserve trusted field"
+        );
 
         // Test TargetSpec (single provider) -> PoolConfig conversion via JSON
         let json = r#"{
@@ -1864,7 +1870,10 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("test-model").unwrap();
-        assert!(pool.is_trusted(), "Single TargetSpec with trusted: true should create trusted pool");
+        assert!(
+            pool.is_trusted(),
+            "Single TargetSpec with trusted: true should create trusted pool"
+        );
     }
 
     #[test]
@@ -1890,7 +1899,10 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("trusted-pool").unwrap();
-        assert!(pool.is_trusted(), "Pool with trusted: true should be trusted");
+        assert!(
+            pool.is_trusted(),
+            "Pool with trusted: true should be trusted"
+        );
         assert_eq!(pool.len(), 2, "Pool should have 2 providers");
 
         // Test pool without trusted flag (defaults to false)
@@ -1910,6 +1922,9 @@ mod tests {
         let targets = Targets::from_config(config).unwrap();
 
         let pool = targets.targets.get("untrusted-pool").unwrap();
-        assert!(!pool.is_trusted(), "Pool without trusted flag should default to false");
+        assert!(
+            !pool.is_trusted(),
+            "Pool without trusted flag should default to false"
+        );
     }
 }

@@ -11,9 +11,8 @@ pub struct ResponsesRequest {
     /// The model to use for completion
     pub model: String,
 
-    /// The input to generate a response for - can be a string or array of items
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<Input>,
+    /// The input to generate a response for - can be a string or array of items (required per Open Responses spec)
+    pub input: Input,
 
     /// Instructions for the model (system prompt)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,23 +129,23 @@ impl<'de> serde::Deserialize<'de> for Item {
         // Match against known types
         match item_type {
             "message" => {
-                let item: MessageItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: MessageItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Message(item))
             }
             "function_call" => {
-                let item: FunctionCallItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: FunctionCallItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCall(item))
             }
             "function_call_output" => {
-                let item: FunctionCallOutputItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: FunctionCallOutputItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCallOutput(item))
             }
             "reasoning" => {
-                let item: ReasoningItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: ReasoningItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Reasoning(item))
             }
             // Unknown type - preserve the entire raw value
@@ -165,7 +164,10 @@ impl serde::Serialize for Item {
             Item::Message(msg) => {
                 // Serialize with type tag
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("message".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("message".to_string()),
+                );
                 let value = serde_json::to_value(msg).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -174,7 +176,10 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCall(fc) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("function_call".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("function_call".to_string()),
+                );
                 let value = serde_json::to_value(fc).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -183,7 +188,10 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCallOutput(fco) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("function_call_output".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("function_call_output".to_string()),
+                );
                 let value = serde_json::to_value(fco).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -192,7 +200,10 @@ impl serde::Serialize for Item {
             }
             Item::Reasoning(r) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("reasoning".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("reasoning".to_string()),
+                );
                 let value = serde_json::to_value(r).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -376,20 +387,26 @@ pub enum StopSequence {
     Multiple(Vec<String>),
 }
 
+/// Default value for strict field in function tools
+fn default_strict() -> bool {
+    true
+}
+
 /// Tool definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Tool {
     #[serde(rename = "function")]
     Function {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parameters: Option<serde_json::Value>,
-        /// Must always be present (boolean or null) per the spec
-        strict: Option<bool>,
+        /// Function name (required per Open Responses spec)
+        name: String,
+        /// Function description (required per Open Responses spec)
+        description: String,
+        /// Function parameters as JSON Schema (required per Open Responses spec)
+        parameters: serde_json::Value,
+        /// Whether to enforce strict parameter validation (defaults to true)
+        #[serde(default = "default_strict")]
+        strict: bool,
     },
 
     /// Code interpreter tool
@@ -673,7 +690,7 @@ mod tests {
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.model, "gpt-4o");
-        assert!(matches!(request.input, Some(Input::Text(_))));
+        assert!(matches!(request.input, Input::Text(_)));
     }
 
     #[test]
@@ -690,7 +707,7 @@ mod tests {
         }"#;
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(request.input, Some(Input::Items(_))));
+        assert!(matches!(request.input, Input::Items(_)));
     }
 
     #[test]
@@ -789,5 +806,185 @@ mod tests {
             serde_json::to_string(&ItemStatus::Completed).unwrap(),
             "\"completed\""
         );
+    }
+
+    #[test]
+    fn test_valid_function_tool_with_all_required_fields() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "name": "add",
+                "description": "Add two numbers",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "number"},
+                        "b": {"type": "number"}
+                    },
+                    "required": ["a", "b"]
+                }
+            }]
+        }"#;
+
+        let request: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.model, "gpt-4o");
+        assert!(request.tools.is_some());
+        let tools = request.tools.unwrap();
+        assert_eq!(tools.len(), 1);
+
+        match &tools[0] {
+            Tool::Function {
+                name,
+                description,
+                parameters,
+                strict,
+            } => {
+                assert_eq!(name, "add");
+                assert_eq!(description, "Add two numbers");
+                assert!(parameters.is_object());
+                assert!(*strict); // defaults to true
+            }
+            _ => panic!("Expected Function tool"),
+        }
+    }
+
+    #[test]
+    fn test_nested_openai_format_tool_is_rejected() {
+        // This is the format that previously passed validation but failed downstream
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "add",
+                    "description": "Add two numbers",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }]
+        }"#;
+
+        let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Nested OpenAI format should be rejected");
+
+        let err_msg = result.unwrap_err().to_string();
+        // Should fail because "name" field is missing at the top level
+        assert!(
+            err_msg.contains("missing field") || err_msg.contains("name"),
+            "Error should mention missing required field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_function_tool_missing_name_is_rejected() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "description": "Some function",
+                "parameters": {"type": "object"}
+            }]
+        }"#;
+
+        let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Tool without name should be rejected");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("name"),
+            "Error should mention missing name field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_function_tool_missing_description_is_rejected() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "name": "add",
+                "parameters": {"type": "object"}
+            }]
+        }"#;
+
+        let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "Tool without description should be rejected"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("description"),
+            "Error should mention missing description field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_function_tool_missing_parameters_is_rejected() {
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "name": "add",
+                "description": "Add numbers"
+            }]
+        }"#;
+
+        let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "Tool without parameters should be rejected"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("parameters"),
+            "Error should mention missing parameters field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_request_missing_input_is_rejected() {
+        let json = r#"{
+            "model": "gpt-4o"
+        }"#;
+
+        let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "Request without input should be rejected");
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("input"),
+            "Error should mention missing input field, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_function_tool_with_empty_parameters_is_valid() {
+        // No-argument functions should still work with empty parameter object
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": "test",
+            "tools": [{
+                "type": "function",
+                "name": "get_time",
+                "description": "Get current time",
+                "parameters": {"type": "object", "properties": {}}
+            }]
+        }"#;
+
+        let request: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert!(request.tools.is_some());
     }
 }

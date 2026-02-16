@@ -20,7 +20,7 @@ use crate::handlers::target_message_handler;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -69,7 +69,10 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     };
 
     // Check if this pool is trusted - if so, bypass all sanitization
-    let is_trusted = state.targets.targets.get(&original_model)
+    let is_trusted = state
+        .targets
+        .targets
+        .get(&original_model)
         .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
@@ -126,7 +129,10 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     };
 
     // Check if this pool is trusted - if so, bypass all sanitization
-    let is_trusted = state.targets.targets.get(&original_model)
+    let is_trusted = state
+        .targets
+        .targets
+        .get(&original_model)
         .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
@@ -182,7 +188,10 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     };
 
     // Check if this pool is trusted - if so, bypass all sanitization
-    let is_trusted = state.targets.targets.get(&original_model)
+    let is_trusted = state
+        .targets
+        .targets
+        .get(&original_model)
         .map(|pool| pool.is_trusted())
         .unwrap_or(false);
 
@@ -285,11 +294,7 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize chat response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -444,11 +449,7 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize embeddings response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -503,11 +504,7 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize responses API response from provider, returning standard error"
             );
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Bad gateway",
-            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
 
@@ -1415,7 +1412,8 @@ mod tests {
             }
         }"#;
 
-        let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
+        let mock_client =
+            MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error_response);
         let state = AppState::with_client(targets, mock_client);
         let router = crate::strict::build_strict_router(state);
 
@@ -1788,7 +1786,10 @@ mod tests {
         assert!(response_json["error"]["metadata"].is_object());
         assert_eq!(response_json["error"]["metadata"]["provider"], "openai");
         assert_eq!(response_json["error"]["metadata"]["region"], "eu-west-3");
-        assert_eq!(response_json["error"]["metadata"]["trace_id"], "trace-abc-123");
+        assert_eq!(
+            response_json["error"]["metadata"]["trace_id"],
+            "trace-abc-123"
+        );
     }
 
     /// Test that Content-Length header is updated correctly after Responses API sanitization
@@ -1935,9 +1936,15 @@ mod tests {
         assert!(body_str.contains("\"model\":\"gpt-4\""));
 
         // Provider-specific fields should be removed
-        assert!(!body_str.contains("provider"), "Provider field should be removed");
+        assert!(
+            !body_str.contains("provider"),
+            "Provider field should be removed"
+        );
         assert!(!body_str.contains("cost"), "Cost field should be removed");
-        assert!(!body_str.contains("leaked-provider"), "Provider name should not leak");
+        assert!(
+            !body_str.contains("leaked-provider"),
+            "Provider name should not leak"
+        );
     }
 
     /// Test that SSE events with comment lines don't leak provider metadata
@@ -1997,7 +2004,10 @@ mod tests {
             !body_str.contains("provider=custom-llm"),
             "Provider metadata in comments should be stripped"
         );
-        assert!(!body_str.contains("trace_id=xyz-123"), "Trace ID should be stripped");
+        assert!(
+            !body_str.contains("trace_id=xyz-123"),
+            "Trace ID should be stripped"
+        );
         assert!(!body_str.contains("cost=0.001"), "Cost should be stripped");
 
         // But the actual data should be sanitized and present

@@ -540,8 +540,15 @@ mod tests {
             LoadBalanceStrategy::Priority,
             LoadBalanceStrategy::WeightedRandom,
         ] {
-            let pool =
-                ProviderPool::with_config(providers.clone(), None, None, None, None, strategy, false);
+            let pool = ProviderPool::with_config(
+                providers.clone(),
+                None,
+                None,
+                None,
+                None,
+                strategy,
+                false,
+            );
 
             let order: Vec<_> = pool.select_ordered().collect();
             assert_eq!(order.len(), 1);
