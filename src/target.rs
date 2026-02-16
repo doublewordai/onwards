@@ -759,62 +759,34 @@ impl Targets {
                         info!("Config file changed, updating targets...");
                         trace!("{:?}", new_targets);
 
-                        // Update targets atomically
-                        let current_target_keys: Vec<String> =
-                            targets.iter().map(|entry| entry.key().clone()).collect();
+                        // Update targets: insert/update first, then remove stale.
+                        // This ordering ensures a target that exists in both old and new
+                        // configs is never briefly absent from the map.
 
-                        // Do it like this for atomicity (if you delete and recreate, there's a
-                        // moment with no targets during which requests can fail)
-
-                        // Remove deleted targets
-                        for key in current_target_keys {
-                            if !new_targets.targets.contains_key(&key) {
-                                targets.remove(&key);
-                            }
-                        }
-
-                        // Insert/update targets
+                        // Insert/update targets first
                         for entry in new_targets.targets.iter() {
                             targets.insert(entry.key().clone(), entry.value().clone());
                         }
 
-                        // Update key rate limiters atomically (same pattern)
-                        let current_rate_limiter_keys: Vec<String> = key_rate_limiters
-                            .iter()
-                            .map(|entry| entry.key().clone())
-                            .collect();
+                        // Then remove targets that no longer exist
+                        targets.retain(|key, _| new_targets.targets.contains_key(key));
 
-                        // Remove deleted rate limiters
-                        for key in current_rate_limiter_keys {
-                            if !new_targets.key_rate_limiters.contains_key(&key) {
-                                key_rate_limiters.remove(&key);
-                            }
-                        }
-
-                        // Insert/update key rate limiters
+                        // Update key rate limiters: insert first, then remove stale
                         for entry in new_targets.key_rate_limiters.iter() {
                             key_rate_limiters.insert(entry.key().clone(), entry.value().clone());
                         }
+                        key_rate_limiters.retain(|key, _| {
+                            new_targets.key_rate_limiters.contains_key(key)
+                        });
 
-                        // Update key concurrency limiters atomically (same pattern)
-                        let current_concurrency_limiter_keys: Vec<String> =
-                            key_concurrency_limiters
-                                .iter()
-                                .map(|entry| entry.key().clone())
-                                .collect();
-
-                        // Remove deleted concurrency limiters
-                        for key in current_concurrency_limiter_keys {
-                            if !new_targets.key_concurrency_limiters.contains_key(&key) {
-                                key_concurrency_limiters.remove(&key);
-                            }
-                        }
-
-                        // Insert/update key concurrency limiters
+                        // Update key concurrency limiters: insert first, then remove stale
                         for entry in new_targets.key_concurrency_limiters.iter() {
                             key_concurrency_limiters
                                 .insert(entry.key().clone(), entry.value().clone());
                         }
+                        key_concurrency_limiters.retain(|key, _| {
+                            new_targets.key_concurrency_limiters.contains_key(key)
+                        });
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
