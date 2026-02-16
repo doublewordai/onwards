@@ -1578,6 +1578,7 @@ mod tests {
             enabled: true,
             on_status: vec![],
             on_rate_limit: false,
+            ..Default::default()
         });
 
         let pool = ProviderPool::with_config(
