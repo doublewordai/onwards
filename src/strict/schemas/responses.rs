@@ -130,23 +130,23 @@ impl<'de> serde::Deserialize<'de> for Item {
         // Match against known types
         match item_type {
             "message" => {
-                let item: MessageItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: MessageItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Message(item))
             }
             "function_call" => {
-                let item: FunctionCallItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: FunctionCallItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCall(item))
             }
             "function_call_output" => {
-                let item: FunctionCallOutputItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: FunctionCallOutputItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCallOutput(item))
             }
             "reasoning" => {
-                let item: ReasoningItem = serde_json::from_value(value)
-                    .map_err(serde::de::Error::custom)?;
+                let item: ReasoningItem =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Reasoning(item))
             }
             // Unknown type - preserve the entire raw value
@@ -165,7 +165,10 @@ impl serde::Serialize for Item {
             Item::Message(msg) => {
                 // Serialize with type tag
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("message".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("message".to_string()),
+                );
                 let value = serde_json::to_value(msg).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -174,7 +177,10 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCall(fc) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("function_call".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("function_call".to_string()),
+                );
                 let value = serde_json::to_value(fc).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -183,7 +189,10 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCallOutput(fco) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("function_call_output".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("function_call_output".to_string()),
+                );
                 let value = serde_json::to_value(fco).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -192,7 +201,10 @@ impl serde::Serialize for Item {
             }
             Item::Reasoning(r) => {
                 let mut map = serde_json::Map::new();
-                map.insert("type".to_string(), serde_json::Value::String("reasoning".to_string()));
+                map.insert(
+                    "type".to_string(),
+                    serde_json::Value::String("reasoning".to_string()),
+                );
                 let value = serde_json::to_value(r).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);

@@ -102,6 +102,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{"id":"chatcmpl-123","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Hello!"}}]}"#;
@@ -152,6 +153,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock response in Responses format (as if upstream supports it)

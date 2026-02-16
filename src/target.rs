@@ -494,6 +494,29 @@ pub struct Auth {
     pub key_definitions: Option<HashMap<String, KeyDefinition>>,
 }
 
+/// HTTP connection pool configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpPoolConfig {
+    /// Maximum number of idle HTTP connections to keep alive per upstream host.
+    /// Higher values improve performance under load by reusing connections.
+    /// - Fan-out scenarios (many upstreams): 100-300
+    /// - Single upstream scenarios: 1000-2000
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub max_idle_per_host: usize,
+    /// How long (in seconds) to keep idle HTTP connections alive.
+    /// 90s balances connection reuse with avoiding stale connections.
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    100
+}
+
+fn default_pool_idle_timeout_secs() -> u64 {
+    90
+}
+
 /// The config file contains a map of target names to targets.
 /// Each target can be a single provider or a list of providers for load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +528,9 @@ pub struct ConfigFile {
     /// When true, only known OpenAI API paths are accepted and validated.
     #[serde(default)]
     pub strict_mode: bool,
+    /// HTTP connection pooling configuration (global)
+    #[serde(default)]
+    pub http_pool: Option<HttpPoolConfig>,
 }
 
 /// The live-updating collection of targets.
@@ -518,6 +544,8 @@ pub struct Targets {
     pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
     /// Enable strict mode with schema validation
     pub strict_mode: bool,
+    /// HTTP connection pool configuration (global)
+    pub http_pool_config: Option<HttpPoolConfig>,
 }
 
 #[async_trait]
@@ -751,6 +779,7 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             strict_mode: config_file.strict_mode,
+            http_pool_config: config_file.http_pool,
         })
     }
 
@@ -913,6 +942,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None
         }
     }
 
@@ -974,6 +1004,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None
         };
 
         // Create sequence of target updates
@@ -1037,6 +1068,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -1087,6 +1119,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1126,6 +1159,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1158,6 +1192,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1184,6 +1219,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1271,6 +1307,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1291,6 +1328,7 @@ mod tests {
             targets: HashMap::new(),
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1321,6 +1359,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1360,6 +1399,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1447,6 +1487,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1474,6 +1515,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1551,6 +1593,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1585,6 +1628,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None
         };
 
         let targets = Targets::from_config(config_file).unwrap();

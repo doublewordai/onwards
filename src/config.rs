@@ -32,18 +32,6 @@ pub struct Config {
     /// The prefix to use for metrics.
     #[arg(long, default_value = "onwards")]
     pub metrics_prefix: String,
-
-    /// Maximum number of idle HTTP connections to keep alive per upstream host.
-    /// Higher values improve performance under load by reusing connections.
-    /// - Fan-out scenarios (many upstreams): 100-300
-    /// - Single upstream scenarios: 1000-2000
-    #[arg(long, default_value_t = 100)]
-    pub pool_max_idle_per_host: usize,
-
-    /// How long (in seconds) to keep idle HTTP connections alive.
-    /// 90s balances connection reuse with avoiding stale connections.
-    #[arg(long, default_value_t = 90)]
-    pub pool_idle_timeout_secs: u64,
 }
 
 impl Config {
