@@ -135,7 +135,7 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 In strict mode, you can mark entire provider pools as trusted to bypass error sanitization while keeping success response sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their detailed error messages to help with debugging, while still ensuring response consistency.
 
-**Note:** The `trusted` flag is set at the pool level, meaning all providers in a trusted pool share the same trust behavior. You cannot mix trusted and untrusted providers within the same pool.
+**Note:** The `trusted` flag is set at the pool level, meaning all providers in a trusted pool share the same trust behavior. You cannot mix trusted and untrusted providers within the same pool. This is also the only exception to strict mode's error standardization guarantees: when `trusted: true` is set on a pool, errors from that pool may be forwarded with full third-party details instead of being standardized, while non-trusted pools continue to have their errors fully standardized and third-party details hidden.
 
 ### Configuration
 
