@@ -133,9 +133,9 @@ Requests to unsupported endpoints will return `404 Not Found` when strict mode i
 
 ## Trusted Pools
 
-In strict mode, you can mark entire provider pools as trusted to bypass all sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their exact responses and error messages passed through.
+In strict mode, you can mark entire provider pools as trusted to bypass error sanitization while keeping success response sanitization. This is useful when you have providers you fully control (e.g., your own OpenAI account) and want their detailed error messages to help with debugging, while still ensuring response consistency.
 
-**Note:** The `trusted` flag is set at the pool level, meaning all providers in a trusted pool bypass sanitization. You cannot mix trusted and untrusted providers within the same pool.
+**Note:** The `trusted` flag is set at the pool level, meaning all providers in a trusted pool share the same trust behavior. You cannot mix trusted and untrusted providers within the same pool.
 
 ### Configuration
 
@@ -181,33 +181,58 @@ In strict mode, you can mark entire provider pools as trusted to bypass all sani
 }
 ```
 
-In these examples, `gpt-4` and `gpt-4-pool` responses bypass all sanitization, while `third-party` responses receive full strict mode sanitization.
+In these examples, `gpt-4` and `gpt-4-pool` error responses bypass sanitization (but success responses are still sanitized), while `third-party` receives full strict mode sanitization for both success and error responses.
 
 ### Behavior
 
 When a pool is marked as `trusted: true`:
 
-- **Success responses**: Passed through completely with all provider metadata intact
-- **Error responses**: Original error messages and metadata forwarded to clients
-- **No model field rewriting**: Response model field matches provider's response exactly
-- **No Content-Length updates**: Headers passed through as-is
-- **No SSE sanitization**: Streaming responses passed through without line-by-line parsing
+**Success responses (200 OK) are STILL sanitized:**
+- Model field IS rewritten to match the client's request
+- Provider-specific metadata IS removed (costs, trace IDs, custom fields)
+- Response IS validated against OpenAI schemas
+- Content-Length headers ARE updated correctly
+- Streaming responses ARE parsed and sanitized line-by-line
+
+**Error responses (4xx, 5xx) bypass sanitization:**
+- Original error messages and metadata forwarded to clients
+- Provider-specific error details preserved (stack traces, debug info)
+- Custom error fields passed through unchanged
+
+This allows you to get detailed debugging information from errors while maintaining response consistency for successful requests.
 
 ### Security Warning
 
-⚠️ **Use trusted pools carefully.** Marking a pool as trusted bypasses all strict mode security guarantees for all providers in that pool:
+⚠️ **Use trusted pools carefully.** Marking a pool as trusted bypasses error sanitization for all providers in that pool:
 
-- Provider-specific metadata may leak to clients (costs, trace IDs, internal identifiers)
-- Third-party error details and stack traces will be exposed
-- Responses may not match OpenAI schema exactly
-- Non-standard fields may confuse client applications
+**What is exposed for trusted pools:**
+- Error details and stack traces from the provider
+- Provider-specific error metadata (trace IDs, internal error codes)
+- Debug information in error responses
+
+**What is NOT exposed (still sanitized):**
+- Success responses are fully sanitized (model rewritten, metadata removed)
+- Provider metadata in successful requests (costs, trace IDs) is still stripped
+- Responses still match OpenAI schema exactly for successful requests
 
 **Only mark pools as trusted when you fully control or trust ALL providers in that pool.** This typically means:
 - Your own OpenAI/Anthropic accounts (all providers using your API keys)
 - Self-hosted models you operate (all instances)
 - Internal services you maintain (all endpoints)
 
+**Do not mark third-party providers as trusted** unless you want their detailed error messages exposed to your clients. Trusted pools are designed for debugging your own infrastructure, not for production use with external providers.
+
 **Do not mix trusted and untrusted providers** - if you have mixed trust levels, create separate pools for trusted and untrusted providers.
+
+### Interaction with Model Override Header
+
+Onwards supports the `model-override` header to route requests to different pools than specified in the request body. The trust check correctly uses the **resolved model** (checking the header first, then falling back to the body) to prevent security bypass attacks.
+
+This means if a client sends:
+- Request body with `"model": "trusted-pool"`
+- Header with `model-override: untrusted-pool`
+
+The request will route to `untrusted-pool` and **sanitization will be applied** (because the resolved model is untrusted), preventing metadata leakage. This security measure ensures clients cannot bypass sanitization by exploiting the mismatch between body and header model resolution.
 
 ## Implementation details
 
