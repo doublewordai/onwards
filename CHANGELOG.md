@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0](https://github.com/doublewordai/onwards/compare/v0.14.0...v0.15.0) - 2026-02-17
+
+### Added
+
+- *(strict-mode)* add trusted pools to bypass sanitization ([#88](https://github.com/doublewordai/onwards/pull/88))
+
 ## [0.14.0](https://github.com/doublewordai/onwards/compare/v0.13.0...v0.14.0) - 2026-02-16
 
 ### Added
