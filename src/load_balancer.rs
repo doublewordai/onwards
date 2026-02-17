@@ -28,6 +28,13 @@ pub struct ProviderPool {
     fallback: Option<FallbackConfig>,
     /// Load balancing strategy
     strategy: LoadBalanceStrategy,
+    /// Mark this pool as trusted to bypass strict mode error sanitization.
+    /// When strict_mode is enabled globally AND trusted is true for a pool,
+    /// error response sanitization is skipped, but success responses are still sanitized.
+    /// WARNING: Trusted pools can leak metadata and non-standard responses.
+    /// Only use for providers you fully control or trust.
+    /// Defaults to false.
+    trusted: bool,
 }
 
 /// A single provider within a pool
@@ -51,6 +58,7 @@ impl ProviderPool {
             pool_concurrency_limiter: None,
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
+            trusted: false,
         }
     }
 
@@ -62,6 +70,7 @@ impl ProviderPool {
         pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
         fallback: Option<FallbackConfig>,
         strategy: LoadBalanceStrategy,
+        trusted: bool,
     ) -> Self {
         let total_weight = providers.iter().map(|p| p.weight).sum();
         Self {
@@ -72,6 +81,7 @@ impl ProviderPool {
             pool_concurrency_limiter,
             fallback,
             strategy,
+            trusted,
         }
     }
 
@@ -198,6 +208,11 @@ impl ProviderPool {
     /// Get the load balancing strategy
     pub fn strategy(&self) -> LoadBalanceStrategy {
         self.strategy
+    }
+
+    /// Check if this pool is marked as trusted
+    pub fn is_trusted(&self) -> bool {
+        self.trusted
     }
 
     /// Select providers in priority order for fallback scenarios.
@@ -448,6 +463,7 @@ mod tests {
             None,
             None,
             LoadBalanceStrategy::Priority,
+            false,
         );
 
         // Priority strategy should always return providers in definition order
@@ -484,6 +500,7 @@ mod tests {
             None,
             None,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         // Weighted random should include all providers (order varies)
@@ -519,6 +536,7 @@ mod tests {
             None,
             None,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         // Run multiple times and count how often heavy is first
@@ -564,8 +582,15 @@ mod tests {
             LoadBalanceStrategy::Priority,
             LoadBalanceStrategy::WeightedRandom,
         ] {
-            let pool =
-                ProviderPool::with_config(providers.clone(), None, None, None, None, strategy);
+            let pool = ProviderPool::with_config(
+                providers.clone(),
+                None,
+                None,
+                None,
+                None,
+                strategy,
+                false,
+            );
 
             let order: Vec<_> = pool.select_ordered().collect();
             assert_eq!(order.len(), 1);
@@ -602,6 +627,7 @@ mod tests {
             None,
             fallback,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         // With replacement + max_attempts=5, should get exactly 5 entries
@@ -659,6 +685,7 @@ mod tests {
             None,
             fallback,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -709,6 +736,7 @@ mod tests {
             None,
             fallback,
             LoadBalanceStrategy::Priority,
+            false,
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -741,6 +769,7 @@ mod tests {
             None,
             None,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -776,6 +805,7 @@ mod tests {
             None,
             fallback,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -819,6 +849,7 @@ mod tests {
             None,
             fallback,
             LoadBalanceStrategy::WeightedRandom,
+            false,
         );
 
         // Over many runs, the heavy provider should dominate

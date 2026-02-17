@@ -1588,6 +1588,7 @@ mod tests {
             None,
             fallback_config,
             LoadBalanceStrategy::Priority,
+            false,
         );
 
         assert!(pool.fallback_enabled(), "Fallback should be enabled");
