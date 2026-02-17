@@ -87,9 +87,9 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     // Error responses are only sanitized for untrusted pools
     if response.status().is_success() {
         if is_streaming {
-            sanitize_streaming_chat_response(response, original_model).await
+            sanitize_streaming_chat_response(response, resolved_model).await
         } else {
-            sanitize_chat_response(response, original_model).await
+            sanitize_chat_response(response, resolved_model).await
         }
     } else if is_trusted {
         debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
@@ -149,9 +149,9 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     // Error responses are only sanitized for untrusted pools
     if response.status().is_success() {
         if is_streaming {
-            sanitize_streaming_responses_response(response, original_model).await
+            sanitize_streaming_responses_response(response, resolved_model).await
         } else {
-            sanitize_responses_response(response, original_model).await
+            sanitize_responses_response(response, resolved_model).await
         }
     } else if is_trusted {
         debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
@@ -207,7 +207,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted pools
     if response.status().is_success() {
-        sanitize_embeddings_response(response, original_model).await
+        sanitize_embeddings_response(response, resolved_model).await
     } else if is_trusted {
         debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
         response
