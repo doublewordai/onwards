@@ -25,7 +25,7 @@ use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 /// Handler for GET /v1/models
 ///
@@ -149,9 +149,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     // Error responses are only sanitized for untrusted pools
     if response.status().is_success() {
         if is_streaming {
-            // TODO: Add streaming sanitization when Open Responses streaming format is defined
-            warn!("Streaming responses not yet sanitized");
-            response
+            sanitize_streaming_responses_response(response, original_model).await
         } else {
             sanitize_responses_response(response, original_model).await
         }
@@ -542,6 +540,103 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
             )
         }
     }
+}
+
+/// Sanitize streaming responses response
+///
+/// Similar to chat streaming sanitization - deserializes each SSE chunk through
+/// the strict ResponsesResponse schema (drops extra fields), rewrites model field,
+/// and re-serializes.
+async fn sanitize_streaming_responses_response(
+    mut response: Response,
+    original_model: String,
+) -> Response {
+    let body_stream =
+        http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
+
+    let sanitized_stream = body_stream.map(move |chunk_result| {
+        match chunk_result {
+            Ok(chunk) => {
+                let chunk_str = String::from_utf8_lossy(&chunk);
+                let mut sanitized_lines = Vec::new();
+
+                // Process SSE line-by-line for streaming chunks
+                for line in chunk_str.lines() {
+                    if let Some(data_part) = line.strip_prefix("data: ") {
+                        // This is a data line
+
+                        // Handle [DONE] marker
+                        if data_part.trim() == "[DONE]" {
+                            sanitized_lines.push(line.to_string());
+                            continue;
+                        }
+
+                        // Deserialize the chunk through our strict schema
+                        match serde_json::from_str::<ResponsesResponse>(data_part) {
+                            Ok(mut chunk_data) => {
+                                // Rewrite model field
+                                chunk_data.model = original_model.clone();
+
+                                // Re-serialize
+                                match serde_json::to_string(&chunk_data) {
+                                    Ok(sanitized_json) => {
+                                        sanitized_lines.push(format!("data: {}", sanitized_json));
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "Failed to serialize responses chunk, terminating stream");
+                                        return Err(std::io::Error::other(
+                                            "Failed to serialize chunk",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    "Failed to parse responses SSE data line from provider, terminating stream"
+                                );
+                                return Err(std::io::Error::other(
+                                    "Malformed SSE data from provider",
+                                ));
+                            }
+                        }
+                    } else if line.is_empty() {
+                        // Preserve empty lines (SSE event delimiters)
+                        sanitized_lines.push(String::new());
+                    }
+                    // Ignore all other lines (comments, event types, etc.) - don't leak metadata
+                }
+
+                // Reconstruct the chunk with sanitized content
+                let mut sanitized_chunk = sanitized_lines.join("\n");
+
+                // Count trailing newlines in input and restore them
+                let input_trailing = chunk_str.chars().rev().take_while(|&c| c == '\n').count();
+                let output_trailing = sanitized_chunk
+                    .chars()
+                    .rev()
+                    .take_while(|&c| c == '\n')
+                    .count();
+
+                for _ in output_trailing..input_trailing {
+                    sanitized_chunk.push('\n');
+                }
+
+                Ok::<_, std::io::Error>(axum::body::Bytes::from(sanitized_chunk))
+            }
+            Err(e) => {
+                error!(error = %e, "Stream error while sanitizing responses");
+                Err(std::io::Error::other("Stream error"))
+            }
+        }
+    });
+
+    *response.body_mut() = Body::from_stream(sanitized_stream);
+    // Remove Content-Length header - streaming responses should use chunked encoding
+    response.headers_mut().remove(header::CONTENT_LENGTH);
+    debug!("Set up streaming responses response sanitization");
+    response
 }
 
 /// Sanitize error responses from third parties
@@ -1461,6 +1556,90 @@ mod tests {
         assert!(!body_str.contains("xyz-123.internal.com"));
         assert!(!body_str.contains("provider"));
         assert!(!body_str.contains("trace_id"));
+    }
+
+    /// Test that responses API streaming responses are sanitized
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_streaming_removes_unknown_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        // Mock SSE streaming response with provider metadata in chunks
+        let mock_stream = r#"data: {"id":"resp-123","object":"response","created_at":1677652288,"completed_at":null,"status":"in_progress","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"error":null,"tools":[],"tool_choice":"auto","truncation":"auto","parallel_tool_calls":true,"text":{},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null,"provider_cost":0.001,"trace_id":"trace-abc-123"}
+
+data: {"id":"resp-123","object":"response","created_at":1677652288,"completed_at":1677652290,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello world"}]}],"error":null,"tools":[],"tool_choice":"auto","truncation":"auto","parallel_tool_calls":true,"text":{},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null,"provider_cost":0.002,"internal_metadata":{"region":"us-east-1"}}
+
+data: [DONE]
+
+"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o","input":"Hello","stream":true}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+
+        // Verify streaming response IS SANITIZED:
+        // 1. Standard fields are present
+        assert!(
+            response_str.contains("\"id\":\"resp-123\""),
+            "Response should contain standard id field"
+        );
+        assert!(
+            response_str.contains("\"model\":\"gpt-4o\""),
+            "Response should contain model field"
+        );
+        assert!(
+            response_str.contains("\"status\":\"completed\""),
+            "Response should contain status field"
+        );
+
+        // 2. Provider metadata IS removed
+        assert!(
+            !response_str.contains("\"provider_cost\""),
+            "Streaming responses should sanitize - provider_cost removed"
+        );
+        assert!(
+            !response_str.contains("\"trace_id\""),
+            "Streaming responses should sanitize - trace_id removed"
+        );
+        assert!(
+            !response_str.contains("\"internal_metadata\""),
+            "Streaming responses should sanitize - internal_metadata removed"
+        );
+        assert!(
+            !response_str.contains("\"region\""),
+            "Streaming responses should sanitize - nested metadata removed"
+        );
     }
 
     /// Test that Content-Length header is updated correctly after chat completion sanitization
