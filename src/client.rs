@@ -3,6 +3,8 @@
 //! This module provides a unified interface for making HTTP requests, allowing
 //! different client implementations (hyper, mock clients for testing, etc.) to
 //! be used interchangeably throughout the proxy.
+use std::time::Duration;
+
 use async_trait::async_trait;
 use axum::response::IntoResponse;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -43,16 +45,24 @@ pub fn create_hyper_client(
     pool_max_idle_per_host: usize,
     pool_idle_timeout_secs: u64,
 ) -> HyperClient {
-    let https = hyper_tls::HttpsConnector::new();
+    let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
+
+    // Send TCP keepalive probes to detect dead connections.
+    // After 60s idle, send a probe every 15s (Linux default); give up after 3
+    // failures (Linux default). This keeps conntrack entries alive and detects
+    // zombies within ~105s.
+    http_connector.set_keepalive(Some(Duration::from_secs(60)));
+
+    let https = hyper_tls::HttpsConnector::new_with_connector(http_connector);
 
     tracing::info!(
-        "Creating HTTP client with connection pool: max_idle_per_host={}, idle_timeout={}s",
+        "Creating HTTP client with connection pool: max_idle_per_host={}, idle_timeout={}s, tcp_keepalive=60s",
         pool_max_idle_per_host,
         pool_idle_timeout_secs
     );
 
     Client::builder(TokioExecutor::new())
-        .pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs))
+        .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .pool_timer(hyper_util::rt::TokioTimer::new())
         .build(https)
