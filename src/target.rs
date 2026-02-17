@@ -265,9 +265,9 @@ pub struct PoolConfig {
 
 impl TargetSpecOrList {
     /// Convert to pool-level config and list of provider specs
-    pub fn into_pool_config(self) -> PoolConfig {
+    pub fn into_pool_config(self) -> Result<PoolConfig, anyhow::Error> {
         match self {
-            TargetSpecOrList::Pool(pool) => PoolConfig {
+            TargetSpecOrList::Pool(pool) => Ok(PoolConfig {
                 keys: pool.keys,
                 rate_limit: pool.rate_limit,
                 concurrency_limit: pool.concurrency_limit,
@@ -277,12 +277,21 @@ impl TargetSpecOrList {
                 sanitize_response: pool.sanitize_response,
                 trusted: pool.trusted,
                 providers: pool.providers,
-            },
+            }),
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
                 // Take keys and trusted from first provider for backwards compatibility
                 let keys = list.first().and_then(|t| t.keys.clone());
                 let trusted = list.first().map(|t| t.trusted).unwrap_or(false);
+
+                // Validate that all providers in the list have the same trusted value
+                if list.iter().any(|t| t.trusted != trusted) {
+                    return Err(anyhow::anyhow!(
+                        "All providers in a legacy list format must have the same 'trusted' value. \
+                         Use pool config format if you need different trust levels per provider."
+                    ));
+                }
+
                 let providers = list
                     .into_iter()
                     .map(|t| ProviderSpec {
@@ -299,7 +308,7 @@ impl TargetSpecOrList {
                         request_timeout_secs: t.request_timeout_secs,
                     })
                     .collect();
-                PoolConfig {
+                Ok(PoolConfig {
                     keys,
                     rate_limit: None,
                     concurrency_limit: None,
@@ -309,7 +318,7 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     providers,
-                }
+                })
             }
             TargetSpecOrList::Single(spec) => {
                 // Single provider: use its keys and trusted as pool-level, convert to ProviderSpec
@@ -329,7 +338,7 @@ impl TargetSpecOrList {
                     sanitize_response: false, // Will be OR'd with pool-level setting
                     request_timeout_secs: spec.request_timeout_secs,
                 };
-                PoolConfig {
+                Ok(PoolConfig {
                     keys,
                     rate_limit: None,
                     concurrency_limit: None,
@@ -339,7 +348,7 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     providers: vec![provider],
-                }
+                })
             }
         }
     }
@@ -747,7 +756,7 @@ impl Targets {
         let targets = Arc::new(DashMap::new());
         for (name, target_spec_or_list) in config_file.targets {
             // Extract pool-level config and provider specs
-            let pool_config = target_spec_or_list.into_pool_config();
+            let pool_config = target_spec_or_list.into_pool_config()?;
 
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
@@ -1958,7 +1967,7 @@ mod tests {
             }],
         };
 
-        let pool_config = TargetSpecOrList::Pool(pool_spec).into_pool_config();
+        let pool_config = TargetSpecOrList::Pool(pool_spec).into_pool_config().unwrap();
         assert!(
             pool_config.trusted,
             "PoolSpec conversion should preserve trusted field"
@@ -1981,6 +1990,40 @@ mod tests {
         assert!(
             pool.is_trusted(),
             "Single TargetSpec with trusted: true should create trusted pool"
+        );
+    }
+
+    #[test]
+    fn test_legacy_list_mixed_trusted_values_rejected() {
+        // Test that legacy list format with mixed trusted values is rejected
+        let json = r#"{
+            "targets": {
+                "test-model": [
+                    {
+                        "url": "https://api.example1.com",
+                        "trusted": true
+                    },
+                    {
+                        "url": "https://api.example2.com",
+                        "trusted": false
+                    }
+                ]
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let result = Targets::from_config(config);
+
+        assert!(
+            result.is_err(),
+            "Config with mixed trusted values in legacy list should be rejected"
+        );
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("same 'trusted' value"),
+            "Error message should mention trusted value mismatch, got: {}",
+            err_msg
         );
     }
 
