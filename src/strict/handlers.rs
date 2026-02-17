@@ -1612,7 +1612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trusted_target_bypasses_sanitization() {
+    async fn test_trusted_target_sanitizes_success_responses() {
         use crate::load_balancer::{Provider, ProviderPool};
         use crate::target::{LoadBalanceStrategy, Target, Targets};
         use crate::test_utils::MockHttpClient;
