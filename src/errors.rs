@@ -88,6 +88,19 @@ impl OnwardsErrorResponse {
         }
     }
 
+    pub fn gateway_timeout() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "The upstream service took too long to respond. Please try again."
+                    .to_string(),
+                r#type: "internal_error".to_string(),
+                param: None,
+                code: "gateway_timeout".to_string(),
+            }),
+            status: StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+
     pub fn unprocessable_request(message: &str, param: Option<&str>) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {

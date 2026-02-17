@@ -698,6 +698,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields that should be stripped
@@ -776,6 +777,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party returns internal model name
@@ -835,6 +837,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let streaming_chunks = vec![
@@ -891,6 +894,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let streaming_chunks = vec![
@@ -942,6 +946,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields
@@ -1010,6 +1015,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -1067,6 +1073,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with internal fields (should be completely replaced)
@@ -1131,6 +1138,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with leaky message
@@ -1189,6 +1197,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Non-JSON error response (e.g., plain text or HTML)
@@ -1242,6 +1251,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party response with extra fields
@@ -1330,6 +1340,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -1407,6 +1418,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Third-party error with internal details
@@ -1469,6 +1481,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra fields that will be removed during sanitization
@@ -1548,6 +1561,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra provider-specific fields
@@ -1632,6 +1646,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -1741,6 +1756,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -1837,6 +1853,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -1923,6 +1940,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -2015,6 +2033,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream success response with provider-specific fields
@@ -2132,6 +2151,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream success response with provider-specific fields
@@ -2217,6 +2237,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Response with extra provider-specific fields
@@ -2309,6 +2330,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Multi-line SSE event with provider-specific fields in the JSON
@@ -2372,6 +2394,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // SSE stream with comment line containing provider-specific info
@@ -2440,6 +2463,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock client that captures the forwarded request
@@ -2545,6 +2569,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         let mock_response = r#"{
@@ -2659,6 +2684,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true, // Strict mode enabled
+            http_pool_config: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -2758,6 +2784,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -2882,6 +2909,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -3001,6 +3029,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: true,
+            http_pool_config: None,
         };
 
         // Mock SSE streaming response with provider metadata in chunks

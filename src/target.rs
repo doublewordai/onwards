@@ -68,6 +68,14 @@ pub struct ProviderSpec {
     /// Defaults to false.
     #[serde(default)]
     pub sanitize_response: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 /// Load balancing strategy for selecting providers
@@ -98,6 +106,16 @@ pub struct FallbackConfig {
     /// If true, hitting a local rate limit will try the next provider instead of returning 429.
     #[serde(default)]
     pub on_rate_limit: bool,
+
+    /// When true, weighted random failover samples with replacement,
+    /// allowing the same provider to be retried. Only affects WeightedRandom strategy.
+    #[serde(default)]
+    pub with_replacement: bool,
+
+    /// Maximum number of failover attempts. Defaults to provider count.
+    /// Most useful with `with_replacement: true` to allow more attempts than providers.
+    #[serde(default)]
+    pub max_attempts: Option<usize>,
 }
 
 impl FallbackConfig {
@@ -205,6 +223,14 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub trusted: bool,
+
+    /// Request timeout in seconds. If specified, requests exceeding this duration
+    /// will be cancelled and return a 504 Gateway Timeout error.
+    /// If fallback is enabled, the next provider will be tried.
+    /// Note: This timeout applies only to receiving the response headers, not to
+    /// reading the full response body (which may be streamed over a longer period).
+    #[serde(default)]
+    pub request_timeout_secs: Option<u64>,
 }
 
 fn default_weight() -> u32 {
@@ -270,6 +296,7 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
+                        request_timeout_secs: t.request_timeout_secs,
                     })
                     .collect();
                 PoolConfig {
@@ -300,6 +327,7 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
+                    request_timeout_secs: spec.request_timeout_secs,
                 };
                 PoolConfig {
                     keys,
@@ -352,6 +380,7 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }
@@ -377,17 +406,22 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
+            request_timeout_secs: value.request_timeout_secs,
         }
     }
 }
 
+/// Error returned when rate limit is exceeded
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitExceeded;
+
 pub trait RateLimiter: std::fmt::Debug + Send + Sync {
-    fn check(&self) -> Result<(), ()>;
+    fn check(&self) -> Result<(), RateLimitExceeded>;
 }
 
 impl RateLimiter for DefaultDirectRateLimiter {
-    fn check(&self) -> Result<(), ()> {
-        self.check().map_err(|_| ())
+    fn check(&self) -> Result<(), RateLimitExceeded> {
+        self.check().map_err(|_| RateLimitExceeded)
     }
 }
 
@@ -455,6 +489,7 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
+    pub request_timeout_secs: Option<u64>,
 }
 
 impl Target {
@@ -493,6 +528,29 @@ pub struct Auth {
     pub key_definitions: Option<HashMap<String, KeyDefinition>>,
 }
 
+/// HTTP connection pool configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpPoolConfig {
+    /// Maximum number of idle HTTP connections to keep alive per upstream host.
+    /// Higher values improve performance under load by reusing connections.
+    /// - Fan-out scenarios (many upstreams): 100-300
+    /// - Single upstream scenarios: 1000-2000
+    #[serde(default = "default_pool_max_idle_per_host")]
+    pub max_idle_per_host: usize,
+    /// How long (in seconds) to keep idle HTTP connections alive.
+    /// 90s balances connection reuse with avoiding stale connections.
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_pool_max_idle_per_host() -> usize {
+    100
+}
+
+fn default_pool_idle_timeout_secs() -> u64 {
+    90
+}
+
 /// The config file contains a map of target names to targets.
 /// Each target can be a single provider or a list of providers for load balancing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +562,9 @@ pub struct ConfigFile {
     /// When true, only known OpenAI API paths are accepted and validated.
     #[serde(default)]
     pub strict_mode: bool,
+    /// HTTP connection pooling configuration (global)
+    #[serde(default)]
+    pub http_pool: Option<HttpPoolConfig>,
 }
 
 /// The live-updating collection of targets.
@@ -517,6 +578,8 @@ pub struct Targets {
     pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
     /// Enable strict mode with schema validation
     pub strict_mode: bool,
+    /// HTTP connection pool configuration (global)
+    pub http_pool_config: Option<HttpPoolConfig>,
 }
 
 #[async_trait]
@@ -751,10 +814,15 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             strict_mode: config_file.strict_mode,
+            http_pool_config: config_file.http_pool,
         })
     }
 
     /// Receives updates from a stream of targets and updates the internal targets map.
+    /// Note: This method updates targets, key_rate_limiters, and key_concurrency_limiters,
+    /// but does NOT update http_pool_config or strict_mode. Changes to these settings
+    /// in the config file require a restart. The HTTP client pool is created once in
+    /// AppState::new and cannot be reconfigured at runtime.
     pub async fn receive_updates<W>(&self, targets_stream: W) -> Result<(), W::Error>
     where
         W: TargetsStream + Send + 'static,
@@ -913,6 +981,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         }
     }
 
@@ -974,6 +1043,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create sequence of target updates
@@ -1037,6 +1107,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -1087,6 +1158,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1126,6 +1198,7 @@ mod tests {
                 key_definitions: None,
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1158,6 +1231,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1184,6 +1258,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1212,11 +1287,11 @@ mod tests {
     }
 
     impl RateLimiter for MockRateLimiter {
-        fn check(&self) -> Result<(), ()> {
+        fn check(&self) -> Result<(), RateLimitExceeded> {
             if *self.should_allow.lock().unwrap() {
                 Ok(())
             } else {
-                Err(())
+                Err(RateLimitExceeded)
             }
         }
     }
@@ -1271,6 +1346,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1291,6 +1367,7 @@ mod tests {
             targets: HashMap::new(),
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1321,6 +1398,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1360,6 +1438,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1447,6 +1526,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1474,6 +1554,7 @@ mod tests {
             targets,
             auth: None,
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1551,6 +1632,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1585,6 +1667,7 @@ mod tests {
                 key_definitions: Some(key_definitions),
             }),
             strict_mode: false,
+            http_pool: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1603,6 +1686,7 @@ mod tests {
             enabled: true,
             on_status: vec![5, 429], // 5 = all 5xx codes, 429 = exact match
             on_rate_limit: false,
+            ..Default::default()
         };
 
         // 5 should match all 5xx codes
@@ -1626,6 +1710,7 @@ mod tests {
             enabled: true,
             on_status: vec![50, 52], // 50 = 500-509, 52 = 520-529
             on_rate_limit: false,
+            ..Default::default()
         };
 
         // 50 matches 500-509
@@ -1646,6 +1731,7 @@ mod tests {
             enabled: false,
             on_status: vec![5, 429],
             on_rate_limit: true,
+            ..Default::default()
         };
 
         // Even matching codes should return false when disabled
@@ -1785,6 +1871,27 @@ mod tests {
     }
 
     #[test]
+    fn test_single_target_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in single-target format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key",
+                    "request_timeout_secs": 30
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, Some(30));
+    }
+
+    #[test]
     fn test_trusted_field_defaults_to_false() {
         let json = r#"{
             "targets": {
@@ -1847,6 +1954,7 @@ mod tests {
                 response_headers: None,
                 weight: 1,
                 sanitize_response: false,
+                request_timeout_secs: None,
             }],
         };
 
@@ -1873,6 +1981,121 @@ mod tests {
         assert!(
             pool.is_trusted(),
             "Single TargetSpec with trusted: true should create trusted pool"
+        );
+    }
+
+    #[test]
+    fn test_single_target_config_without_timeout() {
+        // Test that request_timeout_secs defaults to None when not specified
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-test-key"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let target = pool.first_target().unwrap();
+        assert_eq!(target.request_timeout_secs, None);
+    }
+
+    #[test]
+    fn test_pool_config_with_timeout() {
+        // Test that request_timeout_secs is properly deserialized in pool/providers format
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "request_timeout_secs": 60,
+                            "weight": 1
+                        }
+                    ],
+                    "fallback": {
+                        "enabled": true,
+                        "on_status": [502, 503]
+                    }
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(pool.len(), 2);
+
+        // Check both providers have their respective timeouts
+        let providers = pool.providers();
+
+        // First provider should have 30 second timeout
+        let provider1 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.openai.com"))
+            .unwrap();
+        assert_eq!(provider1.target.request_timeout_secs, Some(30));
+
+        // Second provider should have 60 second timeout
+        let provider2 = providers
+            .iter()
+            .find(|p| p.target.url.host_str() == Some("api.azure.com"))
+            .unwrap();
+        assert_eq!(provider2.target.request_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_pool_config_mixed_timeouts() {
+        // Test that some providers can have timeouts while others don't
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-test-key-1",
+                            "request_timeout_secs": 30,
+                            "weight": 1
+                        },
+                        {
+                            "url": "https://api.azure.com/v1/",
+                            "onwards_key": "sk-test-key-2",
+                            "weight": 1
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let providers = pool.providers();
+
+        // One provider with timeout
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs == Some(30))
+        );
+        // One provider without timeout
+        assert!(
+            providers
+                .iter()
+                .any(|p| p.target.request_timeout_secs.is_none())
         );
     }
 
@@ -1912,6 +2135,9 @@ mod tests {
                     "providers": [
                         {
                             "url": "https://api1.example.com"
+                        },
+                        {
+                            "url": "https://api2.example.com"
                         }
                     ]
                 }

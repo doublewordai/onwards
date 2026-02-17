@@ -1,9 +1,7 @@
-mod config;
-
 use clap::Parser as _;
-use config::Config;
 use onwards::{
     AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
+    config::Config,
     create_openai_sanitizer,
     strict::build_strict_router,
     target::{Targets, WatchedFile},
@@ -33,14 +31,16 @@ pub async fn main() -> anyhow::Result<()> {
 
     // Start file watcher if a config file was specified
     if config.watch {
-        targets.receive_updates(WatchedFile(config.targets)).await?;
+        targets
+            .receive_updates(WatchedFile(config.targets.clone()))
+            .await?;
     }
 
     let mut serves = JoinSet::new();
     // If we are running with metrics enabled, set up the metrics layer and router.
     let prometheus_layer = if config.metrics {
         let (prometheus_layer, prometheus_handle) =
-            build_metrics_layer_and_handle(config.metrics_prefix);
+            build_metrics_layer_and_handle(config.metrics_prefix.clone());
 
         let metrics_router = build_metrics_router(prometheus_handle);
         let bind_addr = format!("0.0.0.0:{}", config.metrics_port);

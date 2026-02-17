@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/doublewordai/onwards/compare/v0.12.0...v0.13.0) - 2026-02-16
+
+### Added
+
+- add with-replacement sampling for weighted random failover ([#93](https://github.com/doublewordai/onwards/pull/93))
+
 ## [0.12.0](https://github.com/doublewordai/onwards/compare/v0.11.2...v0.12.0) - 2026-02-13
 
 ### Added

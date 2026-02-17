@@ -6,16 +6,20 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use onwards::{AppState, build_router, target::Targets};
+//! use onwards::{AppState, build_router, config::Config, target::Targets};
 //! use axum::serve;
 //! use tokio::net::TcpListener;
+//! use clap::Parser;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Parse CLI configuration
+//!     let config = Config::parse();
+//!     
 //!     // Load targets from configuration file
-//!     let targets = Targets::from_config_file(&"config.json".into()).await?;
+//!     let targets = Targets::from_config_file(&config.targets).await?;
 //!
-//!     // Create application state
+//!     // Create application state with connection pool settings from config
 //!     let app_state = AppState::new(targets);
 //!
 //!     // Build router with proxy routes
@@ -42,6 +46,7 @@ use tracing::{info, instrument};
 
 pub mod auth;
 pub mod client;
+pub mod config;
 pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
@@ -150,10 +155,12 @@ pub type ResponseTransformFn = Arc<
 ///
 /// Basic setup:
 /// ```no_run
-/// use onwards::{AppState, target::Targets};
+/// use onwards::{AppState, config::Config, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 /// # Ok(())
 /// # }
@@ -161,11 +168,13 @@ pub type ResponseTransformFn = Arc<
 ///
 /// With request transformation:
 /// ```no_run
-/// use onwards::{AppState, BodyTransformFn, target::Targets};
+/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
 /// use std::sync::Arc;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 ///
 /// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
 ///     // Custom transformation logic
@@ -204,7 +213,13 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
 impl AppState<HyperClient> {
     /// Create a new AppState with the default Hyper client
     pub fn new(targets: target::Targets) -> Self {
-        let http_client = client::create_hyper_client();
+        let (max_idle, timeout) = targets
+            .http_pool_config
+            .as_ref()
+            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
+            .unwrap_or((100, 90));
+
+        let http_client = client::create_hyper_client(max_idle, timeout);
         Self {
             http_client,
             targets,
@@ -215,7 +230,13 @@ impl AppState<HyperClient> {
 
     /// Create a new AppState with the default Hyper client and a body transformation function
     pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let http_client = client::create_hyper_client();
+        let (max_idle, timeout) = targets
+            .http_pool_config
+            .as_ref()
+            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
+            .unwrap_or((100, 90));
+
+        let http_client = client::create_hyper_client(max_idle, timeout);
         Self {
             http_client,
             targets,
@@ -334,10 +355,12 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Opt
 /// # Examples
 ///
 /// ```no_run
-/// use onwards::{AppState, create_openai_sanitizer, target::Targets};
+/// use onwards::{AppState, config::Config, create_openai_sanitizer, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets)
 ///     .with_response_transform(create_openai_sanitizer());
 /// # Ok(())
@@ -375,9 +398,11 @@ pub fn create_openai_sanitizer() -> ResponseTransformFn {
 /// use onwards::{AppState, build_router, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 /// let router = build_router(app_state);
 ///
@@ -457,9 +482,11 @@ type MetricsLayerAndHandle = (
 /// use onwards::{AppState, build_router, build_metrics_router, build_metrics_layer_and_handle, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 ///
 /// // Build metrics layer and handle
@@ -772,6 +799,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -818,6 +846,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(
@@ -889,6 +918,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -987,6 +1017,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1060,6 +1091,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1156,6 +1188,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1233,7 +1266,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_blocks_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that blocks requests
@@ -1241,8 +1274,8 @@ mod tests {
         struct BlockingRateLimiter;
 
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(()) // Always block
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded) // Always block
             }
         }
 
@@ -1263,6 +1296,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1294,7 +1328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_allows_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that allows requests
@@ -1302,7 +1336,7 @@ mod tests {
         struct AllowingRateLimiter;
 
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(()) // Always allow
             }
         }
@@ -1324,6 +1358,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1351,22 +1386,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_with_mixed_targets() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create different rate limiters
         #[derive(Debug)]
         struct BlockingRateLimiter;
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(())
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
             }
         }
 
         #[derive(Debug)]
         struct AllowingRateLimiter;
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(())
             }
         }
@@ -1405,6 +1440,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1473,6 +1509,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1518,6 +1555,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client =
@@ -1591,6 +1629,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters,
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client =
@@ -1666,6 +1705,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1842,6 +1882,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1904,6 +1945,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1954,6 +1996,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -2006,6 +2049,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -2082,6 +2126,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create the same transformation function
@@ -2154,6 +2199,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that only transforms specific paths
@@ -2229,6 +2275,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2266,6 +2313,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2308,6 +2356,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(
@@ -2368,6 +2417,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2423,6 +2473,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2464,6 +2515,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2518,6 +2570,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2572,6 +2625,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2634,6 +2688,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2679,6 +2734,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response with provider-specific fields
@@ -2751,6 +2807,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response from upstream has the turbo model
@@ -2814,6 +2871,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let streaming_chunks = vec![
@@ -2869,6 +2927,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let streaming_chunks = vec![
@@ -2921,6 +2980,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response with provider-specific fields
@@ -2981,6 +3041,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response from a different endpoint (e.g., embeddings)
@@ -3048,6 +3109,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_response = r#"{
@@ -3099,6 +3161,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Upstream returns 422 with provider-specific error details
@@ -3162,6 +3225,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Upstream returns 503 with internal details
@@ -3217,6 +3281,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Upstream returns 422 with provider-specific details
