@@ -2995,7 +2995,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trusted_streaming_responses_passthrough() {
+    async fn test_trusted_streaming_success_responses_still_sanitized() {
         use crate::load_balancer::{Provider, ProviderPool};
         use crate::target::{LoadBalanceStrategy, Target, Targets};
         use crate::test_utils::MockHttpClient;
