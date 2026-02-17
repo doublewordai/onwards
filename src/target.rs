@@ -175,7 +175,7 @@ pub struct PoolSpec {
 
     /// Mark this pool as trusted to bypass strict mode sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
-    /// all sanitization (both success and error responses) is skipped.
+    /// error response sanitization is skipped, but success responses are still sanitized.
     /// WARNING: Trusted pools can leak metadata and non-standard responses.
     /// Only use for providers you fully control or trust.
     /// Defaults to false.
