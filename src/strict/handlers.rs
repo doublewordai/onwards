@@ -1819,6 +1819,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_trusted_target_bypasses_streaming_error_sanitization() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        // Mock upstream error with provider-specific details for streaming request
+        let mock_error = r#"{
+            "error": {
+                "message": "Rate limit exceeded in streaming mode: too many concurrent streams",
+                "type": "provider_error",
+                "code": "rate_limit_exceeded",
+                "metadata": {
+                    "provider": "openai",
+                    "concurrent_streams": 150,
+                    "max_streams": 100,
+                    "trace_id": "trace-stream-456"
+                }
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, mock_error);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        // Send a STREAMING request
+        let request_body = r#"{
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify ORIGINAL error is passed through for trusted target streaming request:
+        // 1. Original error message preserved
+        assert_eq!(
+            response_json["error"]["message"],
+            "Rate limit exceeded in streaming mode: too many concurrent streams",
+            "Trusted target should bypass error sanitization for streaming requests"
+        );
+
+        // 2. Provider error type preserved
+        assert_eq!(response_json["error"]["type"], "provider_error");
+
+        // 3. Provider metadata preserved
+        assert!(response_json["error"]["metadata"].is_object());
+        assert_eq!(response_json["error"]["metadata"]["provider"], "openai");
+        assert_eq!(response_json["error"]["metadata"]["concurrent_streams"], 150);
+        assert_eq!(response_json["error"]["metadata"]["max_streams"], 100);
+        assert_eq!(
+            response_json["error"]["metadata"]["trace_id"],
+            "trace-stream-456"
+        );
+    }
+
+    #[tokio::test]
     async fn test_trusted_target_bypasses_error_sanitization_responses() {
         use crate::load_balancer::{Provider, ProviderPool};
         use crate::target::{LoadBalanceStrategy, Target, Targets};
