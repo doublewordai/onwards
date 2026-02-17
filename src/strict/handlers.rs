@@ -1857,11 +1857,7 @@ mod tests {
         let state = crate::AppState::with_client(targets, mock_client);
         let router = crate::strict::build_strict_router(state);
 
-        let request_body = r#"{
-            "model": "gpt-4o-mini",
-            "input": "Test message",
-            "modalities": ["text"]
-        }"#;
+        let request_body = r#"{"model":"gpt-4o-mini","input":"Test message"}"#;
 
         let request = Request::builder()
             .method("POST")
@@ -1982,6 +1978,225 @@ mod tests {
             response_json["error"]["metadata"]["trace_id"],
             "emb-trace-789"
         );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_target_sanitizes_success_responses() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("gpt-4o-mini".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream success response with provider-specific fields
+        // Based on working test but with provider metadata added
+        let mock_response = r#"{
+            "id": "resp-123",
+            "object": "response",
+            "created_at": 1677652288,
+            "completed_at": 1677652290,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o-mini-actual-provider",
+            "previous_response_id": null,
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "auto",
+            "parallel_tool_calls": true,
+            "text": {},
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null,
+            "provider_metadata": {
+                "cost": 0.002,
+                "trace_id": "trace-responses-456"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{"model":"gpt-4o-mini","input":"Test message"}"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify SUCCESS response is SANITIZED even for trusted target:
+        // 1. Model field IS rewritten to match request
+        assert_eq!(
+            response_json["model"], "gpt-4o-mini",
+            "Trusted target should still sanitize /v1/responses success - model rewritten"
+        );
+
+        // 2. Provider-specific fields ARE removed
+        assert!(
+            response_json.get("provider_metadata").is_none(),
+            "Trusted target should still sanitize /v1/responses success - metadata removed"
+        );
+
+        // 3. Standard fields still present and correct
+        assert_eq!(response_json["object"], "response");
+        assert_eq!(response_json["status"], "completed");
+        assert!(response_json["output"].is_array());
+    }
+
+    #[tokio::test]
+    async fn test_trusted_target_sanitizes_success_embeddings() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        // Create a trusted pool
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+        );
+        targets_map.insert("text-embedding-ada-002".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+        };
+
+        // Mock upstream success response with provider-specific fields
+        let mock_response = r#"{
+            "object": "list",
+            "data": [
+                {
+                    "object": "embedding",
+                    "embedding": [0.1, 0.2, 0.3],
+                    "index": 0
+                }
+            ],
+            "model": "text-embedding-ada-002-actual-provider",
+            "usage": {
+                "prompt_tokens": 8,
+                "total_tokens": 8
+            },
+            "provider_metadata": {
+                "cost": 0.0001,
+                "trace_id": "trace-emb-789",
+                "region": "us-east-1"
+            }
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "model": "text-embedding-ada-002",
+            "input": "Test text for embedding"
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        // Verify SUCCESS response is SANITIZED even for trusted target:
+        // 1. Model field IS rewritten to match request
+        assert_eq!(
+            response_json["model"], "text-embedding-ada-002",
+            "Trusted target should still sanitize /v1/embeddings success - model rewritten"
+        );
+
+        // 2. Provider-specific fields ARE removed
+        assert!(
+            response_json.get("provider_metadata").is_none(),
+            "Trusted target should still sanitize /v1/embeddings success - metadata removed"
+        );
+
+        // 3. Standard fields still present and correct
+        assert_eq!(response_json["object"], "list");
+        assert_eq!(response_json["data"][0]["embedding"][0], 0.1);
+        assert_eq!(response_json["usage"]["total_tokens"], 8);
     }
 
     /// Test that Content-Length header is updated correctly after Responses API sanitization
