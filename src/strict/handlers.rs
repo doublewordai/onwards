@@ -2090,7 +2090,10 @@ data: [DONE]
         // 3. Provider metadata preserved
         assert!(response_json["error"]["metadata"].is_object());
         assert_eq!(response_json["error"]["metadata"]["provider"], "openai");
-        assert_eq!(response_json["error"]["metadata"]["concurrent_streams"], 150);
+        assert_eq!(
+            response_json["error"]["metadata"]["concurrent_streams"],
+            150
+        );
         assert_eq!(response_json["error"]["metadata"]["max_streams"], 100);
         assert_eq!(
             response_json["error"]["metadata"]["trace_id"],

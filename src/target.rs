@@ -1967,7 +1967,9 @@ mod tests {
             }],
         };
 
-        let pool_config = TargetSpecOrList::Pool(pool_spec).into_pool_config().unwrap();
+        let pool_config = TargetSpecOrList::Pool(pool_spec)
+            .into_pool_config()
+            .unwrap();
         assert!(
             pool_config.trusted,
             "PoolSpec conversion should preserve trusted field"
