@@ -47,6 +47,9 @@ pub fn create_hyper_client(
 ) -> HyperClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
 
+    // Allow HTTPS URIs (HttpConnector enforces HTTP-only by default)
+    http_connector.enforce_http(false);
+
     // Send TCP keepalive probes to detect dead connections.
     // After 60s idle, send a probe every 15s (Linux default); give up after 3
     // failures (Linux default). This keeps conntrack entries alive and detects
@@ -66,4 +69,48 @@ pub fn create_hyper_client(
         .pool_max_idle_per_host(pool_max_idle_per_host)
         .pool_timer(hyper_util::rt::TokioTimer::new())
         .build(https)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_hyper_client_accepts_https_uris() {
+        // Test that create_hyper_client() produces a client that accepts HTTPS URIs
+        // Bug: HttpConnector with enforce_http=true (default) rejects HTTPS schemes
+        // This causes real HTTPS requests to fail with connection errors
+
+        let client = create_hyper_client(10, 60);
+
+        // Create a request with an HTTPS URI to a reliable test endpoint
+        let uri: hyper::Uri = "https://httpbin.org/status/200".parse().unwrap();
+        let request = axum::extract::Request::builder()
+            .uri(uri)
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        // Make the request
+        let result = client.request(request).await;
+
+        // This should succeed (or fail for legitimate network reasons)
+        // Without enforce_http(false), it fails with a connection error
+        match result {
+            Ok(response) => {
+                // Success - HTTPS is working
+                assert!(response.status().is_success() || response.status().is_redirection(),
+                    "Expected successful response");
+            },
+            Err(e) => {
+                // If there's an error, it should NOT be about invalid scheme
+                // Common legitimate errors: DNS, timeout, network unreachable
+                let error_string = e.to_string();
+                panic!(
+                    "HTTPS request failed. This might indicate enforce_http is blocking HTTPS. Error: {}",
+                    error_string
+                );
+            }
+        }
+    }
 }
