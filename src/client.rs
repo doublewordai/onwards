@@ -47,6 +47,9 @@ pub fn create_hyper_client(
 ) -> HyperClient {
     let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
 
+    // fix enforce all Uris have the http scheme.
+    http_connector.enforce_http(false);
+    
     // Send TCP keepalive probes to detect dead connections.
     // After 60s idle, send a probe every 15s (Linux default); give up after 3
     // failures (Linux default). This keeps conntrack entries alive and detects
