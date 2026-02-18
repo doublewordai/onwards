@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/doublewordai/onwards/compare/v0.15.0...v0.15.1) - 2026-02-18
+
+### Fixed
+
+- Set `enforce_http` to `false` to allow non-http URI schemes in `… ([#100](https://github.com/doublewordai/onwards/pull/100))
+
+### Other
+
+- *(deps)* update rust docker tag to v1.93.1 ([#85](https://github.com/doublewordai/onwards/pull/85))
+
 ## [0.15.0](https://github.com/doublewordai/onwards/compare/v0.14.0...v0.15.0) - 2026-02-17
 
 ### Added
