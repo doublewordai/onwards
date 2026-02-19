@@ -568,11 +568,19 @@ pub async fn target_message_handler<T: HttpClient>(
             .to_string();
         let is_sse = content_type.contains("text/event-stream");
 
-        // Wrap SSE streams with buffering to handle incomplete chunks from providers.
-        // This must happen before any stream processing (e.g., sanitization) to ensure
-        // downstream consumers receive complete SSE events with valid JSON.
-        if is_sse {
-            debug!("Wrapping SSE response with buffered stream");
+        // Determine if SSE buffering is needed for non-strict sanitization
+        // Note: Strict mode handlers apply their own buffering before their sanitizers,
+        // so we skip buffering here to avoid double-wrapping
+        let needs_sse_buffering = !state.targets.strict_mode
+            && state.response_transform_fn.is_some()
+            && target.sanitize_response
+            && (200..300).contains(&status);
+
+        // Wrap SSE streams with buffering to ensure complete events (delimited by \n\n).
+        // This prevents incomplete JSON from reaching sanitization logic.
+        // Providers may send partial chunks that split events across network packets.
+        if is_sse && needs_sse_buffering {
+            debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
             let buffered = SseBufferedStream::new(byte_stream);
@@ -724,9 +732,10 @@ pub async fn target_message_handler<T: HttpClient>(
 
         record_response_status(response.status().as_u16());
         debug!(
-            "Returning response with status {}, content-length: {:?}",
+            "Returning response with status {}, content-length: {:?}, strict_mode: {}",
             response.status(),
-            response.headers().get(CONTENT_LENGTH)
+            response.headers().get(CONTENT_LENGTH),
+            state.targets.strict_mode
         );
         return Ok(response);
     }
