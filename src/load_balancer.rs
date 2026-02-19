@@ -7,8 +7,12 @@
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
-use crate::target::{ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter, Target};
+use crate::target::{
+    ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter, RoutingAction,
+    RoutingRule, Target,
+};
 use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// A pool of providers that share an alias, with load balancing support
@@ -35,6 +39,8 @@ pub struct ProviderPool {
     /// Only use for providers you fully control or trust.
     /// Defaults to false.
     trusted: bool,
+    /// Routing rules evaluated against key labels before processing
+    routing_rules: Vec<RoutingRule>,
 }
 
 /// A single provider within a pool
@@ -59,6 +65,7 @@ impl ProviderPool {
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
             trusted: false,
+            routing_rules: Vec::new(),
         }
     }
 
@@ -71,6 +78,7 @@ impl ProviderPool {
         fallback: Option<FallbackConfig>,
         strategy: LoadBalanceStrategy,
         trusted: bool,
+        routing_rules: Vec<RoutingRule>,
     ) -> Self {
         let total_weight = providers.iter().map(|p| p.weight).sum();
         Self {
@@ -82,6 +90,7 @@ impl ProviderPool {
             fallback,
             strategy,
             trusted,
+            routing_rules,
         }
     }
 
@@ -213,6 +222,26 @@ impl ProviderPool {
     /// Check if this pool is marked as trusted
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    /// Get the routing rules for this pool
+    pub fn routing_rules(&self) -> &[RoutingRule] {
+        &self.routing_rules
+    }
+
+    /// Evaluate routing rules against key labels.
+    /// Returns the first matching action, or None if no rules match (allow by default).
+    pub fn evaluate_routing_rules(
+        &self,
+        key_labels: &HashMap<String, String>,
+    ) -> Option<&RoutingAction> {
+        self.routing_rules.iter().find_map(|rule| {
+            let matches = rule
+                .match_labels
+                .iter()
+                .all(|(k, v)| key_labels.get(k).is_some_and(|kv| kv == v));
+            matches.then_some(&rule.action)
+        })
     }
 
     /// Select providers in priority order for fallback scenarios.
@@ -464,6 +493,7 @@ mod tests {
             None,
             LoadBalanceStrategy::Priority,
             false,
+            Vec::new(),
         );
 
         // Priority strategy should always return providers in definition order
@@ -501,6 +531,7 @@ mod tests {
             None,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         // Weighted random should include all providers (order varies)
@@ -537,6 +568,7 @@ mod tests {
             None,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         // Run multiple times and count how often heavy is first
@@ -590,6 +622,7 @@ mod tests {
                 None,
                 strategy,
                 false,
+                Vec::new(),
             );
 
             let order: Vec<_> = pool.select_ordered().collect();
@@ -628,6 +661,7 @@ mod tests {
             fallback,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         // With replacement + max_attempts=5, should get exactly 5 entries
@@ -686,6 +720,7 @@ mod tests {
             fallback,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -737,6 +772,7 @@ mod tests {
             fallback,
             LoadBalanceStrategy::Priority,
             false,
+            Vec::new(),
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -770,6 +806,7 @@ mod tests {
             None,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -806,6 +843,7 @@ mod tests {
             fallback,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         let order: Vec<_> = pool.select_ordered().collect();
@@ -850,6 +888,7 @@ mod tests {
             fallback,
             LoadBalanceStrategy::WeightedRandom,
             false,
+            Vec::new(),
         );
 
         // Over many runs, the heavy provider should dominate
@@ -870,5 +909,179 @@ mod tests {
             "Heavy provider (99:1 weight) should appear >90% of the time, got {}%",
             percentage
         );
+    }
+
+    #[test]
+    fn test_evaluate_routing_rules_no_rules() {
+        let pool = ProviderPool::new(vec![Provider {
+            target: create_test_target("https://api.example.com"),
+            weight: 1,
+        }]);
+
+        let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+        assert!(pool.evaluate_routing_rules(&labels).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_routing_rules_deny() {
+        use crate::target::{RoutingAction, RoutingRule};
+
+        let rules = vec![RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), "playground".to_string())]),
+            action: RoutingAction::Deny,
+        }];
+
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: create_test_target("https://api.example.com"),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            rules,
+        );
+
+        // Matching labels → deny
+        let labels = HashMap::from([("purpose".to_string(), "playground".to_string())]);
+        assert!(matches!(
+            pool.evaluate_routing_rules(&labels),
+            Some(RoutingAction::Deny)
+        ));
+
+        // Non-matching labels → allow (None)
+        let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+        assert!(pool.evaluate_routing_rules(&labels).is_none());
+
+        // Empty labels → allow (None)
+        assert!(pool.evaluate_routing_rules(&HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_evaluate_routing_rules_redirect() {
+        use crate::target::{RoutingAction, RoutingRule};
+
+        let rules = vec![RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
+            action: RoutingAction::Redirect {
+                target: "gpt-4o-mini".to_string(),
+            },
+        }];
+
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: create_test_target("https://api.example.com"),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            rules,
+        );
+
+        let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+        match pool.evaluate_routing_rules(&labels) {
+            Some(RoutingAction::Redirect { target }) => {
+                assert_eq!(target, "gpt-4o-mini");
+            }
+            other => panic!("Expected Redirect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_evaluate_routing_rules_first_match_wins() {
+        use crate::target::{RoutingAction, RoutingRule};
+
+        let rules = vec![
+            RoutingRule {
+                match_labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
+                action: RoutingAction::Deny,
+            },
+            RoutingRule {
+                match_labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
+                action: RoutingAction::Redirect {
+                    target: "other".to_string(),
+                },
+            },
+        ];
+
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: create_test_target("https://api.example.com"),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            rules,
+        );
+
+        // First matching rule (Deny) should win
+        let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+        assert!(matches!(
+            pool.evaluate_routing_rules(&labels),
+            Some(RoutingAction::Deny)
+        ));
+    }
+
+    #[test]
+    fn test_evaluate_routing_rules_multiple_label_conditions() {
+        use crate::target::{RoutingAction, RoutingRule};
+
+        let rules = vec![RoutingRule {
+            match_labels: HashMap::from([
+                ("purpose".to_string(), "batch".to_string()),
+                ("tier".to_string(), "free".to_string()),
+            ]),
+            action: RoutingAction::Deny,
+        }];
+
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: create_test_target("https://api.example.com"),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            rules,
+        );
+
+        // Both labels match → deny
+        let labels = HashMap::from([
+            ("purpose".to_string(), "batch".to_string()),
+            ("tier".to_string(), "free".to_string()),
+        ]);
+        assert!(matches!(
+            pool.evaluate_routing_rules(&labels),
+            Some(RoutingAction::Deny)
+        ));
+
+        // Only one label matches → no match (all must match)
+        let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+        assert!(pool.evaluate_routing_rules(&labels).is_none());
+
+        // Extra labels are fine — only rule labels need to match
+        let labels = HashMap::from([
+            ("purpose".to_string(), "batch".to_string()),
+            ("tier".to_string(), "free".to_string()),
+            ("org".to_string(), "acme".to_string()),
+        ]);
+        assert!(matches!(
+            pool.evaluate_routing_rules(&labels),
+            Some(RoutingAction::Deny)
+        ));
     }
 }

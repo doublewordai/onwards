@@ -207,6 +207,10 @@ pub struct PoolSpec {
     #[serde(default)]
     #[builder(default)]
     pub trusted: bool,
+    /// Routing rules evaluated against key labels before processing.
+    /// First matching rule wins; no match = allow.
+    #[serde(default)]
+    pub routing_rules: Vec<RoutingRule>,
 
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
@@ -290,6 +294,7 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub open_responses: Option<OpenResponsesConfig>,
     pub trusted: bool,
+    pub routing_rules: Vec<RoutingRule>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -307,6 +312,7 @@ impl TargetSpecOrList {
                 sanitize_response: pool.sanitize_response,
                 open_responses: pool.open_responses,
                 trusted: pool.trusted,
+                routing_rules: pool.routing_rules,
                 providers: pool.providers,
             }),
             TargetSpecOrList::List(list) => {
@@ -351,6 +357,7 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     open_responses: None,
                     trusted,
+                    routing_rules: Vec::new(),
                     providers,
                 })
             }
@@ -385,6 +392,7 @@ impl TargetSpecOrList {
                     sanitize_response,
                     open_responses,
                     trusted,
+                    routing_rules: Vec::new(),
                     providers: vec![provider],
                 })
             }
@@ -565,6 +573,7 @@ impl Target {
             None,
             LoadBalanceStrategy::default(),
             false, // trusted defaults to false
+            Vec::new(),
         )
     }
 }
@@ -574,6 +583,30 @@ pub struct KeyDefinition {
     pub key: String,
     pub rate_limit: Option<RateLimitParameters>,
     pub concurrency_limit: Option<ConcurrencyLimitParameters>,
+    /// Labels for this key (e.g., {"purpose": "batch"}).
+    /// Used by routing rules to match requests to actions.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+}
+
+/// A rule that matches on key labels and takes an action (deny or redirect).
+/// Rules are evaluated in order; first match wins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingRule {
+    /// All label conditions must match for this rule to apply
+    pub match_labels: HashMap<String, String>,
+    /// Action to take when matched
+    pub action: RoutingAction,
+}
+
+/// Action taken when a routing rule matches
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RoutingAction {
+    /// Return 403 Forbidden
+    Deny,
+    /// Redirect to another model alias
+    Redirect { target: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -632,6 +665,8 @@ pub struct Targets {
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
     /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
     pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
+    /// Labels per actual API key (actual key -> labels map)
+    pub key_labels: Arc<DashMap<String, HashMap<String, String>>>,
     /// Enable strict mode with schema validation
     pub strict_mode: bool,
     /// HTTP connection pool configuration (global)
@@ -776,9 +811,10 @@ impl Targets {
         debug!("{} global keys configured", global_keys.len());
         debug!("{} key definitions configured", key_definitions.len());
 
-        // Set up rate limiters keyed by actual API keys
+        // Set up rate limiters and labels keyed by actual API keys
         let key_rate_limiters = Arc::new(DashMap::new());
         let key_concurrency_limiters = Arc::new(DashMap::new());
+        let key_labels = Arc::new(DashMap::new());
 
         for (_key_id, key_def) in key_definitions {
             if let Some(ref rate_limit) = key_def.rate_limit {
@@ -797,6 +833,9 @@ impl Targets {
                     SemaphoreConcurrencyLimiter::new(concurrency_limit.max_concurrent_requests);
                 // Map the actual API key to its concurrency limiter
                 key_concurrency_limiters.insert(key_def.key.clone(), limiter);
+            }
+            if !key_def.labels.is_empty() {
+                key_labels.insert(key_def.key.clone(), key_def.labels);
             }
         }
 
@@ -854,6 +893,7 @@ impl Targets {
                 pool_config.fallback,
                 pool_config.strategy,
                 pool_config.trusted,
+                pool_config.routing_rules,
             );
             debug!(
                 "Created provider pool '{}' with {} provider(s), fallback enabled: {}, strategy: {:?}",
@@ -869,6 +909,7 @@ impl Targets {
             targets,
             key_rate_limiters,
             key_concurrency_limiters,
+            key_labels,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
         })
@@ -887,6 +928,7 @@ impl Targets {
         let targets = Arc::clone(&self.targets);
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
+        let key_labels = Arc::clone(&self.key_labels);
 
         let mut stream = targets_stream.stream().await?;
 
@@ -953,6 +995,20 @@ impl Targets {
                         for entry in new_targets.key_concurrency_limiters.iter() {
                             key_concurrency_limiters
                                 .insert(entry.key().clone(), entry.value().clone());
+                        }
+
+                        // Update key labels atomically (same pattern)
+                        let current_label_keys: Vec<String> =
+                            key_labels.iter().map(|entry| entry.key().clone()).collect();
+
+                        for key in current_label_keys {
+                            if !new_targets.key_labels.contains_key(&key) {
+                                key_labels.remove(&key);
+                            }
+                        }
+
+                        for entry in new_targets.key_labels.iter() {
+                            key_labels.insert(entry.key().clone(), entry.value().clone());
                         }
                     }
                     Err(e) => {
@@ -1036,6 +1092,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         }
@@ -1098,6 +1155,7 @@ mod tests {
             targets: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1162,6 +1220,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1392,6 +1451,7 @@ mod tests {
                     burst_size: Some(NonZeroU32::new(20).unwrap()),
                 }),
                 concurrency_limit: None,
+                labels: HashMap::new(),
             },
         );
 
@@ -1444,6 +1504,7 @@ mod tests {
                 key: "sk-unlimited-123".to_string(),
                 rate_limit: None,
                 concurrency_limit: None,
+                labels: HashMap::new(),
             },
         );
 
@@ -1678,6 +1739,7 @@ mod tests {
                 concurrency_limit: Some(ConcurrencyLimitParameters {
                     max_concurrent_requests: 3,
                 }),
+                labels: HashMap::new(),
             },
         );
 
@@ -1713,6 +1775,7 @@ mod tests {
                 key: "sk-unlimited-456".to_string(),
                 rate_limit: None,
                 concurrency_limit: None,
+                labels: HashMap::new(),
             },
         );
 
@@ -2000,6 +2063,7 @@ mod tests {
             sanitize_response: false,
             open_responses: None,
             trusted: true,
+            routing_rules: Vec::new(),
             providers: vec![ProviderSpec {
                 url: "https://api.example.com".parse().unwrap(),
                 onwards_key: None,
@@ -2315,5 +2379,119 @@ mod tests {
             providers[1].target.trusted, None,
             "Second provider should have trusted=None (inherits pool)"
         );
+    }
+
+    #[test]
+    fn test_routing_rules_deserialized_from_config() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "routing_rules": [
+                        {
+                            "match_labels": {"purpose": "playground"},
+                            "action": {"type": "deny"}
+                        },
+                        {
+                            "match_labels": {"purpose": "batch"},
+                            "action": {"type": "redirect", "target": "gpt-4o-mini"}
+                        }
+                    ],
+                    "providers": [
+                        { "url": "https://api.openai.com/v1/" }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        let rules = pool.routing_rules();
+        assert_eq!(rules.len(), 2);
+
+        // First rule: deny playground
+        assert_eq!(rules[0].match_labels.get("purpose").unwrap(), "playground");
+        assert!(matches!(rules[0].action, RoutingAction::Deny));
+
+        // Second rule: redirect batch
+        assert_eq!(rules[1].match_labels.get("purpose").unwrap(), "batch");
+        match &rules[1].action {
+            RoutingAction::Redirect { target } => assert_eq!(target, "gpt-4o-mini"),
+            other => panic!("Expected Redirect, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_key_labels_wired_through_config() {
+        let mut key_definitions = HashMap::new();
+        key_definitions.insert(
+            "batch_user".to_string(),
+            KeyDefinition {
+                key: "sk-batch-123".to_string(),
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
+            },
+        );
+        key_definitions.insert(
+            "playground_user".to_string(),
+            KeyDefinition {
+                key: "sk-play-456".to_string(),
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: HashMap::from([("purpose".to_string(), "playground".to_string())]),
+            },
+        );
+        key_definitions.insert(
+            "no_labels_user".to_string(),
+            KeyDefinition {
+                key: "sk-nolabel-789".to_string(),
+                rate_limit: None,
+                concurrency_limit: None,
+                labels: HashMap::new(),
+            },
+        );
+
+        let config_file = ConfigFile {
+            targets: HashMap::new(),
+            auth: Some(Auth {
+                global_keys: std::collections::HashSet::new(),
+                key_definitions: Some(key_definitions),
+            }),
+            strict_mode: false,
+            http_pool: None,
+        };
+
+        let targets = Targets::from_config(config_file).unwrap();
+
+        // Keys with labels should be in key_labels
+        let batch_labels = targets.key_labels.get("sk-batch-123").unwrap();
+        assert_eq!(batch_labels.get("purpose").unwrap(), "batch");
+
+        let play_labels = targets.key_labels.get("sk-play-456").unwrap();
+        assert_eq!(play_labels.get("purpose").unwrap(), "playground");
+
+        // Key without labels should NOT be in key_labels
+        assert!(!targets.key_labels.contains_key("sk-nolabel-789"));
+    }
+
+    #[test]
+    fn test_routing_rules_empty_by_default() {
+        // Single target format has no routing_rules field
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com",
+                    "onwards_key": "sk-test"
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+
+        let pool = targets.targets.get("gpt-4").unwrap();
+        assert!(pool.routing_rules().is_empty());
     }
 }
