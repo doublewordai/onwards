@@ -279,25 +279,26 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
 /// rewrites the model field, and re-serializes.
 async fn sanitize_chat_response(mut response: Response, original_model: String) -> Response {
     // Read the response body
-    let body_bytes =
-        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
-            Ok(bytes) => {
-                debug!(
-                    bytes_read = bytes.len(),
-                    body_sample = ?String::from_utf8_lossy(&bytes).chars().take(100).collect::<String>(),
-                    "Read upstream response body for sanitization"
-                );
-                bytes
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to read response body for sanitization");
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    "Failed to read upstream response"
-                );
-            }
-        };
+    let body_bytes = match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+        .await
+    {
+        Ok(bytes) => {
+            debug!(
+                bytes_read = bytes.len(),
+                body_sample = ?String::from_utf8_lossy(&bytes).chars().take(100).collect::<String>(),
+                "Read upstream response body for sanitization"
+            );
+            bytes
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to read response body for sanitization");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "Failed to read upstream response",
+            );
+        }
+    };
 
     // Deserialize through our strict schema (automatically drops extra fields)
     let mut chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
@@ -331,7 +332,9 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
 
             // Remove Transfer-Encoding since we're setting Content-Length
             // HTTP doesn't allow both headers - having both causes undefined behavior
-            response.headers_mut().remove(axum::http::header::TRANSFER_ENCODING);
+            response
+                .headers_mut()
+                .remove(axum::http::header::TRANSFER_ENCODING);
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from(content_length),
@@ -469,7 +472,7 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
-                    "Failed to read upstream response"
+                    "Failed to read upstream response",
                 );
             }
         };
@@ -497,7 +500,9 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
 
             // Remove Transfer-Encoding since we're setting Content-Length
             // HTTP doesn't allow both headers - having both causes undefined behavior
-            response.headers_mut().remove(axum::http::header::TRANSFER_ENCODING);
+            response
+                .headers_mut()
+                .remove(axum::http::header::TRANSFER_ENCODING);
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from(content_length),
@@ -532,7 +537,7 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "api_error",
-                    "Failed to read upstream response"
+                    "Failed to read upstream response",
                 );
             }
         };
@@ -560,7 +565,9 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
 
             // Remove Transfer-Encoding since we're setting Content-Length
             // HTTP doesn't allow both headers - having both causes undefined behavior
-            response.headers_mut().remove(axum::http::header::TRANSFER_ENCODING);
+            response
+                .headers_mut()
+                .remove(axum::http::header::TRANSFER_ENCODING);
             response.headers_mut().insert(
                 header::CONTENT_LENGTH,
                 header::HeaderValue::from(content_length),

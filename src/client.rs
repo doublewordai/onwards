@@ -81,8 +81,8 @@ mod tests {
         // Bug: HttpConnector with enforce_http=true (default) rejects HTTPS schemes
         // This test uses a mock server to avoid external network dependencies
 
-        use wiremock::{MockServer, Mock, ResponseTemplate};
         use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         // Start a local mock server
         let mock_server = MockServer::start().await;
