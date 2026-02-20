@@ -54,10 +54,10 @@ impl OpenResponsesAdapter {
         let mut messages = if let Some(ref prev_id) = request.previous_response_id {
             match self.store.get_context(prev_id).await {
                 Ok(Some(context)) => {
-                    // Parse the stored context as items and convert
-                    let items: Vec<Item> = serde_json::from_value(context)
+                    // Deserialize the stored response and extract output items
+                    let stored_response: ResponsesResponse = serde_json::from_value(context)
                         .map_err(|e| AdapterError::ContextError(e.to_string()))?;
-                    items_to_messages(&items)?
+                    items_to_messages(&stored_response.output)?
                 }
                 Ok(None) => {
                     return Err(AdapterError::PreviousResponseNotFound(prev_id.clone()));
@@ -215,6 +215,9 @@ impl OpenResponsesAdapter {
     }
 
     /// Store a response and return the stored response with ID
+    ///
+    /// The entire response is stored to allow future access to metadata, instructions,
+    /// and other fields. Currently only the output items are used for conversation context.
     pub async fn store_response(&self, response: &ResponsesResponse) -> Result<String, StoreError> {
         let value = serde_json::to_value(response)
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;

@@ -22,7 +22,6 @@ use super::schemas::responses::{
     ResponsesRequest, ResponsesResponse, TextConfig, TextFormat, TruncationStrategy,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// State machine for tracking streaming response state
@@ -69,7 +68,22 @@ struct StreamingToolCall {
     arguments: String,
 }
 
-static RESPONSE_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Generate a unique response ID using timestamp and random component
+///
+/// Format: resp_{timestamp_hex}_{random_hex}
+/// This avoids ID collisions across server restarts and concurrent requests.
+fn generate_response_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    // Use rng for better randomness distribution under high load
+    use rand::Rng;
+    let random: u64 = rand::rng().random();
+
+    format!("resp_{:016x}_{:08x}", timestamp, random)
+}
 
 impl StreamingState {
     /// Create a new streaming state for a response
@@ -80,10 +94,7 @@ impl StreamingState {
             .as_secs();
 
         Self {
-            response_id: format!(
-                "resp_{:016x}",
-                RESPONSE_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
+            response_id: generate_response_id(),
             model: request.model.clone(),
             created_at: timestamp,
             items: Vec::new(),
