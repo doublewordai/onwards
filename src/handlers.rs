@@ -34,6 +34,11 @@ fn record_response_status(status_code: u16) {
 #[derive(Clone, Debug)]
 struct OriginalModel(String);
 
+/// Response extension carrying the resolved trust level of the provider that handled the request.
+/// Set by `target_message_handler` so strict-mode handlers can read it without a second pool lookup.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedTrust(pub(crate) bool);
+
 /// Filters and modifies headers before forwarding to upstream
 ///
 /// This function implements RFC 7230 compliant proxy behavior by:
@@ -737,6 +742,8 @@ pub async fn target_message_handler<T: HttpClient>(
             response.headers().get(CONTENT_LENGTH),
             state.targets.strict_mode
         );
+        let resolved_trust = target.trusted.unwrap_or_else(|| pool.is_trusted());
+        response.extensions_mut().insert(ResolvedTrust(resolved_trust));
         return Ok(response);
     }
 
