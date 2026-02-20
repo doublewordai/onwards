@@ -472,7 +472,8 @@ impl StreamingState {
             frequency_penalty: 0.0,
             top_logprobs: 0,
             temperature: req.temperature.unwrap_or(1.0),
-            reasoning: req.reasoning.clone(),
+            reasoning: serde_json::to_value(&req.reasoning)
+                .unwrap_or(serde_json::Value::Null),
             usage,
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,

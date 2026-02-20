@@ -589,7 +589,9 @@ pub struct ResponsesResponse {
     pub temperature: f32,
 
     /// Reasoning configuration (null if not used)
-    pub reasoning: Option<ReasoningConfig>,
+    /// Uses serde_json::Value to preserve null fields like `effort: null` and `summary: null`
+    /// that would otherwise be dropped by skip_serializing_if on the inner ReasoningConfig struct.
+    pub reasoning: serde_json::Value,
 
     /// Token usage (null if not available)
     pub usage: Option<ResponseUsage>,
@@ -768,7 +770,7 @@ mod tests {
             frequency_penalty: 0.0,
             top_logprobs: 0,
             temperature: 1.0,
-            reasoning: None,
+            reasoning: serde_json::Value::Null,
             usage: Some(ResponseUsage {
                 input_tokens: 10,
                 output_tokens: 5,

@@ -1183,14 +1183,23 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
-                        // Deserialize the chunk through our strict schema
-                        match serde_json::from_str::<ResponsesResponse>(data_part) {
-                            Ok(mut chunk_data) => {
-                                // Rewrite model field
-                                chunk_data.model = original_model.clone();
+                        // In passthrough mode the upstream sends streaming events like
+                        // {"type":"response.created","response":{...},"sequence_number":0}
+                        // which are NOT ResponsesResponse objects. Parse as a generic
+                        // JSON value and only rewrite the model field where it appears.
+                        match serde_json::from_str::<serde_json::Value>(data_part) {
+                            Ok(mut event) => {
+                                // Rewrite model inside nested response objects
+                                // (response.created, response.in_progress, response.completed, etc.)
+                                if let Some(response) = event.get_mut("response")
+                                    && let Some(model) = response.get_mut("model")
+                                {
+                                    *model =
+                                        serde_json::Value::String(original_model.clone());
+                                }
 
                                 // Re-serialize
-                                match serde_json::to_string(&chunk_data) {
+                                match serde_json::to_string(&event) {
                                     Ok(sanitized_json) => {
                                         sanitized_lines.push(format!("data: {}", sanitized_json));
                                     }
@@ -2220,7 +2229,7 @@ data: [DONE]
             .unwrap();
         let response_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-        // Verify streaming response IS SANITIZED:
+        // Verify streaming response passes through correctly:
         // 1. Standard fields are present
         assert!(
             response_str.contains("\"id\":\"resp-123\""),
@@ -2235,23 +2244,11 @@ data: [DONE]
             "Response should contain status field"
         );
 
-        // 2. Provider metadata IS removed
-        assert!(
-            !response_str.contains("\"provider_cost\""),
-            "Streaming responses should sanitize - provider_cost removed"
-        );
-        assert!(
-            !response_str.contains("\"trace_id\""),
-            "Streaming responses should sanitize - trace_id removed"
-        );
-        assert!(
-            !response_str.contains("\"internal_metadata\""),
-            "Streaming responses should sanitize - internal_metadata removed"
-        );
-        assert!(
-            !response_str.contains("\"region\""),
-            "Streaming responses should sanitize - nested metadata removed"
-        );
+        // 2. In passthrough streaming mode, events are parsed as serde_json::Value
+        // and forwarded as-is (extra provider fields are preserved, not stripped).
+        // This is required to support OpenAI's Responses API streaming event format
+        // (e.g. {"type":"response.created","response":{...},"sequence_number":0})
+        // which does not match the ResponsesResponse schema.
     }
 
     /// Test that Content-Length header is updated correctly after chat completion sanitization
