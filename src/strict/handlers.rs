@@ -135,6 +135,23 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
 
+    // OpenAI requires additionalProperties: false in tool schemas even for /v1/responses
+    // Add it if missing to ensure compatibility
+    let mut request = request;
+    if let Some(ref mut tools) = request.tools {
+        for tool in tools.iter_mut() {
+            if let super::schemas::responses::Tool::Function { parameters, .. } = tool
+                && let Some(obj) = parameters.as_object_mut()
+                && !obj.contains_key("additionalProperties")
+            {
+                obj.insert(
+                    "additionalProperties".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+        }
+    }
+
     // Re-serialize the validated request and forward it
     let body_bytes = match serde_json::to_vec(&request) {
         Ok(bytes) => bytes,
@@ -769,6 +786,9 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
         axum::http::header::CONTENT_TYPE,
         "application/json".parse().unwrap(),
     );
+
+    // Disable compression - hyper doesn't auto-decompress, causing parse failures
+    headers.remove(axum::http::header::ACCEPT_ENCODING);
 
     // Build the request to forward
     let mut request_builder = Request::builder().method("POST").uri(path);
