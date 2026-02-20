@@ -727,6 +727,9 @@ async fn forward_request_raw<T: HttpClient + Clone + Send + Sync + 'static>(
         "application/json".parse().unwrap(),
     );
 
+    // Disable compression - hyper doesn't auto-decompress, causing parse failures
+    headers.remove(axum::http::header::ACCEPT_ENCODING);
+
     // Build the request to forward
     let request = match Request::builder()
         .method("POST")

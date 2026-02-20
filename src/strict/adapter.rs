@@ -611,15 +611,29 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
                 description,
                 parameters,
                 strict,
-            } => Some(ChatTool {
-                tool_type: "function".to_string(),
-                function: super::schemas::chat_completions::FunctionDefinition {
-                    name: name.clone(),
-                    description: Some(description.clone()),
-                    parameters: Some(parameters.clone()),
-                    strict: Some(*strict),
-                },
-            }),
+            } => {
+                // OpenAI requires `additionalProperties: false` in strict mode
+                // Add it if not present in the parameters schema
+                let mut params = parameters.clone();
+                if let Some(obj) = params.as_object_mut() {
+                    if !obj.contains_key("additionalProperties") {
+                        obj.insert(
+                            "additionalProperties".to_string(),
+                            serde_json::Value::Bool(false),
+                        );
+                    }
+                }
+
+                Some(ChatTool {
+                    tool_type: "function".to_string(),
+                    function: super::schemas::chat_completions::FunctionDefinition {
+                        name: name.clone(),
+                        description: Some(description.clone()),
+                        parameters: Some(params),
+                        strict: Some(*strict),
+                    },
+                })
+            }
             // Other tool types (code_interpreter, file_search, etc.) don't map to Chat Completions
             _ => {
                 debug!("Skipping non-function tool type in conversion");

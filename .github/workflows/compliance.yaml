@@ -57,7 +57,7 @@ jobs:
 
       - name: Start onwards
         run: |
-          ./target/release/onwards -f /tmp/config.json &
+          ./target/release/onwards -f /tmp/config.json > /tmp/onwards.log 2>&1 &
           for i in $(seq 1 30); do
             if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
               echo "Server is ready"
@@ -66,6 +66,7 @@ jobs:
             sleep 1
           done
           echo "Server failed to start"
+          cat /tmp/onwards.log
           exit 1
 
       - name: Run compliance tests
@@ -75,3 +76,9 @@ jobs:
             --base-url http://localhost:3000/v1 \
             --api-key test \
             --model gpt-4o-mini
+
+      - name: Show onwards logs
+        if: always()
+        run: |
+          echo "=== Onwards Server Logs ==="
+          cat /tmp/onwards.log || echo "No log file found"
