@@ -15,7 +15,7 @@ use super::schemas::chat_completions::{
     ToolCall,
 };
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
-use super::schemas::responses::{ResponsesRequest, ResponsesResponse};
+use super::schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent};
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
@@ -1183,19 +1183,15 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
-                        // In passthrough mode the upstream sends streaming events like
-                        // {"type":"response.created","response":{...},"sequence_number":0}
-                        // which are NOT ResponsesResponse objects. Parse as a generic
-                        // JSON value and only rewrite the model field where it appears.
-                        match serde_json::from_str::<serde_json::Value>(data_part) {
+                        // Parse as a typed ResponsesStreamingEvent — the structured
+                        // envelope shared by all Responses API streaming events.
+                        // This validates that type + sequence_number are present and
+                        // gives us typed access to response.model for rewriting.
+                        match serde_json::from_str::<ResponsesStreamingEvent>(data_part) {
                             Ok(mut event) => {
-                                // Rewrite model inside nested response objects
-                                // (response.created, response.in_progress, response.completed, etc.)
-                                if let Some(response) = event.get_mut("response")
-                                    && let Some(model) = response.get_mut("model")
-                                {
-                                    *model =
-                                        serde_json::Value::String(original_model.clone());
+                                // Rewrite model on response-level events
+                                if let Some(ref mut response) = event.response {
+                                    response.model = original_model.clone();
                                 }
 
                                 // Re-serialize
@@ -2200,14 +2196,37 @@ mod tests {
             http_pool_config: None,
         };
 
-        // Mock SSE streaming response with provider metadata in chunks
-        let mock_stream = r#"data: {"id":"resp-123","object":"response","created_at":1677652288,"completed_at":null,"status":"in_progress","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello"}]}],"error":null,"tools":[],"tool_choice":"auto","truncation":"auto","parallel_tool_calls":true,"text":{},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null,"provider_cost":0.001,"trace_id":"trace-abc-123"}
-
-data: {"id":"resp-123","object":"response","created_at":1677652288,"completed_at":1677652290,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello world"}]}],"error":null,"tools":[],"tool_choice":"auto","truncation":"auto","parallel_tool_calls":true,"text":{},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null,"provider_cost":0.002,"internal_metadata":{"region":"us-east-1"}}
-
-data: [DONE]
-
-"#;
+        // Mock SSE stream using real OpenAI Responses API streaming event format:
+        // each chunk is a ResponsesStreamingEvent with type + sequence_number.
+        let mock_stream = concat!(
+            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{",
+            "\"id\":\"resp-123\",\"object\":\"response\",\"created_at\":1677652288,",
+            "\"completed_at\":null,\"status\":\"in_progress\",\"incomplete_details\":null,",
+            "\"model\":\"gpt-4o-2024-08-06\",\"previous_response_id\":null,\"instructions\":null,",
+            "\"output\":[],\"error\":null,\"tools\":[],\"tool_choice\":\"auto\",",
+            "\"truncation\":\"disabled\",\"parallel_tool_calls\":true,",
+            "\"text\":{\"format\":{\"type\":\"text\"}},\"top_p\":1.0,\"presence_penalty\":0.0,",
+            "\"frequency_penalty\":0.0,\"top_logprobs\":0,\"temperature\":1.0,",
+            "\"reasoning\":{\"effort\":null,\"summary\":null},\"usage\":null,",
+            "\"max_output_tokens\":null,\"max_tool_calls\":null,\"store\":false,",
+            "\"background\":false,\"service_tier\":\"default\",\"metadata\":null,",
+            "\"safety_identifier\":null,\"prompt_cache_key\":null}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,",
+            "\"item_id\":\"msg_abc\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{",
+            "\"id\":\"resp-123\",\"object\":\"response\",\"created_at\":1677652288,",
+            "\"completed_at\":1677652290,\"status\":\"completed\",\"incomplete_details\":null,",
+            "\"model\":\"gpt-4o-2024-08-06\",\"previous_response_id\":null,\"instructions\":null,",
+            "\"output\":[],\"error\":null,\"tools\":[],\"tool_choice\":\"auto\",",
+            "\"truncation\":\"disabled\",\"parallel_tool_calls\":true,",
+            "\"text\":{\"format\":{\"type\":\"text\"}},\"top_p\":1.0,\"presence_penalty\":0.0,",
+            "\"frequency_penalty\":0.0,\"top_logprobs\":0,\"temperature\":1.0,",
+            "\"reasoning\":{\"effort\":null,\"summary\":null},\"usage\":null,",
+            "\"max_output_tokens\":null,\"max_tool_calls\":null,\"store\":false,",
+            "\"background\":false,\"service_tier\":\"default\",\"metadata\":null,",
+            "\"safety_identifier\":null,\"prompt_cache_key\":null}}\n\n",
+            "data: [DONE]\n\n"
+        );
 
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
         let state = AppState::with_client(targets, mock_client);
@@ -2229,26 +2248,47 @@ data: [DONE]
             .unwrap();
         let response_str = String::from_utf8(body_bytes.to_vec()).unwrap();
 
-        // Verify streaming response passes through correctly:
-        // 1. Standard fields are present
+        // Event envelopes are preserved
         assert!(
-            response_str.contains("\"id\":\"resp-123\""),
-            "Response should contain standard id field"
+            response_str.contains("\"type\":\"response.created\""),
+            "response.created event should be present"
+        );
+        assert!(
+            response_str.contains("\"type\":\"response.completed\""),
+            "response.completed event should be present"
+        );
+        assert!(
+            response_str.contains("\"type\":\"response.output_text.delta\""),
+            "delta event should pass through"
+        );
+
+        // Model is rewritten from the provider name to the requested name on response-level events
+        assert!(
+            !response_str.contains("gpt-4o-2024-08-06"),
+            "Provider model name should be rewritten"
         );
         assert!(
             response_str.contains("\"model\":\"gpt-4o\""),
-            "Response should contain model field"
-        );
-        assert!(
-            response_str.contains("\"status\":\"completed\""),
-            "Response should contain status field"
+            "Model should be rewritten to the requested model name"
         );
 
-        // 2. In passthrough streaming mode, events are parsed as serde_json::Value
-        // and forwarded as-is (extra provider fields are preserved, not stripped).
-        // This is required to support OpenAI's Responses API streaming event format
-        // (e.g. {"type":"response.created","response":{...},"sequence_number":0})
-        // which does not match the ResponsesResponse schema.
+        // sequence_number passes through from provider
+        assert!(
+            response_str.contains("\"sequence_number\":0"),
+            "sequence_number should be preserved"
+        );
+
+        // reasoning null fields survive the roundtrip through ResponsesStreamingEvent
+        assert!(
+            response_str.contains("\"reasoning\":{\"effort\":null,\"summary\":null}"),
+            "reasoning null fields must not be collapsed to {{}}"
+        );
+
+        // Delta event-specific fields pass through via flatten
+        assert!(
+            response_str.contains("\"delta\":\"Hello\""),
+            "delta field should pass through on delta events"
+        );
     }
 
     /// Test that Content-Length header is updated correctly after chat completion sanitization

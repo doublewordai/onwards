@@ -32,7 +32,7 @@ use tracing::info;
 
 pub use adapter::OpenResponsesAdapter;
 pub use schemas::chat_completions::{ChatCompletionRequest, ChatCompletionResponse};
-pub use schemas::responses::{ResponsesRequest, ResponsesResponse};
+pub use schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent};
 
 /// Build a strict router with typed handlers and schema validation.
 ///
