@@ -1,0 +1,12 @@
+{
+  "strict_mode": true,
+  "targets": {
+    "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8": {
+      "url": "https://api.doubleword.ai",
+      "onwards_key": "$DOUBLEWORD_API_KEY",
+      "open_responses": {
+        "adapter": true
+      }
+    }
+  }
+}
