@@ -6,16 +6,20 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use onwards::{AppState, build_router, target::Targets};
+//! use onwards::{AppState, build_router, config::Config, target::Targets};
 //! use axum::serve;
 //! use tokio::net::TcpListener;
+//! use clap::Parser;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Parse CLI configuration
+//!     let config = Config::parse();
+//!     
 //!     // Load targets from configuration file
-//!     let targets = Targets::from_config_file(&"config.json".into()).await?;
+//!     let targets = Targets::from_config_file(&config.targets).await?;
 //!
-//!     // Create application state
+//!     // Create application state with connection pool settings from config
 //!     let app_state = AppState::new(targets);
 //!
 //!     // Build router with proxy routes
@@ -42,6 +46,7 @@ use tracing::{info, instrument};
 
 pub mod auth;
 pub mod client;
+pub mod config;
 pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
@@ -154,10 +159,12 @@ pub type ResponseTransformFn = Arc<
 ///
 /// Basic setup:
 /// ```no_run
-/// use onwards::{AppState, target::Targets};
+/// use onwards::{AppState, config::Config, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 /// # Ok(())
 /// # }
@@ -165,11 +172,13 @@ pub type ResponseTransformFn = Arc<
 ///
 /// With request transformation:
 /// ```no_run
-/// use onwards::{AppState, BodyTransformFn, target::Targets};
+/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
 /// use std::sync::Arc;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 ///
 /// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
 ///     // Custom transformation logic
@@ -212,7 +221,13 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
 impl AppState<HyperClient> {
     /// Create a new AppState with the default Hyper client
     pub fn new(targets: target::Targets) -> Self {
-        let http_client = client::create_hyper_client();
+        let (max_idle, timeout) = targets
+            .http_pool_config
+            .as_ref()
+            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
+            .unwrap_or((100, 90));
+
+        let http_client = client::create_hyper_client(max_idle, timeout);
         Self {
             http_client,
             targets,
@@ -225,7 +240,13 @@ impl AppState<HyperClient> {
 
     /// Create a new AppState with the default Hyper client and a body transformation function
     pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let http_client = client::create_hyper_client();
+        let (max_idle, timeout) = targets
+            .http_pool_config
+            .as_ref()
+            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
+            .unwrap_or((100, 90));
+
+        let http_client = client::create_hyper_client(max_idle, timeout);
         Self {
             http_client,
             targets,
@@ -362,10 +383,12 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Opt
 /// # Examples
 ///
 /// ```no_run
-/// use onwards::{AppState, create_openai_sanitizer, target::Targets};
+/// use onwards::{AppState, config::Config, create_openai_sanitizer, target::Targets};
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets)
 ///     .with_response_transform(create_openai_sanitizer());
 /// # Ok(())
@@ -403,9 +426,11 @@ pub fn create_openai_sanitizer() -> ResponseTransformFn {
 /// use onwards::{AppState, build_router, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 /// let router = build_router(app_state);
 ///
@@ -485,9 +510,11 @@ type MetricsLayerAndHandle = (
 /// use onwards::{AppState, build_router, build_metrics_router, build_metrics_layer_and_handle, target::Targets};
 /// use axum::serve;
 /// use tokio::net::TcpListener;
+/// use clap::Parser;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let targets = Targets::from_config_file(&"config.json".into()).await?;
+/// let config = onwards::config::Config::parse();
+/// let targets = Targets::from_config_file(&config.targets).await?;
 /// let app_state = AppState::new(targets);
 ///
 /// // Build metrics layer and handle
@@ -532,6 +559,7 @@ pub mod test_utils {
     pub struct MockHttpClient {
         pub requests: Arc<Mutex<Vec<MockRequest>>>,
         response_builder: Arc<dyn Fn() -> axum::response::Response + Send + Sync>,
+        custom_headers: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     #[derive(Debug, Clone)]
@@ -554,6 +582,7 @@ pub mod test_utils {
                         .body(axum::body::Body::from(body.clone()))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -579,6 +608,7 @@ pub mod test_utils {
                         .body(Body::from_stream(stream))
                         .unwrap()
                 }),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -589,6 +619,7 @@ pub mod test_utils {
             let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             Self {
                 requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
                 response_builder: Arc::new(move || {
                     use axum::body::Body;
                     use futures_util::stream;
@@ -616,6 +647,13 @@ pub mod test_utils {
         pub fn get_requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
         }
+
+        pub fn set_header(&mut self, name: &str, value: String) {
+            self.custom_headers
+                .lock()
+                .unwrap()
+                .push((name.to_string(), value));
+        }
     }
 
     impl std::fmt::Debug for MockHttpClient {
@@ -632,6 +670,7 @@ pub mod test_utils {
             Self {
                 requests: Arc::clone(&self.requests),
                 response_builder: Arc::clone(&self.response_builder),
+                custom_headers: Arc::clone(&self.custom_headers),
             }
         }
     }
@@ -666,8 +705,18 @@ pub mod test_utils {
             };
             self.requests.lock().unwrap().push(mock_request);
 
+            // Build the response and apply custom headers
+            let mut response = (self.response_builder)();
+            let custom_headers = self.custom_headers.lock().unwrap();
+            for (name, value) in custom_headers.iter() {
+                response.headers_mut().insert(
+                    axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    axum::http::HeaderValue::from_str(value).unwrap(),
+                );
+            }
+
             // Return the configured response
-            Ok((self.response_builder)())
+            Ok(response)
         }
     }
 
@@ -810,6 +859,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -856,6 +906,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(
@@ -927,6 +978,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -1025,6 +1077,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1098,6 +1151,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1194,6 +1248,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1271,7 +1326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_blocks_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that blocks requests
@@ -1279,8 +1334,8 @@ mod tests {
         struct BlockingRateLimiter;
 
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(()) // Always block
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded) // Always block
             }
         }
 
@@ -1301,6 +1356,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1320,10 +1376,10 @@ mod tests {
         // Should get 429 Too Many Requests
         assert_eq!(response.status_code(), 429);
 
-        // Should return proper error structure
+        // Should return proper error structure wrapped in OpenAI error envelope
         let response_body: serde_json::Value = response.json();
-        assert_eq!(response_body["type"], "rate_limit_error");
-        assert_eq!(response_body["code"], "rate_limit");
+        assert_eq!(response_body["error"]["type"], "rate_limit_error");
+        assert_eq!(response_body["error"]["code"], "rate_limit");
 
         // Verify no request was made to the upstream (since it was rate limited)
         let requests = mock_client.get_requests();
@@ -1332,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_allows_requests() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create a mock rate limiter that allows requests
@@ -1340,7 +1396,7 @@ mod tests {
         struct AllowingRateLimiter;
 
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(()) // Always allow
             }
         }
@@ -1362,6 +1418,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1389,22 +1446,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_rate_limiting_with_mixed_targets() {
-        use crate::target::{RateLimiter, Target, Targets};
+        use crate::target::{RateLimitExceeded, RateLimiter, Target, Targets};
         use std::sync::Arc;
 
         // Create different rate limiters
         #[derive(Debug)]
         struct BlockingRateLimiter;
         impl RateLimiter for BlockingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
-                Err(())
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
             }
         }
 
         #[derive(Debug)]
         struct AllowingRateLimiter;
         impl RateLimiter for AllowingRateLimiter {
-            fn check(&self) -> Result<(), ()> {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
                 Ok(())
             }
         }
@@ -1443,6 +1500,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1511,6 +1569,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1556,6 +1615,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client =
@@ -1588,7 +1648,7 @@ mod tests {
                 // Second request should be rejected (concurrency limit exceeded)
                 assert_eq!(response2.status_code(), 429);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -1629,6 +1689,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters,
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client =
@@ -1669,7 +1730,7 @@ mod tests {
                 // Second request should be rejected (per-key concurrency limit exceeded)
                 assert_eq!(response2.status_code(), 429);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -1704,6 +1765,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1880,6 +1942,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -1942,6 +2005,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1992,6 +2056,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -2044,6 +2109,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -2120,6 +2186,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create the same transformation function
@@ -2192,6 +2259,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             strict_mode: false,
+            http_pool_config: None,
         };
 
         // Create a transformation function that only transforms specific paths
@@ -2267,6 +2335,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2304,6 +2373,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2346,6 +2416,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(
@@ -2406,6 +2477,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2461,6 +2533,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2502,6 +2575,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2556,6 +2630,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2610,6 +2685,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2672,6 +2748,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2717,6 +2794,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response with provider-specific fields
@@ -2789,6 +2867,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response from upstream has the turbo model
@@ -2852,6 +2931,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let streaming_chunks = vec![
@@ -2907,6 +2987,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let streaming_chunks = vec![
@@ -2959,6 +3040,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response with provider-specific fields
@@ -3019,6 +3101,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             // Response from a different endpoint (e.g., embeddings)
@@ -3086,6 +3169,7 @@ mod tests {
                 key_rate_limiters: Arc::new(DashMap::new()),
                 key_concurrency_limiters: Arc::new(DashMap::new()),
                 strict_mode: false,
+                http_pool_config: None,
             };
 
             let mock_response = r#"{
@@ -3116,6 +3200,172 @@ mod tests {
                 .await;
 
             assert_eq!(response.status_code(), 200);
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_replaces_4xx_body() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            };
+
+            // Upstream returns 422 with provider-specific error details
+            let upstream_error = r#"{
+                "error": {
+                    "message": "Internal provider Novita returned error: model not loaded on GPU cluster eu-west-3",
+                    "type": "provider_error",
+                    "code": "novita_internal_error",
+                    "metadata": {"provider": "novita", "region": "eu-west-3"}
+                }
+            }"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::UNPROCESSABLE_ENTITY, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            // Status code should be preserved
+            assert_eq!(response.status_code(), 422);
+
+            let body: serde_json::Value = response.json();
+            // Should have OpenAI error envelope with generic message
+            assert_eq!(
+                body["error"]["message"],
+                "The upstream provider rejected the request."
+            );
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["code"], "upstream_error");
+            // Should NOT contain any upstream provider details
+            let body_str = serde_json::to_string(&body).unwrap();
+            assert!(!body_str.contains("Novita"));
+            assert!(!body_str.contains("novita"));
+            assert!(!body_str.contains("eu-west-3"));
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_preserves_5xx_status() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(true)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            };
+
+            // Upstream returns 503 with internal details
+            let upstream_error = r#"{"error": "GPU cluster overloaded", "retry_after": 30}"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            // Original 503 status should be preserved
+            assert_eq!(response.status_code(), 503);
+
+            let body: serde_json::Value = response.json();
+            // Should have generic error body, not upstream details
+            assert_eq!(
+                body["error"]["message"],
+                "An internal error occurred. Please try again later."
+            );
+            assert_eq!(body["error"]["type"], "internal_error");
+            assert_eq!(body["error"]["code"], "internal_error");
+            // Should NOT contain upstream details
+            let body_str = serde_json::to_string(&body).unwrap();
+            assert!(!body_str.contains("GPU cluster"));
+            assert!(!body_str.contains("retry_after"));
+        }
+
+        #[tokio::test]
+        async fn test_error_sanitization_disabled_passes_through() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "gpt-4".to_string(),
+                pool(
+                    Target::builder()
+                        .url("https://api.openai.com".parse().unwrap())
+                        .onwards_key("sk-test".to_string())
+                        .sanitize_response(false)
+                        .build(),
+                ),
+            );
+
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            };
+
+            // Upstream returns 422 with provider-specific details
+            let upstream_error = r#"{"error": {"message": "provider-specific detail"}}"#;
+
+            let mock_client = MockHttpClient::new(StatusCode::UNPROCESSABLE_ENTITY, upstream_error);
+            let app_state = AppState::with_client(targets, mock_client)
+                .with_response_transform(create_openai_sanitizer());
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 422);
+
+            // When sanitization is disabled, upstream error body should pass through
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["message"], "provider-specific detail");
         }
     }
 }

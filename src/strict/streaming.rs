@@ -576,11 +576,12 @@ mod tests {
     use crate::strict::schemas::chat_completions::{
         ChunkChoice, ChunkDelta, ChunkFunctionCall, ChunkToolCall,
     };
+    use crate::strict::schemas::responses::Input;
 
     fn test_request(model: &str) -> ResponsesRequest {
         ResponsesRequest {
             model: model.to_string(),
-            input: None,
+            input: Input::Text(String::new()),
             instructions: None,
             previous_response_id: None,
             store: None,

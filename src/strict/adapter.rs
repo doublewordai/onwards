@@ -86,10 +86,8 @@ impl OpenResponsesAdapter {
         }
 
         // Convert input to messages
-        if let Some(ref input) = request.input {
-            let input_messages = input_to_messages(input)?;
-            messages.extend(input_messages);
-        }
+        let input_messages = input_to_messages(&request.input)?;
+        messages.extend(input_messages);
 
         // Convert tools
         let tools = request.tools.as_ref().map(|t| convert_tools(t));
@@ -445,15 +443,15 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
                 };
 
                 // Check if the last message is an assistant message we can add to
-                if let Some(last) = messages.last_mut() {
-                    if last.role == "assistant" {
-                        if let Some(ref mut calls) = last.tool_calls {
-                            calls.push(tool_call);
-                        } else {
-                            last.tool_calls = Some(vec![tool_call]);
-                        }
-                        continue;
+                if let Some(last) = messages.last_mut()
+                    && last.role == "assistant"
+                {
+                    if let Some(ref mut calls) = last.tool_calls {
+                        calls.push(tool_call);
+                    } else {
+                        last.tool_calls = Some(vec![tool_call]);
                     }
+                    continue;
                 }
 
                 // Otherwise create a new assistant message
@@ -481,7 +479,7 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
                 // They're model-internal and can't be fed back
                 debug!("Skipping reasoning item in conversion to messages");
             }
-            Item::Unknown => {
+            Item::Unknown(_) => {
                 warn!("Unknown item type encountered during conversion");
             }
         }
@@ -610,13 +608,13 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
                 description,
                 parameters,
                 strict,
-            } => name.as_ref().map(|n| ChatTool {
+            } => Some(ChatTool {
                 tool_type: "function".to_string(),
                 function: super::schemas::chat_completions::FunctionDefinition {
-                    name: n.clone(),
-                    description: description.clone(),
-                    parameters: parameters.clone(),
-                    strict: *strict,
+                    name: name.clone(),
+                    description: Some(description.clone()),
+                    parameters: Some(parameters.clone()),
+                    strict: Some(*strict),
                 },
             }),
             // Other tool types (code_interpreter, file_search, etc.) don't map to Chat Completions
@@ -778,7 +776,7 @@ mod tests {
 
         let request = ResponsesRequest {
             model: "gpt-4o".to_string(),
-            input: Some(Input::Text("Hello".to_string())),
+            input: Input::Text("Hello".to_string()),
             instructions: Some("Be helpful".to_string()),
             previous_response_id: None,
             store: None,
@@ -855,7 +853,7 @@ mod tests {
 
         let request = ResponsesRequest {
             model: "gpt-4o".to_string(),
-            input: Some(Input::Text("Hello".to_string())),
+            input: Input::Text("Hello".to_string()),
             stream: Some(true),
             instructions: None,
             previous_response_id: None,
@@ -888,7 +886,7 @@ mod tests {
 
         let request = ResponsesRequest {
             model: "gpt-4o".to_string(),
-            input: Some(Input::Text("Hello".to_string())),
+            input: Input::Text("Hello".to_string()),
             stream: None,
             instructions: None,
             previous_response_id: None,

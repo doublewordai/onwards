@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.1](https://github.com/doublewordai/onwards/compare/v0.15.0...v0.15.1) - 2026-02-18
+
+### Fixed
+
+- Set `enforce_http` to `false` to allow non-http URI schemes in `… ([#100](https://github.com/doublewordai/onwards/pull/100))
+
+### Other
+
+- *(deps)* update rust docker tag to v1.93.1 ([#85](https://github.com/doublewordai/onwards/pull/85))
+
+## [0.15.0](https://github.com/doublewordai/onwards/compare/v0.14.0...v0.15.0) - 2026-02-17
+
+### Added
+
+- *(strict-mode)* add trusted pools to bypass sanitization ([#88](https://github.com/doublewordai/onwards/pull/88))
+
+## [0.14.0](https://github.com/doublewordai/onwards/compare/v0.13.0...v0.14.0) - 2026-02-16
+
+### Added
+
+- improved connection pooling, reuse, holds idles, cleanups, timeouts ([#65](https://github.com/doublewordai/onwards/pull/65))
+
+## [0.13.0](https://github.com/doublewordai/onwards/compare/v0.12.0...v0.13.0) - 2026-02-16
+
+### Added
+
+- add with-replacement sampling for weighted random failover ([#93](https://github.com/doublewordai/onwards/pull/93))
+
+## [0.12.0](https://github.com/doublewordai/onwards/compare/v0.11.2...v0.12.0) - 2026-02-13
+
+### Added
+
+- add strict mode router with schema validation ([#78](https://github.com/doublewordai/onwards/pull/78))
+- openAI-style error sanitization ([#84](https://github.com/doublewordai/onwards/pull/84))
+
+### Other
+
+- *(deps)* update rust crate anyhow to v1.0.101 ([#81](https://github.com/doublewordai/onwards/pull/81))
+- *(deps)* update rust docker tag to v1.93.0 ([#63](https://github.com/doublewordai/onwards/pull/63))
+- *(deps)* update actions/checkout action to v6 ([#76](https://github.com/doublewordai/onwards/pull/76))
+- *(deps)* update rust crate hyper-util to v0.1.20 ([#70](https://github.com/doublewordai/onwards/pull/70))
+- *(deps)* update rust crate clap to v4.5.57 ([#66](https://github.com/doublewordai/onwards/pull/66))
+- *(deps)* update actions/upload-pages-artifact action to v4 ([#77](https://github.com/doublewordai/onwards/pull/77))
+- *(deps)* update rust crate bytes to v1.11.1 ([#72](https://github.com/doublewordai/onwards/pull/72))
+- replace monolithic README with mdBook documentation site ([#74](https://github.com/doublewordai/onwards/pull/74))
+
 ## [0.11.2](https://github.com/doublewordai/onwards/compare/v0.11.1...v0.11.2) - 2026-02-02
 
 ### Added
