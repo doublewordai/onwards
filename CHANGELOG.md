@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.2](https://github.com/doublewordai/onwards/compare/v0.15.1...v0.15.2) - 2026-02-19
+
+### Fixed
+
+- HttpConnector enforcing http test and SSE handling in strict mode ([#102](https://github.com/doublewordai/onwards/pull/102))
+
 ## [0.15.1](https://github.com/doublewordai/onwards/compare/v0.15.0...v0.15.1) - 2026-02-18
 
 ### Fixed
