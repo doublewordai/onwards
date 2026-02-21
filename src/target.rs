@@ -80,6 +80,13 @@ pub struct ProviderSpec {
     /// reading the full response body (which may be streamed over a longer period).
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+
+    /// Per-provider override for strict mode error sanitization trust.
+    /// When Some(true), error responses from this provider bypass sanitization.
+    /// When Some(false), error responses are sanitized even if the pool is trusted.
+    /// When None (default), inherits the pool-level `trusted` setting.
+    #[serde(default)]
+    pub trusted: Option<bool>,
 }
 
 /// Configuration for Open Responses API behavior
@@ -331,6 +338,7 @@ impl TargetSpecOrList {
                         sanitize_response: t.sanitize_response,
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
+                        trusted: None, // pool-level trusted handles this for legacy format
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -365,6 +373,7 @@ impl TargetSpecOrList {
                     sanitize_response: false, // Will be OR'd with pool-level setting
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
+                    trusted: None, // pool-level trusted handles this for single-provider format
                 };
                 Ok(PoolConfig {
                     keys,
@@ -420,6 +429,7 @@ impl From<TargetSpec> for Target {
             sanitize_response: value.sanitize_response,
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
+            trusted: None,
         }
     }
 }
@@ -447,6 +457,7 @@ impl From<ProviderSpec> for Target {
             sanitize_response: value.sanitize_response,
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
+            trusted: value.trusted,
         }
     }
 }
@@ -532,6 +543,9 @@ pub struct Target {
     /// Open Responses API configuration
     pub open_responses: Option<OpenResponsesConfig>,
     pub request_timeout_secs: Option<u64>,
+    /// Per-provider override for strict mode error sanitization trust.
+    /// None means inherit from the pool-level trusted setting.
+    pub trusted: Option<bool>,
 }
 
 impl Target {
@@ -1999,6 +2013,7 @@ mod tests {
                 sanitize_response: false,
                 open_responses: None,
                 request_timeout_secs: None,
+                trusted: None,
             }],
         };
 
@@ -2232,5 +2247,69 @@ mod tests {
             !pool.is_trusted(),
             "Pool without trusted flag should default to false"
         );
+    }
+
+    #[test]
+    fn test_provider_spec_trusted_defaults_to_none() {
+        let json = r#"{"url": "https://example.com"}"#;
+        let spec: ProviderSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.trusted, None);
+    }
+
+    #[test]
+    fn test_provider_spec_trusted_some_true() {
+        let json = r#"{"url": "https://example.com", "trusted": true}"#;
+        let spec: ProviderSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.trusted, Some(true));
+    }
+
+    #[test]
+    fn test_provider_spec_trusted_some_false() {
+        let json = r#"{"url": "https://example.com", "trusted": false}"#;
+        let spec: ProviderSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.trusted, Some(false));
+    }
+
+    #[test]
+    fn test_target_from_provider_spec_propagates_trusted() {
+        let spec: ProviderSpec = serde_json::from_str(
+            r#"{"url": "https://example.com", "trusted": true}"#,
+        ).unwrap();
+        let target: Target = spec.into();
+        assert_eq!(target.trusted, Some(true));
+    }
+
+    #[test]
+    fn test_target_from_provider_spec_trusted_none() {
+        let spec: ProviderSpec = serde_json::from_str(
+            r#"{"url": "https://example.com"}"#,
+        ).unwrap();
+        let target: Target = spec.into();
+        assert_eq!(target.trusted, None);
+    }
+
+    #[test]
+    fn test_per_provider_trusted_parsed_from_config() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "trusted": false,
+                    "providers": [
+                        {"url": "https://internal.example.com", "trusted": true},
+                        {"url": "https://external.example.com"}
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("gpt-4").unwrap();
+
+        assert!(!pool.is_trusted(), "Pool-level trusted should be false");
+
+        let providers = pool.providers();
+        assert_eq!(providers[0].target.trusted, Some(true), "First provider should have trusted=Some(true)");
+        assert_eq!(providers[1].target.trusted, None, "Second provider should have trusted=None (inherits pool)");
     }
 }

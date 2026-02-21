@@ -73,6 +73,7 @@ Settings specific to each provider:
 | `rate_limit` | Provider-specific rate limit |
 | `concurrency_limit` | Provider-specific concurrency limit |
 | `response_headers` | Provider-specific headers |
+| `trusted` | Override pool-level trust for strict mode error sanitization (`true`/`false`; omit to inherit from pool) |
 
 ## Examples
 
