@@ -17,7 +17,7 @@ use super::schemas::responses::{ResponsesRequest, ResponsesResponse};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::extract_model_from_request;
-use crate::handlers::target_message_handler;
+use crate::handlers::{ResolvedTrust, target_message_handler};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -26,6 +26,13 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
 use tracing::{debug, error};
+
+/// Result of forwarding a request to an upstream provider.
+/// Carries the response alongside the resolved trust level of the provider that handled it.
+struct ForwardResult {
+    response: Response,
+    trusted: bool,
+}
 
 /// Handler for GET /v1/models
 ///
@@ -69,30 +76,21 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
     };
 
-    // Check if this pool is trusted
-    // SECURITY: Use the same model resolution as routing (checks model-override header)
-    // to prevent bypass attacks where body has trusted pool but header routes to untrusted
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
-    let is_trusted = state
-        .targets
-        .targets
-        .get(&resolved_model)
-        .map(|pool| pool.is_trusted())
-        .unwrap_or(false);
-
-    let response = forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
+    let ForwardResult { response, trusted } =
+        forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
-    // Error responses are only sanitized for untrusted pools
+    // Error responses are only sanitized for untrusted providers
     if response.status().is_success() {
         if is_streaming {
             sanitize_streaming_chat_response(response, resolved_model).await
         } else {
             sanitize_chat_response(response, resolved_model).await
         }
-    } else if is_trusted {
-        debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
+    } else if trusted {
+        debug!(model = %resolved_model, "Bypassing error sanitization for trusted provider");
         response
     } else {
         sanitize_error_response(response).await
@@ -131,30 +129,21 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Check if this pool is trusted
-    // SECURITY: Use the same model resolution as routing (checks model-override header)
-    // to prevent bypass attacks where body has trusted pool but header routes to untrusted
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
-    let is_trusted = state
-        .targets
-        .targets
-        .get(&resolved_model)
-        .map(|pool| pool.is_trusted())
-        .unwrap_or(false);
-
-    let response = forward_request(state, headers, "/v1/responses", body_bytes).await;
+    let ForwardResult { response, trusted } =
+        forward_request(state, headers, "/v1/responses", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
-    // Error responses are only sanitized for untrusted pools
+    // Error responses are only sanitized for untrusted providers
     if response.status().is_success() {
         if is_streaming {
             sanitize_streaming_responses_response(response, resolved_model).await
         } else {
             sanitize_responses_response(response, resolved_model).await
         }
-    } else if is_trusted {
-        debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
+    } else if trusted {
+        debug!(model = %resolved_model, "Bypassing error sanitization for trusted provider");
         response
     } else {
         sanitize_error_response(response).await
@@ -190,26 +179,17 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Check if this pool is trusted
-    // SECURITY: Use the same model resolution as routing (checks model-override header)
-    // to prevent bypass attacks where body has trusted pool but header routes to untrusted
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
-    let is_trusted = state
-        .targets
-        .targets
-        .get(&resolved_model)
-        .map(|pool| pool.is_trusted())
-        .unwrap_or(false);
-
-    let response = forward_request(state, headers, "/v1/embeddings", body_bytes).await;
+    let ForwardResult { response, trusted } =
+        forward_request(state, headers, "/v1/embeddings", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
-    // Error responses are only sanitized for untrusted pools
+    // Error responses are only sanitized for untrusted providers
     if response.status().is_success() {
         sanitize_embeddings_response(response, resolved_model).await
-    } else if is_trusted {
-        debug!(model = %resolved_model, "Bypassing error sanitization for trusted pool");
+    } else if trusted {
+        debug!(model = %resolved_model, "Bypassing error sanitization for trusted provider");
         response
     } else {
         sanitize_error_response(response).await
@@ -222,7 +202,7 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
     mut headers: HeaderMap,
     path: &str,
     body_bytes: Vec<u8>,
-) -> Response {
+) -> ForwardResult {
     // Ensure content-type is set
     headers.insert(
         axum::http::header::CONTENT_TYPE,
@@ -241,19 +221,28 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
         Ok(req) => req,
         Err(e) => {
             error!(error = %e, "Failed to build request");
-            return error_response(
+            let response = error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "Failed to build request",
             );
+            return ForwardResult { response, trusted: false };
         }
     };
 
     // Use the existing target message handler
-    match target_message_handler(State(state), request).await {
+    let response = match target_message_handler(State(state), request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
-    }
+    };
+
+    let trusted = response
+        .extensions()
+        .get::<ResolvedTrust>()
+        .map(|t| t.0)
+        .unwrap_or(false);
+
+    ForwardResult { response, trusted }
 }
 
 /// Create an OpenAI-compatible error response
@@ -3410,6 +3399,150 @@ data: [DONE]
         assert!(
             !response_str.contains("\"provider_cost\""),
             "Trusted pool streaming success should still sanitize - metadata removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_trusted_overrides_untrusted_pool() {
+        // Pool is NOT trusted, but the provider IS trusted via per-provider override.
+        // Error response should pass through unchanged.
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .trusted(true) // provider is trusted
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false, // pool is NOT trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let error_body = r#"{"error": {"message": "provider specific error", "type": "rate_limit_error", "provider_trace": "trace-xyz"}}"#;
+        let mock_client = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, error_body);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            body_str.contains("provider_trace"),
+            "Provider-specific fields should pass through for trusted provider (even with untrusted pool)"
+        );
+        assert!(
+            body_str.contains("provider specific error"),
+            "Original provider message should pass through for trusted provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_provider_untrusted_overrides_trusted_pool() {
+        // Pool IS trusted, but the provider is explicitly NOT trusted.
+        // Error response should be sanitized.
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        let pool = ProviderPool::with_config(
+            vec![Provider {
+                target: Target::builder()
+                    .url("https://api.example.com".parse().unwrap())
+                    .trusted(false) // provider explicitly NOT trusted
+                    .build(),
+                weight: 1,
+            }],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // pool IS trusted
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let error_body = r#"{"error": {"message": "provider specific error", "type": "rate_limit_error", "provider_trace": "trace-xyz"}}"#;
+        let mock_client = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, error_body);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body =
+            r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = std::str::from_utf8(&body_bytes).unwrap();
+        assert!(
+            !body_str.contains("provider_trace"),
+            "Provider-specific fields should be stripped for explicitly untrusted provider (even with trusted pool)"
+        );
+        assert!(
+            !body_str.contains("provider specific error"),
+            "Original provider message should be stripped for explicitly untrusted provider"
+        );
+        assert!(
+            body_str.contains("Rate limit exceeded"),
+            "Sanitized standard message should be present"
         );
     }
 }
