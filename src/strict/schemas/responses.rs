@@ -589,7 +589,9 @@ pub struct ResponsesResponse {
     pub temperature: f32,
 
     /// Reasoning configuration (null if not used)
-    pub reasoning: Option<ReasoningConfig>,
+    /// Uses serde_json::Value to preserve null fields like `effort: null` and `summary: null`
+    /// that would otherwise be dropped by skip_serializing_if on the inner ReasoningConfig struct.
+    pub reasoning: serde_json::Value,
 
     /// Token usage (null if not available)
     pub usage: Option<ResponseUsage>,
@@ -617,6 +619,36 @@ pub struct ResponsesResponse {
 
     /// Prompt cache key (null if not set)
     pub prompt_cache_key: Option<String>,
+}
+
+/// A streaming event from POST /v1/responses with stream: true
+///
+/// All events share `type` and `sequence_number`. Response-level events
+/// (response.created, response.in_progress, response.completed, etc.) also
+/// carry a full `ResponsesResponse` under `response`. All other event-specific
+/// fields (item, delta, output_index, content_index, …) pass through via
+/// `#[serde(flatten)]`.
+///
+/// This is the Responses API analogue of `ChatCompletionChunk` for chat
+/// completions streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponsesStreamingEvent {
+    /// The event type, e.g. "response.created", "response.output_text.delta"
+    #[serde(rename = "type")]
+    pub event_type: String,
+
+    /// Monotonically increasing sequence number for ordering events
+    pub sequence_number: u64,
+
+    /// Full response snapshot — present only on response-level events
+    /// (response.created, response.in_progress, response.completed,
+    ///  response.failed, response.incomplete)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponsesResponse>,
+
+    /// Event-specific fields (item, delta, output_index, content_index, …)
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Response status
@@ -768,7 +800,7 @@ mod tests {
             frequency_penalty: 0.0,
             top_logprobs: 0,
             temperature: 1.0,
-            reasoning: None,
+            reasoning: serde_json::Value::Null,
             usage: Some(ResponseUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -986,5 +1018,149 @@ mod tests {
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
         assert!(request.tools.is_some());
+    }
+
+    #[test]
+    fn test_streaming_event_parses_response_created() {
+        // response.created carries a full ResponsesResponse under "response"
+        let json = r#"{
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_abc",
+                "object": "response",
+                "created_at": 1234567890,
+                "completed_at": null,
+                "status": "in_progress",
+                "incomplete_details": null,
+                "model": "gpt-4o-mini-2024-07-18",
+                "previous_response_id": null,
+                "instructions": null,
+                "output": [],
+                "error": null,
+                "tools": [],
+                "tool_choice": "auto",
+                "truncation": "disabled",
+                "parallel_tool_calls": true,
+                "text": {"format": {"type": "text"}},
+                "top_p": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "top_logprobs": 0,
+                "temperature": 1.0,
+                "reasoning": {"effort": null, "summary": null},
+                "usage": null,
+                "max_output_tokens": null,
+                "max_tool_calls": null,
+                "store": true,
+                "background": false,
+                "service_tier": "auto",
+                "metadata": {},
+                "safety_identifier": null,
+                "prompt_cache_key": null
+            }
+        }"#;
+
+        let event: ResponsesStreamingEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type, "response.created");
+        assert_eq!(event.sequence_number, 0);
+        let response = event.response.as_ref().unwrap();
+        assert_eq!(response.model, "gpt-4o-mini-2024-07-18");
+        // reasoning null fields must survive the roundtrip
+        assert_eq!(
+            response.reasoning,
+            serde_json::json!({"effort": null, "summary": null})
+        );
+    }
+
+    #[test]
+    fn test_streaming_event_model_rewrite_roundtrips() {
+        // Verify that rewriting response.model and re-serializing produces valid JSON
+        let json = r#"{
+            "type": "response.completed",
+            "sequence_number": 5,
+            "response": {
+                "id": "resp_xyz",
+                "object": "response",
+                "created_at": 1234567890,
+                "completed_at": 1234567891,
+                "status": "completed",
+                "incomplete_details": null,
+                "model": "gpt-4o-mini-2024-07-18",
+                "previous_response_id": null,
+                "instructions": null,
+                "output": [],
+                "error": null,
+                "tools": [],
+                "tool_choice": "auto",
+                "truncation": "disabled",
+                "parallel_tool_calls": true,
+                "text": {"format": {"type": "text"}},
+                "top_p": 1.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "top_logprobs": 0,
+                "temperature": 1.0,
+                "reasoning": {"effort": null, "summary": null},
+                "usage": null,
+                "max_output_tokens": null,
+                "max_tool_calls": null,
+                "store": true,
+                "background": false,
+                "service_tier": "default",
+                "metadata": {},
+                "safety_identifier": null,
+                "prompt_cache_key": null
+            }
+        }"#;
+
+        let mut event: ResponsesStreamingEvent = serde_json::from_str(json).unwrap();
+        event.response.as_mut().unwrap().model = "gpt-4o-mini".to_string();
+
+        let out = serde_json::to_string(&event).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(reparsed["type"], "response.completed");
+        assert_eq!(reparsed["sequence_number"], 5);
+        assert_eq!(reparsed["response"]["model"], "gpt-4o-mini");
+        // reasoning null fields must survive roundtrip through the typed struct
+        assert_eq!(
+            reparsed["response"]["reasoning"]["effort"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            reparsed["response"]["reasoning"]["summary"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn test_streaming_event_parses_delta_without_response() {
+        // response.output_text.delta has no "response" field — only event-specific fields
+        let json = r#"{
+            "type": "response.output_text.delta",
+            "sequence_number": 3,
+            "item_id": "msg_abc",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "Hello"
+        }"#;
+
+        let event: ResponsesStreamingEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.event_type, "response.output_text.delta");
+        assert_eq!(event.sequence_number, 3);
+        assert!(event.response.is_none());
+        // event-specific fields pass through via flatten
+        assert_eq!(event.extra["delta"], "Hello");
+        assert_eq!(event.extra["item_id"], "msg_abc");
+    }
+
+    #[test]
+    fn test_streaming_event_rejects_missing_required_fields() {
+        // Events missing type or sequence_number should fail to parse
+        let no_type = r#"{"sequence_number": 0, "delta": "hi"}"#;
+        assert!(serde_json::from_str::<ResponsesStreamingEvent>(no_type).is_err());
+
+        let no_seq = r#"{"type": "response.output_text.delta", "delta": "hi"}"#;
+        assert!(serde_json::from_str::<ResponsesStreamingEvent>(no_seq).is_err());
     }
 }
