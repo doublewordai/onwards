@@ -195,7 +195,7 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => pool,
+        Some(pool) => pool.clone(),
         None => {
             debug!("No target found for model: {}", model_name);
             record_response_status(404);
@@ -274,10 +274,8 @@ pub async fn target_message_handler<T: HttpClient>(
                             "Routing rule redirecting from '{}' to '{}' with labels {:?}",
                             model_name, redirect_alias, labels
                         );
-                        // Drop current pool ref before looking up redirect target
-                        drop(pool);
                         pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p,
+                            Some(p) => p.clone(),
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());

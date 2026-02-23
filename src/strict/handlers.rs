@@ -237,7 +237,7 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
 ) -> bool {
     // Get the pool for this model
     let pool = match state.targets.targets.get(model) {
-        Some(pool) => pool,
+        Some(pool) => pool.clone(),
         None => {
             debug!(model = %model, "No target found, cannot determine adapter setting");
             return false;
