@@ -372,7 +372,8 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         };
 
         // Check if the response requires tool action
-        if OpenResponsesAdapter::requires_tool_action(&chat_response) && iteration < max_iterations {
+        if OpenResponsesAdapter::requires_tool_action(&chat_response) && iteration < max_iterations
+        {
             debug!("Response requires tool action");
 
             // Extract tool calls
@@ -787,7 +788,10 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
                 "server_error",
                 "Failed to build request",
             );
-            return ForwardResult { response, trusted: false };
+            return ForwardResult {
+                response,
+                trusted: false,
+            };
         }
     };
 
@@ -4044,8 +4048,7 @@ mod tests {
         let state = crate::AppState::with_client(targets, mock_client);
         let router = crate::strict::build_strict_router(state);
 
-        let request_body =
-            r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
+        let request_body = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -4114,8 +4117,7 @@ mod tests {
         let state = crate::AppState::with_client(targets, mock_client);
         let router = crate::strict::build_strict_router(state);
 
-        let request_body =
-            r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
+        let request_body = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")

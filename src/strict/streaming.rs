@@ -18,10 +18,11 @@
 
 use super::schemas::chat_completions::{ChatCompletionChunk, ChunkChoice};
 use super::schemas::responses::{
-    ContentPart, Item, ItemStatus, MessageContent, MessageItem, ResponseStatus, ResponseUsage,
-    ResponsesRequest, ResponsesResponse, TextConfig, TextFormat, TruncationStrategy,
+    ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent, MessageItem, ResponseStatus,
+    ResponseUsage, ResponsesRequest, ResponsesResponse, TextConfig, TextFormat, TruncationStrategy,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// State machine for tracking streaming response state
@@ -33,7 +34,7 @@ pub struct StreamingState {
     model: String,
     /// Creation timestamp
     created_at: u64,
-    /// Current iteration's output items being built
+    /// Current iteration's output items being built (message items and function call items)
     items: Vec<StreamingItem>,
     /// Items from previous tool-loop iterations (already emitted to client)
     completed_items: Vec<StreamingItem>,
@@ -47,25 +48,35 @@ pub struct StreamingState {
     usage: Option<ResponseUsage>,
     /// Original request parameters (for echoing back in response.completed)
     request: ResponsesRequest,
+    /// Maps choice_index → items-vec index for message items
+    msg_item_for_choice: HashMap<usize, usize>,
+    /// Maps (choice_index, tc_index) → items-vec index for function call items
+    fn_call_item_for: HashMap<(usize, usize), usize>,
+}
+
+/// The inner content of a streaming output item
+#[derive(Debug, Clone)]
+enum StreamingItemKind {
+    Message {
+        role: String,
+        content_text: String,
+        content_part_started: bool,
+        /// Tracks the current content part index (always 0 today; reserved for future multi-part)
+        content_index: u32,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        arguments: String,
+    },
 }
 
 /// A streaming item being built incrementally
 #[derive(Debug, Clone)]
 struct StreamingItem {
     id: String,
-    role: String,
-    content_text: String,
-    tool_calls: Vec<StreamingToolCall>,
     status: ItemStatus,
-    content_part_started: bool,
-}
-
-/// A streaming tool call being built
-#[derive(Debug, Clone)]
-struct StreamingToolCall {
-    id: String,
-    name: String,
-    arguments: String,
+    kind: StreamingItemKind,
 }
 
 /// Generate a unique response ID using timestamp and random component
@@ -104,6 +115,8 @@ impl StreamingState {
             started: false,
             usage: None,
             request: request.clone(),
+            msg_item_for_choice: HashMap::new(),
+            fn_call_item_for: HashMap::new(),
         }
     }
 
@@ -141,7 +154,7 @@ impl StreamingState {
         // Check for finish_reason to emit done events
         for choice in &chunk.choices {
             if choice.finish_reason.is_some() {
-                let done_events = self.finalize_item(choice.index as usize);
+                let done_events = self.finalize_for_choice(choice.index as usize);
                 events.extend(done_events);
             }
         }
@@ -173,9 +186,22 @@ impl StreamingState {
     pub fn extract_tool_calls(&self) -> Vec<(String, String, String)> {
         self.items
             .iter()
-            .flat_map(|item| &item.tool_calls)
-            .filter(|tc| !tc.id.is_empty())
-            .map(|tc| (tc.id.clone(), tc.name.clone(), tc.arguments.clone()))
+            .filter_map(|item| {
+                if let StreamingItemKind::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } = &item.kind
+                {
+                    if !call_id.is_empty() {
+                        Some((call_id.clone(), name.clone(), arguments.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
@@ -187,115 +213,189 @@ impl StreamingState {
     pub fn prepare_next_iteration(&mut self) {
         self.item_index_offset += self.items.len();
         self.completed_items.append(&mut self.items);
+        self.msg_item_for_choice.clear();
+        self.fn_call_item_for.clear();
     }
 
     /// Process a single choice from a chunk
     fn process_choice(&mut self, choice: &ChunkChoice) -> Vec<StreamingEvent> {
         let mut events = Vec::new();
-        let index = choice.index as usize;
-
-        // Ensure we have an item for this index
-        while self.items.len() <= index {
-            let item = StreamingItem {
-                id: format!("item_{}", self.item_index_offset + self.items.len()),
-                role: String::new(),
-                content_text: String::new(),
-                tool_calls: Vec::new(),
-                status: ItemStatus::InProgress,
-                content_part_started: false,
-            };
-            self.items.push(item);
-
-            // Emit output_item.added for new items
-            events.push(self.create_item_added_event(self.items.len() - 1));
-        }
-
-        // Process delta and collect what events to emit
+        let choice_index = choice.index as usize;
         let delta = &choice.delta;
+
+        // --- Message item (text content / role) ---
         let mut emit_content_part_added = false;
         let mut emit_text_delta: Option<String> = None;
 
-        // Handle role (usually in first chunk)
-        if let Some(ref role) = delta.role {
-            self.items[index].role = role.clone();
-        }
+        let has_role = delta.role.is_some();
+        let has_content = delta
+            .content
+            .as_ref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
 
-        // Handle content delta
-        if let Some(ref content) = delta.content {
-            if !self.items[index].content_part_started && !content.is_empty() {
-                self.items[index].content_part_started = true;
-                emit_content_part_added = true;
+        if has_role || has_content {
+            // Find or create the message item for this choice
+            let msg_idx = if let Some(&idx) = self.msg_item_for_choice.get(&choice_index) {
+                idx
+            } else {
+                let idx = self.items.len();
+                let item = StreamingItem {
+                    id: format!("item_{}", self.item_index_offset + idx),
+                    status: ItemStatus::InProgress,
+                    kind: StreamingItemKind::Message {
+                        role: String::new(),
+                        content_text: String::new(),
+                        content_part_started: false,
+                        content_index: 0,
+                    },
+                };
+                self.items.push(item);
+                self.msg_item_for_choice.insert(choice_index, idx);
+                events.push(self.create_item_added_event(idx));
+                idx
+            };
+
+            if let StreamingItemKind::Message {
+                role,
+                content_text,
+                content_part_started,
+                ..
+            } = &mut self.items[msg_idx].kind
+            {
+                if let Some(ref r) = delta.role {
+                    *role = r.clone();
+                }
+                if let Some(ref content) = delta.content
+                    && !content.is_empty()
+                {
+                    if !*content_part_started {
+                        *content_part_started = true;
+                        emit_content_part_added = true;
+                    }
+                    content_text.push_str(content);
+                    emit_text_delta = Some(content.clone());
+                }
             }
 
-            if !content.is_empty() {
-                self.items[index].content_text.push_str(content);
-                emit_text_delta = Some(content.clone());
+            if emit_content_part_added {
+                events.push(self.create_content_part_added_event(msg_idx));
+            }
+            if let Some(ref text) = emit_text_delta {
+                events.push(self.create_text_delta_event(msg_idx, text));
             }
         }
 
-        // Handle tool calls
+        // --- Function call items ---
         if let Some(ref tool_calls) = delta.tool_calls {
             for tc in tool_calls {
                 let tc_index = tc.index as usize;
+                let key = (choice_index, tc_index);
 
-                // Ensure we have a tool call entry
-                while self.items[index].tool_calls.len() <= tc_index {
-                    self.items[index].tool_calls.push(StreamingToolCall {
-                        id: String::new(),
-                        name: String::new(),
-                        arguments: String::new(),
-                    });
+                // Find or create the function call item
+                let fc_idx = if let Some(&idx) = self.fn_call_item_for.get(&key) {
+                    idx
+                } else {
+                    let idx = self.items.len();
+                    let item = StreamingItem {
+                        id: format!("item_{}", self.item_index_offset + idx),
+                        status: ItemStatus::InProgress,
+                        kind: StreamingItemKind::FunctionCall {
+                            call_id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        },
+                    };
+                    self.items.push(item);
+                    self.fn_call_item_for.insert(key, idx);
+                    events.push(self.create_item_added_event(idx));
+                    idx
+                };
+
+                // Collect mutations and events to emit
+                let mut emit_args_delta: Option<String> = None;
+
+                if let StreamingItemKind::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } = &mut self.items[fc_idx].kind
+                {
+                    if let Some(ref id) = tc.id {
+                        *call_id = id.clone();
+                    }
+                    if let Some(ref func) = tc.function {
+                        if let Some(ref n) = func.name {
+                            *name = n.clone();
+                        }
+                        if let Some(ref args) = func.arguments
+                            && !args.is_empty()
+                        {
+                            arguments.push_str(args);
+                            emit_args_delta = Some(args.clone());
+                        }
+                    }
                 }
 
-                // Update tool call fields
-                if let Some(ref id) = tc.id {
-                    self.items[index].tool_calls[tc_index].id = id.clone();
-                }
-                if let Some(ref func) = tc.function {
-                    if let Some(ref name) = func.name {
-                        self.items[index].tool_calls[tc_index].name = name.clone();
-                    }
-                    if let Some(ref args) = func.arguments {
-                        self.items[index].tool_calls[tc_index]
-                            .arguments
-                            .push_str(args);
-                    }
+                if let Some(delta) = emit_args_delta {
+                    events.push(self.create_fn_call_arguments_delta_event(fc_idx, &delta));
                 }
             }
-        }
-
-        // Now emit collected events (no longer holding mutable borrow of items)
-        if emit_content_part_added {
-            events.push(self.create_content_part_added_event(index));
-        }
-        if let Some(ref delta_text) = emit_text_delta {
-            events.push(self.create_text_delta_event(index, delta_text));
         }
 
         events
     }
 
-    /// Finalize an item and emit done events
-    fn finalize_item(&mut self, index: usize) -> Vec<StreamingEvent> {
+    /// Finalize all items associated with a choice and emit done events
+    fn finalize_for_choice(&mut self, choice_index: usize) -> Vec<StreamingEvent> {
+        let mut indices: Vec<usize> = Vec::new();
+        if let Some(&idx) = self.msg_item_for_choice.get(&choice_index) {
+            indices.push(idx);
+        }
+        // Collect fn call indices for this choice
+        let fc_indices: Vec<usize> = self
+            .fn_call_item_for
+            .iter()
+            .filter(|((ci, _), _)| *ci == choice_index)
+            .map(|(_, &idx)| idx)
+            .collect();
+        indices.extend(fc_indices);
+        indices.sort_unstable();
+
         let mut events = Vec::new();
+        for idx in indices {
+            events.extend(self.finalize_item(idx));
+        }
+        events
+    }
 
-        if index < self.items.len() {
-            let item = &mut self.items[index];
+    /// Finalize a single item by index and emit done events
+    fn finalize_item(&mut self, index: usize) -> Vec<StreamingEvent> {
+        if index >= self.items.len() || self.items[index].status != ItemStatus::InProgress {
+            return vec![];
+        }
+        self.items[index].status = ItemStatus::Completed;
 
-            if item.status == ItemStatus::InProgress {
-                item.status = ItemStatus::Completed;
-
-                // Emit content_part.done if we had content
-                if item.content_part_started {
+        match &self.items[index].kind {
+            StreamingItemKind::Message {
+                content_part_started,
+                ..
+            } => {
+                let had_content = *content_part_started;
+                let mut events = Vec::new();
+                if had_content {
                     events.push(self.create_content_part_done_event(index));
                 }
-
-                // Emit output_item.done
                 events.push(self.create_item_done_event(index));
+                events
+            }
+            StreamingItemKind::FunctionCall { .. } => {
+                vec![
+                    self.create_fn_call_arguments_done_event(index),
+                    self.create_item_done_event(index),
+                ]
             }
         }
-
-        events
     }
 
     fn next_sequence(&mut self) -> u32 {
@@ -316,32 +416,49 @@ impl StreamingState {
 
     fn create_item_added_event(&mut self, index: usize) -> StreamingEvent {
         let item = &self.items[index];
+        let output_index = (self.item_index_offset + index) as u32;
+        let output_item = match &item.kind {
+            StreamingItemKind::Message { role, .. } => Item::Message(MessageItem {
+                id: Some(item.id.clone()),
+                role: if role.is_empty() {
+                    "assistant".to_string()
+                } else {
+                    role.clone()
+                },
+                content: MessageContent::Parts(vec![]),
+                status: Some(ItemStatus::InProgress),
+            }),
+            StreamingItemKind::FunctionCall { call_id, name, .. } => {
+                Item::FunctionCall(FunctionCallItem {
+                    id: Some(item.id.clone()),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                    status: Some(ItemStatus::InProgress),
+                })
+            }
+        };
         StreamingEvent {
             event_type: "response.output_item.added".to_string(),
             data: StreamingEventData::OutputItemAdded {
-                output_index: (self.item_index_offset + index) as u32,
-                item: Item::Message(MessageItem {
-                    id: Some(item.id.clone()),
-                    role: if item.role.is_empty() {
-                        "assistant".to_string()
-                    } else {
-                        item.role.clone()
-                    },
-                    content: MessageContent::Parts(vec![]),
-                    status: Some(ItemStatus::InProgress),
-                }),
+                output_index,
+                item: output_item,
             },
             sequence_number: self.next_sequence(),
         }
     }
 
     fn create_content_part_added_event(&mut self, index: usize) -> StreamingEvent {
+        let content_index = match &self.items[index].kind {
+            StreamingItemKind::Message { content_index, .. } => *content_index,
+            StreamingItemKind::FunctionCall { .. } => 0,
+        };
         StreamingEvent {
             event_type: "response.content_part.added".to_string(),
             data: StreamingEventData::ContentPartAdded {
                 item_id: self.items[index].id.clone(),
                 output_index: (self.item_index_offset + index) as u32,
-                content_index: 0,
+                content_index,
                 part: ContentPart::OutputText {
                     text: String::new(),
                     annotations: vec![],
@@ -353,12 +470,16 @@ impl StreamingState {
     }
 
     fn create_text_delta_event(&mut self, index: usize, delta: &str) -> StreamingEvent {
+        let content_index = match &self.items[index].kind {
+            StreamingItemKind::Message { content_index, .. } => *content_index,
+            StreamingItemKind::FunctionCall { .. } => 0,
+        };
         StreamingEvent {
             event_type: "response.output_text.delta".to_string(),
             data: StreamingEventData::OutputTextDelta {
                 item_id: self.items[index].id.clone(),
                 output_index: (self.item_index_offset + index) as u32,
-                content_index: 0,
+                content_index,
                 delta: delta.to_string(),
                 logprobs: vec![],
             },
@@ -367,15 +488,22 @@ impl StreamingState {
     }
 
     fn create_content_part_done_event(&mut self, index: usize) -> StreamingEvent {
-        let item = &self.items[index];
+        let (content_text, content_index) = match &self.items[index].kind {
+            StreamingItemKind::Message {
+                content_text,
+                content_index,
+                ..
+            } => (content_text.clone(), *content_index),
+            StreamingItemKind::FunctionCall { .. } => (String::new(), 0),
+        };
         StreamingEvent {
             event_type: "response.content_part.done".to_string(),
             data: StreamingEventData::ContentPartDone {
-                item_id: item.id.clone(),
+                item_id: self.items[index].id.clone(),
                 output_index: (self.item_index_offset + index) as u32,
-                content_index: 0,
+                content_index,
                 part: ContentPart::OutputText {
-                    text: item.content_text.clone(),
+                    text: content_text,
                     annotations: vec![],
                     logprobs: vec![],
                 },
@@ -386,24 +514,73 @@ impl StreamingState {
 
     fn create_item_done_event(&mut self, index: usize) -> StreamingEvent {
         let item = &self.items[index];
+        let output_index = (self.item_index_offset + index) as u32;
+        let output_item = match &item.kind {
+            StreamingItemKind::Message {
+                role, content_text, ..
+            } => Item::Message(MessageItem {
+                id: Some(item.id.clone()),
+                role: if role.is_empty() {
+                    "assistant".to_string()
+                } else {
+                    role.clone()
+                },
+                content: MessageContent::Parts(vec![ContentPart::OutputText {
+                    text: content_text.clone(),
+                    annotations: vec![],
+                    logprobs: vec![],
+                }]),
+                status: Some(ItemStatus::Completed),
+            }),
+            StreamingItemKind::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => Item::FunctionCall(FunctionCallItem {
+                id: Some(item.id.clone()),
+                call_id: call_id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+                status: Some(ItemStatus::Completed),
+            }),
+        };
         StreamingEvent {
             event_type: "response.output_item.done".to_string(),
             data: StreamingEventData::OutputItemDone {
+                output_index,
+                item: output_item,
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_fn_call_arguments_delta_event(
+        &mut self,
+        index: usize,
+        delta: &str,
+    ) -> StreamingEvent {
+        StreamingEvent {
+            event_type: "response.function_call_arguments.delta".to_string(),
+            data: StreamingEventData::FunctionCallArgumentsDelta {
+                item_id: self.items[index].id.clone(),
                 output_index: (self.item_index_offset + index) as u32,
-                item: Item::Message(MessageItem {
-                    id: Some(item.id.clone()),
-                    role: if item.role.is_empty() {
-                        "assistant".to_string()
-                    } else {
-                        item.role.clone()
-                    },
-                    content: MessageContent::Parts(vec![ContentPart::OutputText {
-                        text: item.content_text.clone(),
-                        annotations: vec![],
-                        logprobs: vec![],
-                    }]),
-                    status: Some(ItemStatus::Completed),
-                }),
+                delta: delta.to_string(),
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_fn_call_arguments_done_event(&mut self, index: usize) -> StreamingEvent {
+        let arguments = match &self.items[index].kind {
+            StreamingItemKind::FunctionCall { arguments, .. } => arguments.clone(),
+            StreamingItemKind::Message { .. } => String::new(),
+        };
+        StreamingEvent {
+            event_type: "response.function_call_arguments.done".to_string(),
+            data: StreamingEventData::FunctionCallArgumentsDone {
+                item_id: self.items[index].id.clone(),
+                output_index: (self.item_index_offset + index) as u32,
+                arguments,
             },
             sequence_number: self.next_sequence(),
         }
@@ -472,8 +649,7 @@ impl StreamingState {
             frequency_penalty: 0.0,
             top_logprobs: 0,
             temperature: req.temperature.unwrap_or(1.0),
-            reasoning: serde_json::to_value(&req.reasoning)
-                .unwrap_or(serde_json::Value::Null),
+            reasoning: serde_json::to_value(&req.reasoning).unwrap_or(serde_json::Value::Null),
             usage,
             max_output_tokens: req.max_output_tokens,
             max_tool_calls: None,
@@ -492,21 +668,34 @@ impl StreamingState {
             .completed_items
             .iter()
             .chain(self.items.iter())
-            .map(|item| {
-                Item::Message(MessageItem {
+            .map(|item| match &item.kind {
+                StreamingItemKind::Message {
+                    role, content_text, ..
+                } => Item::Message(MessageItem {
                     id: Some(item.id.clone()),
-                    role: if item.role.is_empty() {
+                    role: if role.is_empty() {
                         "assistant".to_string()
                     } else {
-                        item.role.clone()
+                        role.clone()
                     },
                     content: MessageContent::Parts(vec![ContentPart::OutputText {
-                        text: item.content_text.clone(),
+                        text: content_text.clone(),
                         annotations: vec![],
                         logprobs: vec![],
                     }]),
                     status: Some(item.status),
-                })
+                }),
+                StreamingItemKind::FunctionCall {
+                    call_id,
+                    name,
+                    arguments,
+                } => Item::FunctionCall(FunctionCallItem {
+                    id: Some(item.id.clone()),
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    status: Some(item.status),
+                }),
             })
             .collect();
 
@@ -568,6 +757,16 @@ pub enum StreamingEventData {
     OutputItemDone {
         output_index: u32,
         item: Item,
+    },
+    FunctionCallArgumentsDelta {
+        item_id: String,
+        output_index: u32,
+        delta: String,
+    },
+    FunctionCallArgumentsDone {
+        item_id: String,
+        output_index: u32,
+        arguments: String,
     },
     ResponseCompleted {
         response: ResponsesResponse,

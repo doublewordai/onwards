@@ -190,8 +190,7 @@ impl OpenResponsesAdapter {
             frequency_penalty: 0.0,
             top_logprobs: 0,
             temperature: request.temperature.unwrap_or(1.0),
-            reasoning: serde_json::to_value(&request.reasoning)
-                .unwrap_or(serde_json::Value::Null),
+            reasoning: serde_json::to_value(&request.reasoning).unwrap_or(serde_json::Value::Null),
             usage: chat_response.usage.as_ref().map(|u| ResponseUsage {
                 input_tokens: u.prompt_tokens,
                 output_tokens: u.completion_tokens,

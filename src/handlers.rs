@@ -743,7 +743,9 @@ pub async fn target_message_handler<T: HttpClient>(
             state.targets.strict_mode
         );
         let resolved_trust = target.trusted.unwrap_or_else(|| pool.is_trusted());
-        response.extensions_mut().insert(ResolvedTrust(resolved_trust));
+        response
+            .extensions_mut()
+            .insert(ResolvedTrust(resolved_trust));
         return Ok(response);
     }
 

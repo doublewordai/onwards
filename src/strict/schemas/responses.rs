@@ -1067,7 +1067,10 @@ mod tests {
         let response = event.response.as_ref().unwrap();
         assert_eq!(response.model, "gpt-4o-mini-2024-07-18");
         // reasoning null fields must survive the roundtrip
-        assert_eq!(response.reasoning, serde_json::json!({"effort": null, "summary": null}));
+        assert_eq!(
+            response.reasoning,
+            serde_json::json!({"effort": null, "summary": null})
+        );
     }
 
     #[test]
@@ -1120,8 +1123,14 @@ mod tests {
         assert_eq!(reparsed["sequence_number"], 5);
         assert_eq!(reparsed["response"]["model"], "gpt-4o-mini");
         // reasoning null fields must survive roundtrip through the typed struct
-        assert_eq!(reparsed["response"]["reasoning"]["effort"], serde_json::Value::Null);
-        assert_eq!(reparsed["response"]["reasoning"]["summary"], serde_json::Value::Null);
+        assert_eq!(
+            reparsed["response"]["reasoning"]["effort"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            reparsed["response"]["reasoning"]["summary"],
+            serde_json::Value::Null
+        );
     }
 
     #[test]

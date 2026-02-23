@@ -2272,18 +2272,15 @@ mod tests {
 
     #[test]
     fn test_target_from_provider_spec_propagates_trusted() {
-        let spec: ProviderSpec = serde_json::from_str(
-            r#"{"url": "https://example.com", "trusted": true}"#,
-        ).unwrap();
+        let spec: ProviderSpec =
+            serde_json::from_str(r#"{"url": "https://example.com", "trusted": true}"#).unwrap();
         let target: Target = spec.into();
         assert_eq!(target.trusted, Some(true));
     }
 
     #[test]
     fn test_target_from_provider_spec_trusted_none() {
-        let spec: ProviderSpec = serde_json::from_str(
-            r#"{"url": "https://example.com"}"#,
-        ).unwrap();
+        let spec: ProviderSpec = serde_json::from_str(r#"{"url": "https://example.com"}"#).unwrap();
         let target: Target = spec.into();
         assert_eq!(target.trusted, None);
     }
@@ -2309,7 +2306,14 @@ mod tests {
         assert!(!pool.is_trusted(), "Pool-level trusted should be false");
 
         let providers = pool.providers();
-        assert_eq!(providers[0].target.trusted, Some(true), "First provider should have trusted=Some(true)");
-        assert_eq!(providers[1].target.trusted, None, "Second provider should have trusted=None (inherits pool)");
+        assert_eq!(
+            providers[0].target.trusted,
+            Some(true),
+            "First provider should have trusted=Some(true)"
+        );
+        assert_eq!(
+            providers[1].target.trusted, None,
+            "Second provider should have trusted=None (inherits pool)"
+        );
     }
 }
