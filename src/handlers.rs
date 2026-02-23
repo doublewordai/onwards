@@ -195,7 +195,7 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     let pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => pool,
+        Some(pool) => pool.clone(),
         None => {
             debug!("No target found for model: {}", model_name);
             record_response_status(404);
