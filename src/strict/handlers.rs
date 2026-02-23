@@ -372,11 +372,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         };
 
         // Check if the response requires tool action
-        if adapter.requires_tool_action(&chat_response) && iteration < max_iterations {
+        if OpenResponsesAdapter::requires_tool_action(&chat_response) && iteration < max_iterations {
             debug!("Response requires tool action");
 
             // Extract tool calls
-            let tool_calls = adapter.extract_tool_calls(&chat_response);
+            let tool_calls = OpenResponsesAdapter::extract_tool_calls(&chat_response);
             debug!(tool_count = tool_calls.len(), "Extracted tool calls");
 
             // Execute tool calls
@@ -418,7 +418,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
             // Get the assistant message from the response
             if let Some(choice) = chat_response.choices.first() {
-                adapter.add_tool_results_to_messages(
+                OpenResponsesAdapter::add_tool_results_to_messages(
                     &mut chat_request.messages,
                     &choice.message,
                     &results,
@@ -648,7 +648,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     extra: None,
                 };
 
-                adapter.add_tool_results_to_messages(&mut messages, &assistant_msg, &results);
+                OpenResponsesAdapter::add_tool_results_to_messages(&mut messages, &assistant_msg, &results);
 
                 // Advance the streaming state so new items get fresh indices.
                 streaming_state.prepare_next_iteration();

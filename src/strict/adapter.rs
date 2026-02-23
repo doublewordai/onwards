@@ -226,7 +226,7 @@ impl OpenResponsesAdapter {
     }
 
     /// Check if a response requires tool execution
-    pub fn requires_tool_action(&self, response: &ChatCompletionResponse) -> bool {
+    pub fn requires_tool_action(response: &ChatCompletionResponse) -> bool {
         response
             .choices
             .first()
@@ -235,7 +235,7 @@ impl OpenResponsesAdapter {
     }
 
     /// Extract tool calls from a response that require execution
-    pub fn extract_tool_calls(&self, response: &ChatCompletionResponse) -> Vec<PendingToolCall> {
+    pub fn extract_tool_calls(response: &ChatCompletionResponse) -> Vec<PendingToolCall> {
         response
             .choices
             .iter()
@@ -302,7 +302,6 @@ impl OpenResponsesAdapter {
 
     /// Add tool results to messages for the next iteration
     pub fn add_tool_results_to_messages(
-        &self,
         messages: &mut Vec<ChatMessage>,
         assistant_message: &ChatMessage,
         results: &[ToolCallResult],
