@@ -1,8 +1,6 @@
 name: Rust Test and Docker Build
 
 on:
-  push:
-    branches: [ main ]
   pull_request:
     branches: [ main ]
 
@@ -44,5 +42,4 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ghcr.io/${{ github.repository }}:latest
-
+          tags: ghcr.io/${{ github.repository }}:sha-${{ github.event.pull_request.head.sha }}
