@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::Target;
+use crate::target::{RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -194,7 +194,7 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let pool = match state.targets.targets.get(&model_name) {
+    let mut pool = match state.targets.targets.get(&model_name) {
         Some(pool) => pool.clone(),
         None => {
             debug!("No target found for model: {}", model_name);
@@ -240,6 +240,56 @@ pub async fn target_message_handler<T: HttpClient>(
             "Pool '{}' has no keys configured - allowing request",
             model_name
         );
+    }
+
+    // Evaluate routing rules against key labels (after auth, before rate limiting).
+    // Rules on the pool are matched against the authenticated key's labels.
+    // Note: routing rules are NOT re-evaluated on the redirect target pool.
+    if !pool.routing_rules().is_empty() {
+        if let Some(token) = bearer_token {
+            let labels = state
+                .targets
+                .key_labels
+                .get(token)
+                .map(|r| r.value().clone())
+                .unwrap_or_default();
+
+            // Clone the action to release the borrow on pool before potentially reassigning it
+            let action = pool.evaluate_routing_rules(&labels).cloned();
+
+            if let Some(action) = action {
+                match action {
+                    RoutingAction::Deny => {
+                        debug!(
+                            "Routing rule denied request for model '{}' with labels {:?}",
+                            model_name, labels
+                        );
+                        record_response_status(403);
+                        return Err(OnwardsErrorResponse::forbidden());
+                    }
+                    RoutingAction::Redirect {
+                        target: ref redirect_alias,
+                    } => {
+                        debug!(
+                            "Routing rule redirecting from '{}' to '{}' with labels {:?}",
+                            model_name, redirect_alias, labels
+                        );
+                        pool = match state.targets.targets.get(redirect_alias) {
+                            Some(p) => p.clone(),
+                            None => {
+                                debug!("Redirect target '{}' not found", redirect_alias);
+                                return Err(OnwardsErrorResponse::bad_gateway());
+                            }
+                        };
+                        if pool.is_empty() {
+                            debug!("Redirect target pool '{}' has no providers", redirect_alias);
+                            return Err(OnwardsErrorResponse::bad_gateway());
+                        }
+                    }
+                }
+            }
+        }
+        // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
     // Check pool-level rate limit before selecting a provider
@@ -1536,6 +1586,7 @@ mod tests {
                 targets: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             },
@@ -1609,6 +1660,7 @@ mod tests {
             fallback_config,
             LoadBalanceStrategy::Priority,
             false,
+            Vec::new(),
         );
 
         assert!(pool.fallback_enabled(), "Fallback should be enabled");

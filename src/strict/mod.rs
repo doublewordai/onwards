@@ -106,6 +106,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -130,6 +131,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -297,6 +299,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -383,6 +386,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -468,6 +472,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };

@@ -1402,6 +1402,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1481,6 +1482,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1541,6 +1543,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1598,6 +1601,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1650,6 +1654,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1719,6 +1724,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1777,6 +1783,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1842,6 +1849,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1901,6 +1909,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -1955,6 +1964,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2044,6 +2054,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2122,6 +2133,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2185,6 +2197,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2301,6 +2314,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2381,6 +2395,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2459,6 +2474,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -2466,6 +2482,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2569,6 +2586,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -2576,6 +2594,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2666,6 +2685,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -2673,6 +2693,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2770,6 +2791,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4o-mini".to_string(), pool);
 
@@ -2777,6 +2799,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2857,6 +2880,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("text-embedding-ada-002".to_string(), pool);
 
@@ -2864,6 +2888,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -2950,6 +2975,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4o-mini".to_string(), pool);
 
@@ -2957,6 +2983,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3068,6 +3095,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("text-embedding-ada-002".to_string(), pool);
 
@@ -3075,6 +3103,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3161,6 +3190,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3254,6 +3284,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3318,6 +3349,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3387,6 +3419,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3493,6 +3526,7 @@ mod tests {
             targets,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3608,6 +3642,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true, // Strict mode enabled
             http_pool_config: None,
         };
@@ -3708,6 +3743,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3808,6 +3844,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("trusted-pool".to_string(), trusted_pool);
 
@@ -3826,6 +3863,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             false, // NOT trusted
+            Vec::new(),
         );
         targets_map.insert("untrusted-pool".to_string(), untrusted_pool);
 
@@ -3833,6 +3871,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -3946,6 +3985,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // Mark pool as trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -3953,6 +3993,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -4032,6 +4073,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             false, // pool is NOT trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -4039,6 +4081,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -4101,6 +4144,7 @@ mod tests {
             None,
             LoadBalanceStrategy::default(),
             true, // pool IS trusted
+            Vec::new(),
         );
         targets_map.insert("gpt-4".to_string(), pool);
 
@@ -4108,6 +4152,7 @@ mod tests {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
