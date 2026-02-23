@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/doublewordai/onwards/compare/v0.15.2...v0.16.0) - 2026-02-23
+
+### Added
+
+- add Open Responses adapter for protocol translation ([#79](https://github.com/doublewordai/onwards/pull/79))
+
+### Fixed
+
+- trusted providers ([#107](https://github.com/doublewordai/onwards/pull/107))
+
 ## [0.15.2](https://github.com/doublewordai/onwards/compare/v0.15.1...v0.15.2) - 2026-02-19
 
 ### Fixed
