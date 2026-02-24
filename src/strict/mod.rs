@@ -67,16 +67,15 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
     Router::new()
         // Models endpoints
         .route("/models", get(handlers::models_handler::<T>))
-        .route("/v1/models", get(handlers::models_handler::<T>))
         // Chat completions
         .route(
-            "/v1/chat/completions",
+            "/chat/completions",
             post(handlers::chat_completions_handler::<T>),
         )
         // Open Responses
-        .route("/v1/responses", post(handlers::responses_handler::<T>))
+        .route("/responses", post(handlers::responses_handler::<T>))
         // Embeddings
-        .route("/v1/embeddings", post(handlers::embeddings_handler::<T>))
+        .route("/embeddings", post(handlers::embeddings_handler::<T>))
         .with_state(state)
 }
 
@@ -169,7 +168,7 @@ mod tests {
         let router = build_strict_router(state);
 
         let request = Request::builder()
-            .uri("/v1/unknown/endpoint")
+            .uri("/unknown/endpoint")
             .body(Body::empty())
             .unwrap();
 
@@ -183,7 +182,7 @@ mod tests {
         let router = build_strict_router(state);
 
         let request = Request::builder()
-            .uri("/v1/models")
+            .uri("/models")
             .body(Body::empty())
             .unwrap();
 
@@ -204,7 +203,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -258,7 +257,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -354,7 +353,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -412,7 +411,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -504,7 +503,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
