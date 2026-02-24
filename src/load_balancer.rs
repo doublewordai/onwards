@@ -375,7 +375,14 @@ impl<'a> Iterator for SelectIter<'a> {
 
         let result = self.pool.select_excluding(&self.excluded)?;
 
-        if !self.with_replacement {
+        // For priority strategy, always exclude tried providers so failover
+        // advances through the list. with_replacement only applies to
+        // weighted random selection.
+        let should_exclude = match self.pool.strategy {
+            LoadBalanceStrategy::Priority => true,
+            LoadBalanceStrategy::WeightedRandom => !self.with_replacement,
+        };
+        if should_exclude {
             self.excluded.insert(result.0);
         }
 
@@ -604,6 +611,43 @@ mod tests {
         assert_eq!(order[0].0, 0);
         assert_eq!(order[1].0, 1);
         assert_eq!(order[2].0, 2);
+        assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
+        assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+        assert_eq!(order[2].1.url.as_str(), "https://tertiary.example.com/");
+    }
+
+    #[test]
+    fn test_select_iter_priority_with_replacement_still_advances() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let providers = vec![
+            Provider::new(create_test_target("https://primary.example.com"), 1),
+            Provider::new(create_test_target("https://secondary.example.com"), 1),
+            Provider::new(create_test_target("https://tertiary.example.com"), 1),
+        ];
+
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            with_replacement: true,
+            max_attempts: Some(3),
+            ..Default::default()
+        });
+
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        // Even with with_replacement=true, priority strategy should advance
+        // through providers in order (with_replacement is ignored for priority)
+        let order: Vec<_> = pool.select_iter().collect();
+        assert_eq!(order.len(), 3);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
         assert_eq!(order[2].1.url.as_str(), "https://tertiary.example.com/");
