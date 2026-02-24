@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/doublewordai/onwards/compare/v0.17.0...v0.17.1) - 2026-02-24
+
+### Fixed
+
+- remove /v1 prefix from strict mode routes to prevent double /v1 path ([#115](https://github.com/doublewordai/onwards/pull/115))
+
+### Other
+
+- *(ci)* stop running heavy CI on main pushes ([#112](https://github.com/doublewordai/onwards/pull/112))
+
 ## [0.17.0](https://github.com/doublewordai/onwards/compare/v0.16.1...v0.17.0) - 2026-02-23
 
 ### Added
