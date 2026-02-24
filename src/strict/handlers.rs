@@ -83,7 +83,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let ForwardResult { response, trusted } =
-        forward_request(state, headers, "/v1/chat/completions", body_bytes).await;
+        forward_request(state, headers, "/chat/completions", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -166,7 +166,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let ForwardResult { response, trusted } =
-        forward_request(state, headers, "/v1/responses", body_bytes).await;
+        forward_request(state, headers, "/responses", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -216,7 +216,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let ForwardResult { response, trusted } =
-        forward_request(state, headers, "/v1/embeddings", body_bytes).await;
+        forward_request(state, headers, "/embeddings", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -327,7 +327,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         let response = forward_request_raw(
             state.clone(),
             headers.clone(),
-            "/v1/chat/completions",
+            "/chat/completions",
             body_bytes,
         )
         .await;
@@ -502,7 +502,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     let response = forward_request_raw(
         state.clone(),
         headers.clone(),
-        "/v1/chat/completions",
+        "/chat/completions",
         body_bytes,
     )
     .await;
@@ -669,7 +669,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                 let next_response = forward_request_raw(
                     state.clone(),
                     headers.clone(),
-                    "/v1/chat/completions",
+                    "/chat/completions",
                     body_bytes,
                 )
                 .await;
@@ -1439,7 +1439,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1510,7 +1510,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1563,7 +1563,7 @@ mod tests {
             r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1621,7 +1621,7 @@ mod tests {
             r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1684,7 +1684,7 @@ mod tests {
         let request_body = r#"{"model":"text-embedding-3-small","input":"Hello world"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/embeddings")
+            .uri("/embeddings")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1750,7 +1750,7 @@ mod tests {
         let request_body = r#"{"model":"text-embedding-3-small","input":"Hello"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/embeddings")
+            .uri("/embeddings")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1806,7 +1806,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -1925,7 +1925,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2014,7 +2014,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2100,7 +2100,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2156,7 +2156,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4o","input":"Hello"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2241,7 +2241,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4o","input":"Hello","stream":true}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2356,7 +2356,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2427,7 +2427,7 @@ mod tests {
         let request_body = r#"{"model":"text-embedding-ada-002","input":"test"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/embeddings")
+            .uri("/embeddings")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2523,7 +2523,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2624,7 +2624,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2726,7 +2726,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2826,7 +2826,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -2919,7 +2919,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/embeddings")
+            .uri("/embeddings")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3036,7 +3036,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3141,7 +3141,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/embeddings")
+            .uri("/embeddings")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3246,7 +3246,7 @@ mod tests {
         let request_body = r#"{"model":"gpt-4o","input":"test"}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3303,7 +3303,7 @@ mod tests {
             r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}],"stream":true}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3372,7 +3372,7 @@ mod tests {
             r#"{"model":"gpt-4","messages":[{"role":"user","content":"test"}],"stream":true}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3475,7 +3475,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3582,7 +3582,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/responses")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3685,7 +3685,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3783,7 +3783,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -3914,7 +3914,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .header("model-override", "untrusted-pool") // Header routes to untrusted
             .body(Body::from(request_body))
@@ -4014,7 +4014,7 @@ mod tests {
 
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -4094,7 +4094,7 @@ mod tests {
         let request_body = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();
@@ -4165,7 +4165,7 @@ mod tests {
         let request_body = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "Hi"}]}"#;
         let request = Request::builder()
             .method("POST")
-            .uri("/v1/chat/completions")
+            .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(request_body))
             .unwrap();

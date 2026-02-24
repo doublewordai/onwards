@@ -1,6 +1,7 @@
+use axum::{Router, routing::get};
 use clap::Parser as _;
 use onwards::{
-    AppState, build_metrics_layer_and_handle, build_metrics_router, build_router,
+    AppState, build_metrics_layer_and_handle, build_metrics_router, build_router, client,
     config::Config,
     create_openai_sanitizer,
     strict::build_strict_router,
@@ -58,8 +59,13 @@ pub async fn main() -> anyhow::Result<()> {
 
     // Use strict router if strict_mode is enabled, otherwise use standard router
     let mut router = if strict_mode {
+        use onwards::strict::handlers::models_handler;
         info!("Strict mode enabled - using typed request validation");
-        build_strict_router(app_state)
+        Router::new()
+            // Preserve /models alias at root for backwards compatibility
+            .route("/models", get(models_handler::<client::HyperClient>))
+            .with_state(app_state.clone())
+            .nest("/v1", build_strict_router(app_state))
     } else {
         build_router(app_state)
     };
