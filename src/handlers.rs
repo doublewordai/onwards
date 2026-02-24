@@ -313,9 +313,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Acquire pool-level concurrency permit
     let _pool_concurrency_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
-        match limiter.acquire().await {
-            Ok(guard) => Some(guard),
-            Err(_) => {
+        match limiter.try_acquire() {
+            Some(guard) => Some(guard),
+            None => {
                 debug!(
                     "Pool-level concurrency limit exceeded for model: {}",
                     model_name
@@ -330,9 +330,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // Acquire per-key concurrency permit
     let _key_concurrency_guard = if let Some(token) = bearer_token {
         if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
-            match limiter.acquire().await {
-                Ok(guard) => Some(guard),
-                Err(_) => {
+            match limiter.try_acquire() {
+                Some(guard) => Some(guard),
+                None => {
                     debug!("Per-key concurrency limit exceeded for token: {}", token);
                     return Err(OnwardsErrorResponse::concurrency_limited());
                 }
@@ -359,8 +359,11 @@ pub async fn target_message_handler<T: HttpClient>(
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
 
-    // Iterate through providers (with fallback support)
-    for (_idx, target) in pool.select_ordered() {
+    // Iterate through providers (with fallback support).
+    // select_iter() uses weighted least connections: picks the provider with the
+    // lowest active_connections/weight ratio, skipping providers at their
+    // concurrency limit. The returned guard tracks the active connection.
+    for (_idx, target, _connection_guard) in pool.select_iter() {
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
         if let Some(ref limiter) = target.limiter
             && limiter.check().is_err()
@@ -374,26 +377,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 return Err(OnwardsErrorResponse::rate_limited());
             }
         }
-
-        // Acquire provider-level concurrency permit
-        let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
-            match limiter.acquire().await {
-                Ok(guard) => Some(guard),
-                Err(_) => {
-                    debug!("Provider concurrency limit exceeded: {:?}", target.url);
-                    last_error = Some(OnwardsErrorResponse::concurrency_limited());
-                    // Concurrency limits are treated like rate limits for fallback purposes
-                    if pool.should_fallback_on_rate_limit() {
-                        debug!("Fallback on rate limit enabled, trying next provider");
-                        continue;
-                    } else {
-                        return Err(OnwardsErrorResponse::concurrency_limited());
-                    }
-                }
-            }
-        } else {
-            None
-        };
 
         // Clone response headers for later use
         let response_headers = target.response_headers.clone();
@@ -1634,16 +1617,7 @@ mod tests {
             .request_timeout_secs(1)
             .build();
 
-        let providers = vec![
-            Provider {
-                target: target1,
-                weight: 1,
-            },
-            Provider {
-                target: target2,
-                weight: 1,
-            },
-        ];
+        let providers = vec![Provider::new(target1, 1), Provider::new(target2, 1)];
 
         let fallback_config = Some(FallbackConfig {
             enabled: true,

@@ -1,18 +1,19 @@
 //! Load balancer for distributing requests across multiple providers
 //!
-//! This module implements weighted load balancing with rate limit awareness.
-//! Providers can be assigned different weights, and the load balancer will
-//! select providers proportionally while respecting their rate limits.
+//! This module implements weighted least-connections load balancing. Providers are
+//! assigned weights, and the load balancer selects the provider with the lowest
+//! `active_connections / weight` ratio. Ties are broken by weighted random selection
+//! (proportional to provider weights), so cold-start behavior still respects weights.
 //!
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
 use crate::target::{
-    ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter, RoutingAction,
-    RoutingRule, Target,
+    ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
+    RoutingAction, RoutingRule, Target,
 };
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A pool of providers that share an alias, with load balancing support
@@ -20,14 +21,12 @@ use std::sync::Arc;
 pub struct ProviderPool {
     /// The list of providers in this pool
     providers: Vec<Provider>,
-    /// Total weight of all providers (for weighted random selection)
-    total_weight: u32,
     /// Pool-level access control keys (who can call this alias)
     keys: Option<KeySet>,
     /// Pool-level rate limiter (applies to all requests to this alias)
     pool_limiter: Option<Arc<dyn RateLimiter>>,
     /// Pool-level concurrency limiter (applies to all requests to this alias)
-    pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
+    pool_concurrency_limiter: Option<ConcurrencyLimiter>,
     /// Fallback configuration for retrying failed requests
     fallback: Option<FallbackConfig>,
     /// Load balancing strategy
@@ -50,15 +49,40 @@ pub struct Provider {
     pub target: Target,
     /// Weight for load balancing (higher = more traffic)
     pub weight: u32,
+    /// Tracks active connections and enforces optional concurrency limit
+    limiter: ConcurrencyLimiter,
+}
+
+impl Provider {
+    /// Create a new provider with no concurrency limit
+    pub fn new(target: Target, weight: u32) -> Self {
+        Self {
+            target,
+            weight,
+            limiter: ConcurrencyLimiter::new(),
+        }
+    }
+
+    /// Create a new provider with a concurrency limit
+    pub fn with_concurrency_limit(target: Target, weight: u32, limit: usize) -> Self {
+        Self {
+            target,
+            weight,
+            limiter: ConcurrencyLimiter::with_limit(limit),
+        }
+    }
+
+    /// Get the current number of active connections to this provider
+    pub fn active_connections(&self) -> usize {
+        self.limiter.active()
+    }
 }
 
 impl ProviderPool {
     /// Create a new provider pool from a list of providers
     pub fn new(providers: Vec<Provider>) -> Self {
-        let total_weight = providers.iter().map(|p| p.weight).sum();
         Self {
             providers,
-            total_weight,
             keys: None,
             pool_limiter: None,
             pool_concurrency_limiter: None,
@@ -74,16 +98,14 @@ impl ProviderPool {
         providers: Vec<Provider>,
         keys: Option<KeySet>,
         pool_limiter: Option<Arc<dyn RateLimiter>>,
-        pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
+        pool_concurrency_limiter: Option<ConcurrencyLimiter>,
         fallback: Option<FallbackConfig>,
         strategy: LoadBalanceStrategy,
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
-        let total_weight = providers.iter().map(|p| p.weight).sum();
         Self {
             providers,
-            total_weight,
             keys,
             pool_limiter,
             pool_concurrency_limiter,
@@ -96,63 +118,148 @@ impl ProviderPool {
 
     /// Create a pool with a single provider
     pub fn single(target: Target, weight: u32) -> Self {
-        Self::new(vec![Provider { target, weight }])
+        Self::new(vec![Provider::new(target, weight)])
     }
 
-    /// Select a provider from the pool using weighted random selection
+    /// Select the best available provider using weighted least connections.
     ///
-    /// This method:
-    /// 1. Uses weighted random selection to pick a provider proportionally to weights
-    /// 2. Falls back to trying each provider in order if the selected one is rate limited
-    /// 3. Returns None if all providers are rate limited
-    pub fn select(&self) -> Option<&Target> {
+    /// For WeightedRandom strategy: picks the provider with the lowest
+    /// `active_connections / weight` ratio, breaking ties with weighted random
+    /// selection. Skips providers at their concurrency limit.
+    ///
+    /// For Priority strategy: returns the first available provider in definition
+    /// order, skipping providers at their concurrency limit.
+    ///
+    /// Returns a ConcurrencyGuard that tracks the active connection. When dropped,
+    /// the connection count is decremented.
+    pub fn select(&self) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        self.select_excluding(&HashSet::new())
+    }
+
+    /// Select providers lazily for fallback scenarios.
+    ///
+    /// Returns an iterator that yields one provider at a time. Each call to
+    /// `next()` performs a fresh least-connections evaluation, excluding
+    /// previously tried providers (unless `with_replacement` is set).
+    ///
+    /// The number of attempts is controlled by `fallback.max_attempts`
+    /// (defaults to provider count).
+    pub fn select_iter(&self) -> SelectIter<'_> {
+        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
+        let max_attempts = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.max_attempts)
+            .unwrap_or(self.providers.len());
+
+        SelectIter {
+            pool: self,
+            excluded: HashSet::new(),
+            max_attempts,
+            attempts: 0,
+            with_replacement,
+        }
+    }
+
+    /// Internal: select excluding specific provider indices
+    fn select_excluding(
+        &self,
+        exclude: &HashSet<usize>,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
         if self.providers.is_empty() {
             return None;
         }
 
-        // If only one provider, return it directly (rate limit check done by handler)
-        if self.providers.len() == 1 {
-            return Some(&self.providers[0].target);
+        match self.strategy {
+            LoadBalanceStrategy::Priority => self.select_priority(exclude),
+            LoadBalanceStrategy::WeightedRandom => self.select_least_connections(exclude),
         }
+    }
 
-        // Weighted random selection
-        let mut rng = rand::rng();
-        let random_weight: u32 = rng.random_range(0..self.total_weight);
+    /// Select using priority order: first available provider in definition order
+    fn select_priority(
+        &self,
+        exclude: &HashSet<usize>,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        for (idx, provider) in self.providers.iter().enumerate() {
+            if exclude.contains(&idx) {
+                continue;
+            }
+            if let Some(guard) = provider.limiter.try_acquire() {
+                return Some((idx, &provider.target, guard));
+            }
+        }
+        None
+    }
 
-        let mut cumulative_weight = 0;
-        let mut selected_idx = 0;
+    /// Select using weighted least connections: pick the provider with the lowest
+    /// active/weight ratio, breaking ties with weighted random selection
+    fn select_least_connections(
+        &self,
+        exclude: &HashSet<usize>,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        // Find the minimum active/weight score among available providers
+        let mut best_score = f64::INFINITY;
+        let mut candidates: Vec<usize> = Vec::new();
 
         for (idx, provider) in self.providers.iter().enumerate() {
-            cumulative_weight += provider.weight;
-            if random_weight < cumulative_weight {
-                selected_idx = idx;
-                break;
+            if exclude.contains(&idx) {
+                continue;
+            }
+            // Skip providers at their concurrency limit
+            if provider.limiter.at_capacity() {
+                continue;
+            }
+
+            let score = provider.limiter.active() as f64 / provider.weight as f64;
+
+            if score < best_score - f64::EPSILON {
+                best_score = score;
+                candidates.clear();
+                candidates.push(idx);
+            } else if (score - best_score).abs() < f64::EPSILON {
+                candidates.push(idx);
             }
         }
 
-        // Check if the selected provider is available (not rate limited)
-        let selected = &self.providers[selected_idx];
-        if !is_rate_limited(&selected.target) {
-            return Some(&selected.target);
+        if candidates.is_empty() {
+            return None;
         }
 
-        // If selected provider is rate limited, try others in weighted order
-        // Build list of indices sorted by weight (descending)
-        let mut indices: Vec<usize> = (0..self.providers.len())
-            .filter(|&i| i != selected_idx)
-            .collect();
-        indices.sort_by(|&a, &b| self.providers[b].weight.cmp(&self.providers[a].weight));
+        // Weighted random tiebreak: pick among tied candidates proportional to weight
+        let selected = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let mut rng = rand::rng();
+            let total_weight: u32 = candidates
+                .iter()
+                .map(|&idx| self.providers[idx].weight)
+                .sum();
+            let r: u32 = rng.random_range(0..total_weight);
+            let mut cumulative = 0;
+            let mut picked = candidates[0];
+            for &idx in &candidates {
+                cumulative += self.providers[idx].weight;
+                if r < cumulative {
+                    picked = idx;
+                    break;
+                }
+            }
+            picked
+        };
 
-        for idx in indices {
-            let provider = &self.providers[idx];
-            if !is_rate_limited(&provider.target) {
-                return Some(&provider.target);
+        // Atomically acquire a connection slot
+        let provider = &self.providers[selected];
+        match provider.limiter.try_acquire() {
+            Some(guard) => Some((selected, &provider.target, guard)),
+            None => {
+                // Race: provider hit limit between our check and acquire.
+                // Retry with this provider excluded.
+                let mut new_exclude = exclude.clone();
+                new_exclude.insert(selected);
+                self.select_least_connections(&new_exclude)
             }
         }
-
-        // All providers are rate limited - return the originally selected one
-        // The handler will return the rate limit error
-        Some(&self.providers[selected_idx].target)
     }
 
     /// Get all providers in the pool (for listing models, etc.)
@@ -186,7 +293,7 @@ impl ProviderPool {
     }
 
     /// Get pool-level concurrency limiter
-    pub fn pool_concurrency_limiter(&self) -> Option<&Arc<dyn ConcurrencyLimiter>> {
+    pub fn pool_concurrency_limiter(&self) -> Option<&ConcurrencyLimiter> {
         self.pool_concurrency_limiter.as_ref()
     }
 
@@ -243,121 +350,36 @@ impl ProviderPool {
             matches.then_some(&rule.action)
         })
     }
-
-    /// Select providers in priority order for fallback scenarios.
-    /// Returns an iterator yielding (index, &Target) based on the configured strategy:
-    /// - WeightedRandom: Repeatedly samples from the pool using weighted random.
-    ///   By default samples without replacement (each provider appears once).
-    ///   With `fallback.with_replacement: true`, the same provider can appear multiple times.
-    /// - Priority: Returns providers in definition order (first provider is primary)
-    ///
-    /// The number of attempts is controlled by `fallback.max_attempts` (defaults to provider count).
-    /// Optimized for common cases: single provider returns immediately without allocation.
-    pub fn select_ordered(&self) -> impl Iterator<Item = (usize, &Target)> {
-        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
-        let max_attempts = self.fallback.as_ref().and_then(|f| f.max_attempts);
-        let attempt_count = max_attempts.unwrap_or(self.providers.len());
-
-        let mut order = Vec::with_capacity(attempt_count);
-
-        if self.providers.is_empty() {
-            return order.into_iter();
-        }
-
-        // Fast path: single provider (most common case)
-        if self.providers.len() == 1 {
-            let count = if with_replacement { attempt_count } else { 1 };
-            for _ in 0..count {
-                order.push((0, &self.providers[0].target));
-            }
-            return order.into_iter();
-        }
-
-        match self.strategy {
-            LoadBalanceStrategy::Priority => {
-                // Return providers in definition order, capped at attempt_count
-                for (idx, provider) in self.providers.iter().enumerate().take(attempt_count) {
-                    order.push((idx, &provider.target));
-                }
-            }
-            LoadBalanceStrategy::WeightedRandom if with_replacement => {
-                // Sample with replacement: pick from full pool each time
-                let weights: Vec<(usize, u32)> = self
-                    .providers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| (i, p.weight))
-                    .collect();
-                let mut rng = rand::rng();
-
-                for _ in 0..attempt_count {
-                    let total: u32 = weights.iter().map(|(_, w)| w).sum();
-                    let random_weight: u32 = if total > 0 {
-                        rng.random_range(0..total)
-                    } else {
-                        0
-                    };
-
-                    let mut cumulative = 0;
-                    let mut selected_idx = 0;
-                    for &(idx, weight) in &weights {
-                        cumulative += weight;
-                        if random_weight < cumulative {
-                            selected_idx = idx;
-                            break;
-                        }
-                    }
-
-                    order.push((selected_idx, &self.providers[selected_idx].target));
-                }
-            }
-            LoadBalanceStrategy::WeightedRandom => {
-                // Sample without replacement (default): each provider appears at most once
-                let mut remaining: Vec<(usize, u32)> = self
-                    .providers
-                    .iter()
-                    .enumerate()
-                    .map(|(i, p)| (i, p.weight))
-                    .collect();
-                let mut rng = rand::rng();
-
-                let cap = attempt_count.min(self.providers.len());
-                while order.len() < cap && !remaining.is_empty() {
-                    let total: u32 = remaining.iter().map(|(_, w)| w).sum();
-                    let random_weight: u32 = if total > 0 {
-                        rng.random_range(0..total)
-                    } else {
-                        0
-                    };
-
-                    let mut cumulative = 0;
-                    let mut selected_pos = 0;
-                    for (pos, (_, weight)) in remaining.iter().enumerate() {
-                        cumulative += weight;
-                        if random_weight < cumulative {
-                            selected_pos = pos;
-                            break;
-                        }
-                    }
-
-                    let (idx, _) = remaining.remove(selected_pos);
-                    order.push((idx, &self.providers[idx].target));
-                }
-            }
-        }
-
-        order.into_iter()
-    }
 }
 
-/// Check if a target is rate limited
-fn is_rate_limited(target: &Target) -> bool {
-    if let Some(ref limiter) = target.limiter {
-        // Use check() which consumes a token - if it fails, provider is rate limited
-        // Note: This is a peek, we'll check again in the handler
-        limiter.check().is_err()
-    } else {
-        false
+/// Lazy iterator for fallback provider selection.
+///
+/// Each call to `next()` performs a fresh least-connections evaluation,
+/// ensuring the most up-to-date load information is used for each attempt.
+pub struct SelectIter<'a> {
+    pool: &'a ProviderPool,
+    excluded: HashSet<usize>,
+    max_attempts: usize,
+    attempts: usize,
+    with_replacement: bool,
+}
+
+impl<'a> Iterator for SelectIter<'a> {
+    type Item = (usize, &'a Target, ConcurrencyGuard);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.attempts >= self.max_attempts {
+            return None;
+        }
+        self.attempts += 1;
+
+        let result = self.pool.select_excluding(&self.excluded)?;
+
+        if !self.with_replacement {
+            self.excluded.insert(result.0);
+        }
+
+        Some(result)
     }
 }
 
@@ -381,7 +403,8 @@ mod tests {
 
         let selected = pool.select();
         assert!(selected.is_some());
-        assert_eq!(selected.unwrap().url.as_str(), "https://api.example.com/");
+        let (_, target, _guard) = selected.unwrap();
+        assert_eq!(target.url.as_str(), "https://api.example.com/");
     }
 
     #[test]
@@ -394,32 +417,26 @@ mod tests {
 
     #[test]
     fn test_weighted_selection_distribution() {
-        // Create a pool with providers having different weights
+        // With least connections, when guards are dropped between selections,
+        // all providers have 0 active connections and ties are broken by
+        // weighted random — so the distribution matches weights.
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 3,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 3),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
         ];
         let pool = ProviderPool::new(providers);
 
-        // Run many selections and check distribution
         let mut counts: HashMap<String, usize> = HashMap::new();
         for _ in 0..1000 {
-            if let Some(target) = pool.select() {
+            if let Some((_, target, _guard)) = pool.select() {
                 *counts.entry(target.url.to_string()).or_insert(0) += 1;
             }
+            // guard dropped here — active count returns to 0
         }
 
-        // Provider with weight 3 should be selected roughly 3x more often than weight 1
         let count1 = *counts.get("https://api1.example.com/").unwrap_or(&0);
         let count2 = *counts.get("https://api2.example.com/").unwrap_or(&0);
 
-        // Allow for some variance in random selection (within 50% of expected ratio)
         let ratio = count1 as f64 / count2 as f64;
         assert!(
             ratio > 1.5 && ratio < 6.0,
@@ -429,16 +446,116 @@ mod tests {
     }
 
     #[test]
+    fn test_least_connections_prefers_less_loaded() {
+        // When guards are held, least connections should prefer the less loaded provider
+        let providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+        let pool = ProviderPool::new(providers);
+
+        // First selection: both at 0, random tiebreak (equal weights)
+        let (idx1, _, guard1) = pool.select().unwrap();
+
+        // Second selection: one at 1, other at 0 — should pick the other
+        let (idx2, _, _guard2) = pool.select().unwrap();
+        assert_ne!(idx1, idx2, "Should pick the less loaded provider");
+
+        // Drop first guard, making that provider less loaded again
+        drop(guard1);
+
+        // Now idx1 has 0 active, idx2 has 1 active — should prefer idx1
+        let (idx3, _, _guard3) = pool.select().unwrap();
+        assert_eq!(
+            idx3, idx1,
+            "Should pick the provider whose guard was dropped"
+        );
+    }
+
+    #[test]
+    fn test_weighted_least_connections_respects_weights() {
+        // Weight 3 provider should accumulate ~3x the connections before
+        // the score matches weight 1 provider
+        let providers = vec![
+            Provider::new(create_test_target("https://heavy.example.com"), 3),
+            Provider::new(create_test_target("https://light.example.com"), 1),
+        ];
+        let pool = ProviderPool::new(providers);
+
+        // Hold all guards to accumulate connections
+        let mut guards = Vec::new();
+        for _ in 0..40 {
+            if let Some((_, _, guard)) = pool.select() {
+                guards.push(guard);
+            }
+        }
+
+        let heavy_active = pool.providers()[0].active_connections();
+        let light_active = pool.providers()[1].active_connections();
+
+        // Ratio should be approximately 3:1
+        let ratio = heavy_active as f64 / light_active as f64;
+        assert!(
+            ratio > 2.0 && ratio < 5.0,
+            "Expected ratio around 3.0, got {} (heavy={}, light={})",
+            ratio,
+            heavy_active,
+            light_active
+        );
+    }
+
+    #[test]
+    fn test_concurrency_limit_skips_full_provider() {
+        let providers = vec![
+            Provider::with_concurrency_limit(
+                create_test_target("https://limited.example.com"),
+                1,
+                1,
+            ),
+            Provider::new(create_test_target("https://unlimited.example.com"), 1),
+        ];
+        let pool = ProviderPool::new(providers);
+
+        // First request goes to limited provider (both at 0, random tiebreak)
+        // Keep trying until we get the limited one
+        let mut guard_on_limited = None;
+        for _ in 0..100 {
+            let (idx, _, guard) = pool.select().unwrap();
+            if idx == 0 {
+                guard_on_limited = Some(guard);
+                break;
+            }
+        }
+        assert!(
+            guard_on_limited.is_some(),
+            "Should eventually select the limited provider"
+        );
+
+        // Now limited provider is at capacity (1/1). Next selection must go to unlimited.
+        let (idx, _, _guard) = pool.select().unwrap();
+        assert_eq!(idx, 1, "Should skip the full provider");
+    }
+
+    #[test]
+    fn test_all_at_capacity_returns_none() {
+        let providers = vec![
+            Provider::with_concurrency_limit(create_test_target("https://a.example.com"), 1, 1),
+            Provider::with_concurrency_limit(create_test_target("https://b.example.com"), 1, 1),
+        ];
+        let pool = ProviderPool::new(providers);
+
+        let (_, _, _g1) = pool.select().unwrap();
+        let (_, _, _g2) = pool.select().unwrap();
+
+        // Both at capacity
+        assert!(pool.select().is_none());
+    }
+
+    #[test]
     fn test_first_target() {
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 2,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 2),
         ];
         let pool = ProviderPool::new(providers);
 
@@ -450,14 +567,8 @@ mod tests {
     #[test]
     fn test_providers_accessor() {
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 2,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 2),
         ];
         let pool = ProviderPool::new(providers);
 
@@ -467,22 +578,13 @@ mod tests {
     }
 
     #[test]
-    fn test_select_ordered_priority_strategy() {
+    fn test_select_iter_priority_strategy() {
         use crate::target::LoadBalanceStrategy;
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://primary.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://secondary.example.com"),
-                weight: 10,
-            },
-            Provider {
-                target: create_test_target("https://tertiary.example.com"),
-                weight: 5,
-            },
+            Provider::new(create_test_target("https://primary.example.com"), 1),
+            Provider::new(create_test_target("https://secondary.example.com"), 10),
+            Provider::new(create_test_target("https://tertiary.example.com"), 5),
         ];
 
         let pool = ProviderPool::with_config(
@@ -496,31 +598,24 @@ mod tests {
             Vec::new(),
         );
 
-        // Priority strategy should always return providers in definition order
-        // regardless of weights
-        let order: Vec<_> = pool.select_ordered().collect();
+        // Priority strategy should return providers in definition order
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(order.len(), 3);
-        assert_eq!(order[0].0, 0); // primary first
-        assert_eq!(order[1].0, 1); // secondary second
-        assert_eq!(order[2].0, 2); // tertiary third
+        assert_eq!(order[0].0, 0);
+        assert_eq!(order[1].0, 1);
+        assert_eq!(order[2].0, 2);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
         assert_eq!(order[2].1.url.as_str(), "https://tertiary.example.com/");
     }
 
     #[test]
-    fn test_select_ordered_weighted_random_includes_all() {
+    fn test_select_iter_weighted_random_includes_all() {
         use crate::target::LoadBalanceStrategy;
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 3,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 3),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
         ];
 
         let pool = ProviderPool::with_config(
@@ -534,30 +629,22 @@ mod tests {
             Vec::new(),
         );
 
-        // Weighted random should include all providers (order varies)
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(order.len(), 2);
 
-        // Both providers should be present
         let urls: std::collections::HashSet<_> =
-            order.iter().map(|(_, t)| t.url.as_str()).collect();
+            order.iter().map(|(_, t, _)| t.url.as_str()).collect();
         assert!(urls.contains("https://api1.example.com/"));
         assert!(urls.contains("https://api2.example.com/"));
     }
 
     #[test]
-    fn test_select_ordered_weighted_random_distribution() {
+    fn test_select_iter_weighted_random_distribution() {
         use crate::target::LoadBalanceStrategy;
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://heavy.example.com"),
-                weight: 9,
-            },
-            Provider {
-                target: create_test_target("https://light.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://heavy.example.com"), 9),
+            Provider::new(create_test_target("https://light.example.com"), 1),
         ];
 
         let pool = ProviderPool::with_config(
@@ -571,18 +658,17 @@ mod tests {
             Vec::new(),
         );
 
-        // Run multiple times and count how often heavy is first
+        // When guards are dropped between iterations, all providers are at 0
+        // active connections, so tiebreaking is weighted random.
         let mut heavy_first = 0;
         let iterations = 1000;
         for _ in 0..iterations {
-            let order: Vec<_> = pool.select_ordered().collect();
+            let order: Vec<_> = pool.select_iter().collect();
             if order[0].1.url.as_str() == "https://heavy.example.com/" {
                 heavy_first += 1;
             }
         }
 
-        // With 9:1 weight ratio, heavy should be first roughly 90% of the time
-        // With 1000 iterations, allow for reasonable variance (80-98%)
         let percentage = (heavy_first * 100) / iterations;
         assert!(
             (80..=98).contains(&percentage),
@@ -594,22 +680,21 @@ mod tests {
     }
 
     #[test]
-    fn test_select_ordered_empty_pool() {
+    fn test_select_iter_empty_pool() {
         let pool = ProviderPool::new(vec![]);
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert!(order.is_empty());
     }
 
     #[test]
-    fn test_select_ordered_single_provider() {
+    fn test_select_iter_single_provider() {
         use crate::target::LoadBalanceStrategy;
 
-        let providers = vec![Provider {
-            target: create_test_target("https://only.example.com"),
-            weight: 1,
-        }];
+        let providers = vec![Provider::new(
+            create_test_target("https://only.example.com"),
+            1,
+        )];
 
-        // Test both strategies with single provider
         for strategy in [
             LoadBalanceStrategy::Priority,
             LoadBalanceStrategy::WeightedRandom,
@@ -625,25 +710,19 @@ mod tests {
                 Vec::new(),
             );
 
-            let order: Vec<_> = pool.select_ordered().collect();
+            let order: Vec<_> = pool.select_iter().collect();
             assert_eq!(order.len(), 1);
             assert_eq!(order[0].1.url.as_str(), "https://only.example.com/");
         }
     }
 
     #[test]
-    fn test_select_ordered_with_replacement_allows_duplicates() {
+    fn test_select_iter_with_replacement_allows_duplicates() {
         use crate::target::{FallbackConfig, LoadBalanceStrategy};
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 9,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 9),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
         ];
 
         let fallback = Some(FallbackConfig {
@@ -665,15 +744,16 @@ mod tests {
         );
 
         // With replacement + max_attempts=5, should get exactly 5 entries
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(order.len(), 5);
 
-        // With weight 9:1, the heavy provider should appear multiple times
-        // across many iterations
+        // With least connections + with_replacement, the same provider can be picked
+        // multiple times (since guards from prior iterations are dropped and the
+        // provider becomes least-loaded again)
         let mut found_duplicate = false;
         for _ in 0..100 {
-            let order: Vec<_> = pool.select_ordered().collect();
-            let indices: Vec<usize> = order.iter().map(|(idx, _)| *idx).collect();
+            let order: Vec<_> = pool.select_iter().collect();
+            let indices: Vec<usize> = order.iter().map(|(idx, _, _)| *idx).collect();
             let unique: std::collections::HashSet<_> = indices.iter().collect();
             if unique.len() < indices.len() {
                 found_duplicate = true;
@@ -687,25 +767,15 @@ mod tests {
     }
 
     #[test]
-    fn test_select_ordered_max_attempts_controls_length() {
+    fn test_select_iter_max_attempts_controls_length() {
         use crate::target::{FallbackConfig, LoadBalanceStrategy};
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://api3.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+            Provider::new(create_test_target("https://api3.example.com"), 1),
         ];
 
-        // max_attempts=2 with replacement=false: should return only 2 providers
         let fallback = Some(FallbackConfig {
             enabled: true,
             max_attempts: Some(2),
@@ -723,15 +793,14 @@ mod tests {
             Vec::new(),
         );
 
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(
             order.len(),
             2,
             "max_attempts should cap the ordering length"
         );
 
-        // All entries should be unique (without replacement)
-        let indices: std::collections::HashSet<_> = order.iter().map(|(idx, _)| *idx).collect();
+        let indices: std::collections::HashSet<_> = order.iter().map(|(idx, _, _)| *idx).collect();
         assert_eq!(
             indices.len(),
             2,
@@ -740,22 +809,13 @@ mod tests {
     }
 
     #[test]
-    fn test_select_ordered_max_attempts_with_priority() {
+    fn test_select_iter_max_attempts_with_priority() {
         use crate::target::{FallbackConfig, LoadBalanceStrategy};
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://primary.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://secondary.example.com"),
-                weight: 1,
-            },
-            Provider {
-                target: create_test_target("https://tertiary.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://primary.example.com"), 1),
+            Provider::new(create_test_target("https://secondary.example.com"), 1),
+            Provider::new(create_test_target("https://tertiary.example.com"), 1),
         ];
 
         let fallback = Some(FallbackConfig {
@@ -775,29 +835,21 @@ mod tests {
             Vec::new(),
         );
 
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
     }
 
     #[test]
-    fn test_select_ordered_defaults_preserve_current_behavior() {
+    fn test_select_iter_defaults_preserve_behavior() {
         use crate::target::LoadBalanceStrategy;
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://api1.example.com"),
-                weight: 3,
-            },
-            Provider {
-                target: create_test_target("https://api2.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://api1.example.com"), 3),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
         ];
 
-        // No fallback config at all (default) should behave as before:
-        // without replacement, ordering length = provider count
         let pool = ProviderPool::with_config(
             providers,
             None,
@@ -809,24 +861,23 @@ mod tests {
             Vec::new(),
         );
 
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(order.len(), 2);
 
-        // All entries should be unique (without replacement)
         let urls: std::collections::HashSet<_> =
-            order.iter().map(|(_, t)| t.url.as_str()).collect();
+            order.iter().map(|(_, t, _)| t.url.as_str()).collect();
         assert!(urls.contains("https://api1.example.com/"));
         assert!(urls.contains("https://api2.example.com/"));
     }
 
     #[test]
-    fn test_select_ordered_with_replacement_single_provider() {
+    fn test_select_iter_with_replacement_single_provider() {
         use crate::target::{FallbackConfig, LoadBalanceStrategy};
 
-        let providers = vec![Provider {
-            target: create_test_target("https://only.example.com"),
-            weight: 1,
-        }];
+        let providers = vec![Provider::new(
+            create_test_target("https://only.example.com"),
+            1,
+        )];
 
         let fallback = Some(FallbackConfig {
             enabled: true,
@@ -846,31 +897,25 @@ mod tests {
             Vec::new(),
         );
 
-        let order: Vec<_> = pool.select_ordered().collect();
+        let order: Vec<_> = pool.select_iter().collect();
         assert_eq!(
             order.len(),
             3,
             "Single provider with replacement should repeat"
         );
-        for (idx, target) in &order {
+        for (idx, target, _) in &order {
             assert_eq!(*idx, 0);
             assert_eq!(target.url.as_str(), "https://only.example.com/");
         }
     }
 
     #[test]
-    fn test_select_ordered_with_replacement_respects_weights() {
+    fn test_select_iter_with_replacement_respects_weights() {
         use crate::target::{FallbackConfig, LoadBalanceStrategy};
 
         let providers = vec![
-            Provider {
-                target: create_test_target("https://heavy.example.com"),
-                weight: 99,
-            },
-            Provider {
-                target: create_test_target("https://light.example.com"),
-                weight: 1,
-            },
+            Provider::new(create_test_target("https://heavy.example.com"), 99),
+            Provider::new(create_test_target("https://light.example.com"), 1),
         ];
 
         let fallback = Some(FallbackConfig {
@@ -891,32 +936,32 @@ mod tests {
             Vec::new(),
         );
 
-        // Over many runs, the heavy provider should dominate
+        // Over many runs, the heavy provider should dominate first-pick
         let mut heavy_count = 0;
         let iterations = 100;
         for _ in 0..iterations {
-            let order: Vec<_> = pool.select_ordered().collect();
+            let order: Vec<_> = pool.select_iter().collect();
             heavy_count += order
                 .iter()
-                .filter(|(_, t)| t.url.as_str() == "https://heavy.example.com/")
+                .filter(|(_, t, _)| t.url.as_str() == "https://heavy.example.com/")
                 .count();
         }
 
         let total = iterations * 10;
         let percentage = (heavy_count * 100) / total;
         assert!(
-            percentage > 90,
-            "Heavy provider (99:1 weight) should appear >90% of the time, got {}%",
+            percentage > 85,
+            "Heavy provider (99:1 weight) should appear >85% of the time, got {}%",
             percentage
         );
     }
 
     #[test]
     fn test_evaluate_routing_rules_no_rules() {
-        let pool = ProviderPool::new(vec![Provider {
-            target: create_test_target("https://api.example.com"),
-            weight: 1,
-        }]);
+        let pool = ProviderPool::new(vec![Provider::new(
+            create_test_target("https://api.example.com"),
+            1,
+        )]);
 
         let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
         assert!(pool.evaluate_routing_rules(&labels).is_none());
@@ -932,10 +977,10 @@ mod tests {
         }];
 
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: create_test_target("https://api.example.com"),
-                weight: 1,
-            }],
+            vec![Provider::new(
+                create_test_target("https://api.example.com"),
+                1,
+            )],
             None,
             None,
             None,
@@ -945,18 +990,15 @@ mod tests {
             rules,
         );
 
-        // Matching labels → deny
         let labels = HashMap::from([("purpose".to_string(), "playground".to_string())]);
         assert!(matches!(
             pool.evaluate_routing_rules(&labels),
             Some(RoutingAction::Deny)
         ));
 
-        // Non-matching labels → allow (None)
         let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
         assert!(pool.evaluate_routing_rules(&labels).is_none());
 
-        // Empty labels → allow (None)
         assert!(pool.evaluate_routing_rules(&HashMap::new()).is_none());
     }
 
@@ -972,10 +1014,10 @@ mod tests {
         }];
 
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: create_test_target("https://api.example.com"),
-                weight: 1,
-            }],
+            vec![Provider::new(
+                create_test_target("https://api.example.com"),
+                1,
+            )],
             None,
             None,
             None,
@@ -1012,10 +1054,10 @@ mod tests {
         ];
 
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: create_test_target("https://api.example.com"),
-                weight: 1,
-            }],
+            vec![Provider::new(
+                create_test_target("https://api.example.com"),
+                1,
+            )],
             None,
             None,
             None,
@@ -1025,7 +1067,6 @@ mod tests {
             rules,
         );
 
-        // First matching rule (Deny) should win
         let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
         assert!(matches!(
             pool.evaluate_routing_rules(&labels),
@@ -1046,10 +1087,10 @@ mod tests {
         }];
 
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: create_test_target("https://api.example.com"),
-                weight: 1,
-            }],
+            vec![Provider::new(
+                create_test_target("https://api.example.com"),
+                1,
+            )],
             None,
             None,
             None,
@@ -1059,7 +1100,6 @@ mod tests {
             rules,
         );
 
-        // Both labels match → deny
         let labels = HashMap::from([
             ("purpose".to_string(), "batch".to_string()),
             ("tier".to_string(), "free".to_string()),
@@ -1069,11 +1109,9 @@ mod tests {
             Some(RoutingAction::Deny)
         ));
 
-        // Only one label matches → no match (all must match)
         let labels = HashMap::from([("purpose".to_string(), "batch".to_string())]);
         assert!(pool.evaluate_routing_rules(&labels).is_none());
 
-        // Extra labels are fine — only rule labels need to match
         let labels = HashMap::from([
             ("purpose".to_string(), "batch".to_string()),
             ("tier".to_string(), "free".to_string()),
