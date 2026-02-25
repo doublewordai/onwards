@@ -1405,6 +1405,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party response with extra fields that should be stripped
@@ -1485,6 +1487,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party returns internal model name
@@ -1546,6 +1550,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let streaming_chunks = vec![
@@ -1604,6 +1610,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let streaming_chunks = vec![
@@ -1657,6 +1665,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party response with extra fields
@@ -1727,6 +1737,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_response = r#"{
@@ -1786,6 +1798,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party error with internal fields (should be completely replaced)
@@ -1852,6 +1866,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party error with leaky message
@@ -1912,6 +1928,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Non-JSON error response (e.g., plain text or HTML)
@@ -1967,6 +1985,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party response with extra fields
@@ -2057,6 +2077,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_response = r#"{
@@ -2136,6 +2158,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Third-party error with internal details
@@ -2200,6 +2224,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock SSE stream using real OpenAI Responses API streaming event format:
@@ -2317,6 +2343,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Response with extra fields that will be removed during sanitization
@@ -2398,6 +2426,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Response with extra provider-specific fields
@@ -2485,6 +2515,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -2597,6 +2629,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -2696,6 +2730,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream error with provider-specific details for streaming request
@@ -2802,6 +2838,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -2891,6 +2929,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream error with provider-specific details
@@ -2986,6 +3026,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream success response with provider-specific fields
@@ -3106,6 +3148,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream success response with provider-specific fields
@@ -3193,6 +3237,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Response with extra provider-specific fields
@@ -3287,6 +3333,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Multi-line SSE event with provider-specific fields in the JSON
@@ -3352,6 +3400,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // SSE stream with comment line containing provider-specific info
@@ -3422,6 +3472,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock client that captures the forwarded request
@@ -3529,6 +3581,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_response = r#"{
@@ -3645,6 +3699,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true, // Strict mode enabled
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -3746,6 +3802,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -3874,6 +3932,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock upstream response with provider-specific fields
@@ -3996,6 +4056,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock SSE streaming response with provider metadata in chunks
@@ -4084,6 +4146,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let error_body = r#"{"error": {"message": "provider specific error", "type": "rate_limit_error", "provider_trace": "trace-xyz"}}"#;
@@ -4155,6 +4219,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let error_body = r#"{"error": {"message": "provider specific error", "type": "rate_limit_error", "provider_trace": "trace-xyz"}}"#;

@@ -861,6 +861,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
@@ -909,6 +911,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(
@@ -982,6 +986,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_response_body = r#"{"id": "test-response", "object": "chat.completion", "choices": [{"message": {"content": "Hello from mock!"}}]}"#;
@@ -1082,6 +1088,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1157,6 +1165,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1255,6 +1265,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"unused": "response"}"#);
@@ -1364,6 +1376,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1427,6 +1441,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1510,6 +1526,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1576,6 +1594,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -1629,6 +1649,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client =
@@ -1703,6 +1725,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client =
@@ -1780,6 +1804,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let (prometheus_layer, handle) = build_metrics_layer_and_handle("onwards");
@@ -1958,6 +1984,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create a body transformation function that adds a "transformed": true field
@@ -2022,6 +2050,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2074,6 +2104,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create a transformation function that always returns None (no transformation)
@@ -2128,6 +2160,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create a transformation function that forces include_usage for streaming requests
@@ -2206,6 +2240,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create the same transformation function
@@ -2280,6 +2316,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create a transformation function that only transforms specific paths
@@ -2357,6 +2395,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2396,6 +2436,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2440,6 +2482,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(
@@ -2502,6 +2546,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2559,6 +2605,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2602,6 +2650,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2658,6 +2708,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2714,6 +2766,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2778,6 +2832,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
@@ -2825,6 +2881,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Response with provider-specific fields
@@ -2899,6 +2957,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Response from upstream has the turbo model
@@ -2964,6 +3024,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let streaming_chunks = vec![
@@ -3021,6 +3083,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let streaming_chunks = vec![
@@ -3075,6 +3139,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Response with provider-specific fields
@@ -3137,6 +3203,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Response from a different endpoint (e.g., embeddings)
@@ -3200,6 +3268,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             let mock_response = r#"{
@@ -3253,6 +3323,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Upstream returns 422 with provider-specific error details
@@ -3318,6 +3390,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Upstream returns 503 with internal details
@@ -3375,6 +3449,8 @@ mod tests {
                 key_labels: Arc::new(DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             };
 
             // Upstream returns 422 with provider-specific details

@@ -382,12 +382,33 @@ pub async fn target_message_handler<T: HttpClient>(
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
 
+    // Batch detection: if a batch_header is configured, check for it to
+    // distinguish batch (low-priority) from realtime (high-priority) requests.
+    let is_batch_request = state
+        .targets
+        .batch_header
+        .as_ref()
+        .is_some_and(|h| req.headers().get(h.as_str()).is_some());
+
+    // Priority routing: when enabled globally, realtime requests skip
+    // non-priority providers (so they always get priority=0 and aren't
+    // starved by batch work). Only enforced when at least one provider
+    // in the pool supports priority.
+    let priority_routing = state.targets.priority_routing
+        && pool.providers().iter().any(|p| p.target.supports_priority);
+
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
     for (_idx, target, connection_guard) in pool.select_iter() {
+        // Realtime (non-batch) requests are implicitly high-priority and must
+        // only go to providers that understand priority scheduling, so they
+        // get priority=0 and aren't starved by batch work.
+        if priority_routing && !is_batch_request && !target.supports_priority {
+            continue;
+        }
         any_attempted = true;
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
         if let Some(ref limiter) = target.limiter
@@ -439,6 +460,36 @@ pub async fn target_message_handler<T: HttpClient>(
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return Err(OnwardsErrorResponse::internal()),
             };
+        }
+
+        // Priority field handling:
+        // 1. Always strip any user/fusillade-set priority from the body
+        // 2. Then set priority based on request origin and provider capability:
+        //    - Batch (fusillade header) + priority provider: set priority=1 (low)
+        //    - Batch + non-priority provider: don't set priority
+        //    - Realtime + priority provider: set priority=0 (high)
+        //    - Realtime + non-priority provider: unreachable (skipped above)
+        if !attempt_body.is_empty() {
+            if let Ok(mut json) =
+                serde_json::from_slice::<serde_json::Value>(&attempt_body)
+                && let Some(obj) = json.as_object_mut()
+            {
+                // Always strip incoming priority
+                obj.remove("priority");
+
+                // Inject the correct priority for priority-aware providers
+                if target.supports_priority {
+                    let priority = if is_batch_request { 1 } else { 0 };
+                    obj.insert(
+                        "priority".to_string(),
+                        serde_json::Value::Number(serde_json::Number::from(priority)),
+                    );
+                }
+
+                if let Ok(new_body) = serde_json::to_vec(&json) {
+                    attempt_body = axum::body::Bytes::from(new_body);
+                }
+            }
         }
 
         // Build the upstream URI for this target
@@ -1621,6 +1672,8 @@ mod tests {
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
             },
             http_client: mock_client,
             body_transform_fn: None,

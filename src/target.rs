@@ -88,6 +88,12 @@ pub struct ProviderSpec {
     /// When None (default), inherits the pool-level `trusted` setting.
     #[serde(default)]
     pub trusted: Option<bool>,
+
+    /// Whether this provider supports the `priority` request parameter.
+    /// When false (default), the `priority` field is stripped from request bodies
+    /// before forwarding to this provider.
+    #[serde(default)]
+    pub supports_priority: bool,
 }
 
 /// Configuration for Open Responses API behavior
@@ -346,6 +352,7 @@ impl TargetSpecOrList {
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
                         trusted: None, // pool-level trusted handles this for legacy format
+                        supports_priority: false,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -382,6 +389,7 @@ impl TargetSpecOrList {
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
                     trusted: None, // pool-level trusted handles this for single-provider format
+                    supports_priority: false,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -435,6 +443,7 @@ impl From<TargetSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
+            supports_priority: false,
         }
     }
 }
@@ -459,6 +468,7 @@ impl From<ProviderSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
+            supports_priority: value.supports_priority,
         }
     }
 }
@@ -594,6 +604,10 @@ pub struct Target {
     /// Per-provider override for strict mode error sanitization trust.
     /// None means inherit from the pool-level trusted setting.
     pub trusted: Option<bool>,
+    /// Whether this provider supports the `priority` request parameter.
+    /// When false, the `priority` field is stripped before forwarding.
+    #[builder(default)]
+    pub supports_priority: bool,
 }
 
 impl Target {
@@ -691,6 +705,18 @@ pub struct ConfigFile {
     /// HTTP connection pooling configuration (global)
     #[serde(default)]
     pub http_pool: Option<HttpPoolConfig>,
+    /// When true, realtime (non-batch) requests are only routed to providers
+    /// with `supports_priority: true`, ensuring they always get priority=0 and
+    /// aren't starved by batch work. Batch requests can still go to any provider.
+    /// Defaults to false.
+    #[serde(default)]
+    pub priority_routing: bool,
+    /// Header name used to identify batch requests (e.g. from fusillade).
+    /// When a request carries this header, it is treated as low-priority and
+    /// receives priority=1 on priority-aware providers.
+    /// Defaults to None.
+    #[serde(default)]
+    pub batch_header: Option<String>,
 }
 
 /// The live-updating collection of targets.
@@ -708,6 +734,10 @@ pub struct Targets {
     pub strict_mode: bool,
     /// HTTP connection pool configuration (global)
     pub http_pool_config: Option<HttpPoolConfig>,
+    /// When true, realtime requests skip non-priority providers
+    pub priority_routing: bool,
+    /// Header name that identifies batch requests
+    pub batch_header: Option<String>,
 }
 
 #[async_trait]
@@ -953,6 +983,8 @@ impl Targets {
             key_labels,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
+            priority_routing: config_file.priority_routing,
+            batch_header: config_file.batch_header,
         })
     }
 
@@ -1136,6 +1168,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         }
     }
 
@@ -1199,6 +1233,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Create sequence of target updates
@@ -1264,6 +1300,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
@@ -1315,6 +1353,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1355,6 +1395,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1388,6 +1430,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1415,6 +1459,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1504,6 +1550,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1525,6 +1573,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1557,6 +1607,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1597,6 +1649,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1685,6 +1739,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1715,6 +1771,8 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1794,6 +1852,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1830,6 +1890,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2121,6 +2183,7 @@ mod tests {
                 open_responses: None,
                 request_timeout_secs: None,
                 trusted: None,
+                supports_priority: false,
             }],
         };
 
@@ -2504,6 +2567,8 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let targets = Targets::from_config(config_file).unwrap();

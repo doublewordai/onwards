@@ -108,6 +108,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         let mock_response = r#"{"id":"chatcmpl-123","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Hello!"}}]}"#;
@@ -133,6 +135,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock response that simulates a Chat Completions response
@@ -301,6 +305,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock response in Responses format (as if upstream supports it)
@@ -388,6 +394,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Mock streaming SSE response
@@ -474,6 +482,8 @@ mod tests {
             key_labels: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
+            priority_routing: false,
+            batch_header: None,
         };
 
         // Streaming response that finishes with tool_calls
