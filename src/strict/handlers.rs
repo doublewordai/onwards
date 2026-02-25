@@ -2461,13 +2461,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -2573,13 +2573,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -2672,13 +2672,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -2778,13 +2778,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -2867,13 +2867,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -2962,13 +2962,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -3082,13 +3082,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -3831,13 +3831,13 @@ mod tests {
 
         // Trusted pool
         let trusted_pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://trusted.com".parse().unwrap())
                     .onwards_key("sk-trusted".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -3850,13 +3850,13 @@ mod tests {
 
         // Untrusted pool
         let untrusted_pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://untrusted.com".parse().unwrap())
                     .onwards_key("sk-untrusted".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -3972,13 +3972,13 @@ mod tests {
         let targets_map = Arc::new(DashMap::new());
         // Create a trusted pool
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
                     .onwards_key("sk-test".to_string())
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -4060,13 +4060,13 @@ mod tests {
 
         let targets_map = Arc::new(DashMap::new());
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.example.com".parse().unwrap())
                     .trusted(true) // provider is trusted
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,
@@ -4131,13 +4131,13 @@ mod tests {
 
         let targets_map = Arc::new(DashMap::new());
         let pool = ProviderPool::with_config(
-            vec![Provider {
-                target: Target::builder()
+            vec![Provider::new(
+                Target::builder()
                     .url("https://api.example.com".parse().unwrap())
                     .trusted(false) // provider explicitly NOT trusted
                     .build(),
-                weight: 1,
-            }],
+                1,
+            )],
             None,
             None,
             None,

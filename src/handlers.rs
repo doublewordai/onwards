@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::{RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -26,6 +26,29 @@ use tracing::{debug, error, instrument, trace};
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
+}
+
+/// A stream wrapper that keeps a [`ConcurrencyGuard`] alive until the stream
+/// is fully consumed or dropped. This ensures the active connection count is
+/// decremented when the response body finishes, not when the handler returns —
+/// critical for streaming responses where the body outlives the handler.
+struct GuardedStream<S> {
+    inner: S,
+    _guard: ConcurrencyGuard,
+}
+
+impl<S, E> futures_util::Stream for GuardedStream<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, E>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
 }
 
 /// Stores the original model name requested by the client
@@ -313,9 +336,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Acquire pool-level concurrency permit
     let _pool_concurrency_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
-        match limiter.acquire().await {
-            Ok(guard) => Some(guard),
-            Err(_) => {
+        match limiter.try_acquire() {
+            Some(guard) => Some(guard),
+            None => {
                 debug!(
                     "Pool-level concurrency limit exceeded for model: {}",
                     model_name
@@ -330,9 +353,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // Acquire per-key concurrency permit
     let _key_concurrency_guard = if let Some(token) = bearer_token {
         if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
-            match limiter.acquire().await {
-                Ok(guard) => Some(guard),
-                Err(_) => {
+            match limiter.try_acquire() {
+                Some(guard) => Some(guard),
+                None => {
                     debug!("Per-key concurrency limit exceeded for token: {}", token);
                     return Err(OnwardsErrorResponse::concurrency_limited());
                 }
@@ -359,8 +382,13 @@ pub async fn target_message_handler<T: HttpClient>(
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
 
-    // Iterate through providers (with fallback support)
-    for (_idx, target) in pool.select_ordered() {
+    // Iterate through providers (with fallback support).
+    // select_iter() uses weighted least connections: picks the provider with the
+    // lowest active_connections/weight ratio, skipping providers at their
+    // concurrency limit. The returned guard tracks the active connection.
+    let mut any_attempted = false;
+    for (_idx, target, connection_guard) in pool.select_iter() {
+        any_attempted = true;
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
         if let Some(ref limiter) = target.limiter
             && limiter.check().is_err()
@@ -374,26 +402,6 @@ pub async fn target_message_handler<T: HttpClient>(
                 return Err(OnwardsErrorResponse::rate_limited());
             }
         }
-
-        // Acquire provider-level concurrency permit
-        let _target_concurrency_guard = if let Some(ref limiter) = target.concurrency_limiter {
-            match limiter.acquire().await {
-                Ok(guard) => Some(guard),
-                Err(_) => {
-                    debug!("Provider concurrency limit exceeded: {:?}", target.url);
-                    last_error = Some(OnwardsErrorResponse::concurrency_limited());
-                    // Concurrency limits are treated like rate limits for fallback purposes
-                    if pool.should_fallback_on_rate_limit() {
-                        debug!("Fallback on rate limit enabled, trying next provider");
-                        continue;
-                    } else {
-                        return Err(OnwardsErrorResponse::concurrency_limited());
-                    }
-                }
-            }
-        } else {
-            None
-        };
 
         // Clone response headers for later use
         let response_headers = target.response_headers.clone();
@@ -796,14 +804,38 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
+
+        // Attach the connection guard to the response body so the active
+        // connection count is decremented when the body stream completes,
+        // not when the handler returns. Critical for streaming responses.
+        let (parts, body) = response.into_parts();
+        let guarded = GuardedStream {
+            inner: body.into_data_stream(),
+            _guard: connection_guard,
+        };
+        let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
+
         return Ok(response);
     }
 
-    // All providers exhausted
-    let final_error =
-        last_error.unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
-    record_response_status(final_error.status.as_u16());
-    Err(final_error)
+    // All providers exhausted — distinguish "no providers found" from
+    // "all providers at concurrency capacity"
+    if any_attempted {
+        // We tried at least one provider but all failed
+        let final_error = last_error
+            .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+        record_response_status(final_error.status.as_u16());
+        Err(final_error)
+    } else if !pool.is_empty() {
+        // Pool has providers but select_iter() yielded nothing — all at capacity
+        record_response_status(429);
+        Err(OnwardsErrorResponse::concurrency_limited())
+    } else {
+        // Empty pool (shouldn't normally happen, targets resolved earlier)
+        let err = OnwardsErrorResponse::model_not_found(model_name.as_str());
+        record_response_status(err.status.as_u16());
+        Err(err)
+    }
 }
 
 #[instrument(skip(state, req))]
@@ -1634,16 +1666,7 @@ mod tests {
             .request_timeout_secs(1)
             .build();
 
-        let providers = vec![
-            Provider {
-                target: target1,
-                weight: 1,
-            },
-            Provider {
-                target: target2,
-                weight: 1,
-            },
-        ];
+        let providers = vec![Provider::new(target1, 1), Provider::new(target2, 1)];
 
         let fallback_config = Some(FallbackConfig {
             enabled: true,

@@ -23,8 +23,9 @@ use futures_util::{Stream, StreamExt};
 use governor::{DefaultDirectRateLimiter, Quota};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
-use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info, trace};
 use url::Url;
@@ -427,10 +428,6 @@ impl From<TargetSpec> for Target {
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
                 )) as Arc<dyn RateLimiter>
             }),
-            concurrency_limiter: value.concurrency_limit.map(|cl| {
-                SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
-                    as Arc<dyn ConcurrencyLimiter>
-            }),
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
@@ -454,10 +451,6 @@ impl From<ProviderSpec> for Target {
                     Quota::per_second(rl.requests_per_second)
                         .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
                 )) as Arc<dyn RateLimiter>
-            }),
-            concurrency_limiter: value.concurrency_limit.map(|cl| {
-                SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
-                    as Arc<dyn ConcurrencyLimiter>
             }),
             upstream_auth_header_name: value.upstream_auth_header_name,
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
@@ -484,42 +477,90 @@ impl RateLimiter for DefaultDirectRateLimiter {
     }
 }
 
-/// RAII guard that holds a concurrency permit
-/// When dropped, the permit is automatically released back to the semaphore
+/// RAII guard that tracks an active connection/request.
+/// When dropped, decrements the associated counter.
 #[derive(Debug)]
 pub struct ConcurrencyGuard {
-    _permit: SemaphorePermit<'static>,
+    active: Arc<AtomicUsize>,
 }
 
-#[async_trait]
-pub trait ConcurrencyLimiter: std::fmt::Debug + Send + Sync {
-    /// Try to acquire a concurrency permit
-    /// Returns Ok(guard) if permit was acquired, Err(()) if at capacity
-    async fn acquire(&self) -> Result<ConcurrencyGuard, ()>;
-}
-
-/// Semaphore-based concurrency limiter
-#[derive(Debug)]
-pub struct SemaphoreConcurrencyLimiter {
-    semaphore: &'static Semaphore,
-}
-
-impl SemaphoreConcurrencyLimiter {
-    pub fn new(max_concurrent: usize) -> Arc<Self> {
-        Arc::new(Self {
-            semaphore: Box::leak(Box::new(Semaphore::new(max_concurrent))),
-        })
+impl Drop for ConcurrencyGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
     }
 }
 
-#[async_trait]
-impl ConcurrencyLimiter for SemaphoreConcurrencyLimiter {
-    async fn acquire(&self) -> Result<ConcurrencyGuard, ()> {
-        // Try to acquire without blocking - fail immediately if at capacity
-        match self.semaphore.try_acquire() {
-            Ok(permit) => Ok(ConcurrencyGuard { _permit: permit }),
-            Err(_) => Err(()),
+/// Tracks active connections and enforces an optional concurrency limit.
+///
+/// Used uniformly for provider connection tracking, pool-level concurrency
+/// limits, and per-key concurrency limits.
+#[derive(Debug, Clone)]
+pub struct ConcurrencyLimiter {
+    active: Arc<AtomicUsize>,
+    limit: Option<usize>,
+}
+
+impl Default for ConcurrencyLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConcurrencyLimiter {
+    /// Create a limiter that tracks connections without a limit.
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            limit: None,
         }
+    }
+
+    /// Create a limiter with a maximum concurrent request limit.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            limit: Some(limit),
+        }
+    }
+
+    /// Try to acquire a concurrency slot.
+    /// Returns a guard on success, None if at capacity.
+    pub fn try_acquire(&self) -> Option<ConcurrencyGuard> {
+        loop {
+            let current = self.active.load(Ordering::Acquire);
+            if let Some(max) = self.limit
+                && current >= max
+            {
+                return None;
+            }
+            if self
+                .active
+                .compare_exchange_weak(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(ConcurrencyGuard {
+                    active: Arc::clone(&self.active),
+                });
+            }
+        }
+    }
+
+    /// Check if the limiter is at capacity without acquiring a slot.
+    pub fn at_capacity(&self) -> bool {
+        match self.limit {
+            Some(max) => self.active.load(Ordering::Acquire) >= max,
+            None => false,
+        }
+    }
+
+    /// Get the current number of active connections.
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Get the concurrency limit, if set.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
     }
 }
 
@@ -540,7 +581,6 @@ pub struct Target {
     pub onwards_key: Option<String>,
     pub onwards_model: Option<String>,
     pub limiter: Option<Arc<dyn RateLimiter>>,
-    pub concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>>,
     pub upstream_auth_header_name: Option<String>,
     pub upstream_auth_header_prefix: Option<String>,
     /// Custom headers to include in responses (e.g., pricing, metadata)
@@ -563,16 +603,13 @@ impl Target {
     pub fn into_pool(self) -> ProviderPool {
         let keys = self.keys.clone();
         ProviderPool::with_config(
-            vec![Provider {
-                target: self,
-                weight: 1,
-            }],
+            vec![Provider::new(self, 1)],
             keys,
             None,
             None,
             None,
             LoadBalanceStrategy::default(),
-            false, // trusted defaults to false
+            false,
             Vec::new(),
         )
     }
@@ -664,7 +701,7 @@ pub struct Targets {
     /// Direct rate limiters per actual API key (actual key -> rate limiter)
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
     /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
-    pub key_concurrency_limiters: Arc<DashMap<String, Arc<dyn ConcurrencyLimiter>>>,
+    pub key_concurrency_limiters: Arc<DashMap<String, ConcurrencyLimiter>>,
     /// Labels per actual API key (actual key -> labels map)
     pub key_labels: Arc<DashMap<String, HashMap<String, String>>>,
     /// Enable strict mode with schema validation
@@ -829,9 +866,8 @@ impl Targets {
                 key_rate_limiters.insert(key_def.key.clone(), limiter);
             }
             if let Some(ref concurrency_limit) = key_def.concurrency_limit {
-                let limiter: Arc<dyn ConcurrencyLimiter> =
-                    SemaphoreConcurrencyLimiter::new(concurrency_limit.max_concurrent_requests);
-                // Map the actual API key to its concurrency limiter
+                let limiter =
+                    ConcurrencyLimiter::with_limit(concurrency_limit.max_concurrent_requests);
                 key_concurrency_limiters.insert(key_def.key.clone(), limiter);
             }
             if !key_def.labels.is_empty() {
@@ -864,11 +900,9 @@ impl Targets {
             });
 
             // Create pool-level concurrency limiter
-            let pool_concurrency_limiter: Option<Arc<dyn ConcurrencyLimiter>> =
-                pool_config.concurrency_limit.map(|cl| {
-                    SemaphoreConcurrencyLimiter::new(cl.max_concurrent_requests)
-                        as Arc<dyn ConcurrencyLimiter>
-                });
+            let pool_concurrency_limiter = pool_config
+                .concurrency_limit
+                .map(|cl| ConcurrencyLimiter::with_limit(cl.max_concurrent_requests));
 
             // Convert provider specs to providers
             // Pool-level sanitize_response enables sanitization for all providers
@@ -878,10 +912,17 @@ impl Targets {
                 .into_iter()
                 .map(|mut spec| {
                     let weight = spec.weight;
+                    let concurrency_limit = spec
+                        .concurrency_limit
+                        .as_ref()
+                        .map(|cl| cl.max_concurrent_requests);
                     // Enable sanitization if either pool or provider level is true
                     spec.sanitize_response = pool_sanitize || spec.sanitize_response;
                     let target: Target = spec.into();
-                    Provider { target, weight }
+                    match concurrency_limit {
+                        Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
+                        None => Provider::new(target, weight),
+                    }
                 })
                 .collect();
 
@@ -1648,10 +1689,12 @@ mod tests {
 
         let targets = Targets::from_config(config_file).unwrap();
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
 
-        // Target should have concurrency limiter configured
-        assert!(target.concurrency_limiter.is_some());
+        // Provider should have concurrency limiter configured (limit of 5)
+        // Verify by selecting 5 times (all succeed) then a 6th (fails)
+        let guards: Vec<_> = (0..5).filter_map(|_| pool.select()).collect();
+        assert_eq!(guards.len(), 5);
+        assert!(pool.select().is_none());
     }
 
     #[test]
@@ -1676,53 +1719,53 @@ mod tests {
 
         let targets = Targets::from_config(config_file).unwrap();
         let pool = targets.targets.get("test-model").unwrap();
-        let target = pool.first_target().unwrap();
 
-        // Target should not have concurrency limiter
-        assert!(target.concurrency_limiter.is_none());
+        // Provider should not have concurrency limiter (unlimited selects)
+        let guards: Vec<_> = (0..100).filter_map(|_| pool.select()).collect();
+        assert_eq!(guards.len(), 100);
     }
 
-    #[tokio::test]
-    async fn test_concurrency_limiter_allows_requests() {
-        let limiter = SemaphoreConcurrencyLimiter::new(2);
+    #[test]
+    fn test_concurrency_limiter_allows_requests() {
+        let limiter = ConcurrencyLimiter::with_limit(2);
 
         // First request should succeed
-        let guard1 = limiter.acquire().await;
-        assert!(guard1.is_ok());
+        let guard1 = limiter.try_acquire();
+        assert!(guard1.is_some());
 
         // Second request should succeed
-        let guard2 = limiter.acquire().await;
-        assert!(guard2.is_ok());
+        let guard2 = limiter.try_acquire();
+        assert!(guard2.is_some());
     }
 
-    #[tokio::test]
-    async fn test_concurrency_limiter_blocks_at_capacity() {
-        let limiter = SemaphoreConcurrencyLimiter::new(2);
+    #[test]
+    fn test_concurrency_limiter_blocks_at_capacity() {
+        let limiter = ConcurrencyLimiter::with_limit(2);
 
         // Acquire all available permits
-        let _guard1 = limiter.acquire().await.unwrap();
-        let _guard2 = limiter.acquire().await.unwrap();
+        let _guard1 = limiter.try_acquire().unwrap();
+        let _guard2 = limiter.try_acquire().unwrap();
 
         // Third request should fail
-        let guard3 = limiter.acquire().await;
-        assert!(guard3.is_err());
+        let guard3 = limiter.try_acquire();
+        assert!(guard3.is_none());
     }
 
-    #[tokio::test]
-    async fn test_concurrency_limiter_releases_on_drop() {
-        let limiter = SemaphoreConcurrencyLimiter::new(1);
+    #[test]
+    fn test_concurrency_limiter_releases_on_drop() {
+        let limiter = ConcurrencyLimiter::with_limit(1);
 
         {
             // Acquire the only permit
-            let _guard = limiter.acquire().await.unwrap();
+            let _guard = limiter.try_acquire().unwrap();
 
             // Second request should fail while guard is held
-            assert!(limiter.acquire().await.is_err());
+            assert!(limiter.try_acquire().is_none());
         } // guard drops here
 
         // After guard is dropped, should be able to acquire again
-        let guard = limiter.acquire().await;
-        assert!(guard.is_ok());
+        let guard = limiter.try_acquire();
+        assert!(guard.is_some());
     }
 
     #[test]
@@ -1964,7 +2007,7 @@ mod tests {
         let pool = target.into_pool();
 
         // Verify the target's sanitize_response is accessible through the pool
-        let (_, first_target) = pool.select_ordered().next().unwrap();
+        let (_, first_target, _guard) = pool.select_iter().next().unwrap();
         assert!(
             first_target.sanitize_response,
             "into_pool should preserve sanitize_response setting"
@@ -1982,7 +2025,7 @@ mod tests {
         let pool = target.into_pool();
 
         // Verify the target's sanitize_response is accessible through the pool
-        let (_, first_target) = pool.select_ordered().next().unwrap();
+        let (_, first_target, _guard) = pool.select_iter().next().unwrap();
         assert!(
             !first_target.sanitize_response,
             "into_pool should preserve default sanitize_response setting"

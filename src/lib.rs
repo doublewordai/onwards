@@ -837,8 +837,8 @@ pub mod test_utils {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::load_balancer::ProviderPool;
-    use crate::target::{Target, Targets};
+    use crate::load_balancer::{Provider, ProviderPool};
+    use crate::target::{ConcurrencyLimiter, Target, Targets};
     use axum::http::StatusCode;
     use axum_test::TestServer;
     use dashmap::DashMap;
@@ -1559,18 +1559,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrency_limiting_below_limits() {
-        use target::SemaphoreConcurrencyLimiter;
-
         // Create a target with concurrency limit
         let targets_map = Arc::new(DashMap::new());
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
         targets_map.insert(
             "limited-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .concurrency_limiter(SemaphoreConcurrencyLimiter::new(5))
-                    .build(),
-            ),
+            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]),
         );
 
         let targets = Targets {
@@ -1606,17 +1602,23 @@ mod tests {
     #[tokio::test]
     async fn test_concurrency_limiting_at_limits() {
         use std::rc::Rc;
-        use target::SemaphoreConcurrencyLimiter;
 
-        // Create a target with concurrency limit of 1
+        // Create a target with pool-level concurrency limit of 1
         let targets_map = Arc::new(DashMap::new());
+        let target = Target::builder()
+            .url("https://api.example.com".parse().unwrap())
+            .build();
         targets_map.insert(
             "limited-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .concurrency_limiter(SemaphoreConcurrencyLimiter::new(1))
-                    .build(),
+            ProviderPool::with_config(
+                vec![Provider::new(target, 1)],
+                None,
+                None,
+                Some(ConcurrencyLimiter::with_limit(1)),
+                None,
+                target::LoadBalanceStrategy::default(),
+                false,
+                Vec::new(),
             ),
         );
 
@@ -1675,7 +1677,6 @@ mod tests {
     #[tokio::test]
     async fn test_per_key_concurrency_limiting() {
         use std::rc::Rc;
-        use target::SemaphoreConcurrencyLimiter;
 
         // Create a target without concurrency limit
         let targets_map = Arc::new(DashMap::new());
@@ -1692,7 +1693,7 @@ mod tests {
         let key_concurrency_limiters = Arc::new(DashMap::new());
         key_concurrency_limiters.insert(
             "sk-limited-key".to_string(),
-            SemaphoreConcurrencyLimiter::new(1) as Arc<dyn target::ConcurrencyLimiter>,
+            ConcurrencyLimiter::with_limit(1),
         );
 
         let targets = Targets {
@@ -2630,20 +2631,20 @@ mod tests {
         async fn test_load_balancing_with_multiple_providers() {
             // Create a pool with two providers
             let providers = vec![
-                Provider {
-                    target: Target::builder()
+                Provider::new(
+                    Target::builder()
                         .url("https://api.provider1.com".parse().unwrap())
                         .onwards_key("key1".to_string())
                         .build(),
-                    weight: 1,
-                },
-                Provider {
-                    target: Target::builder()
+                    1,
+                ),
+                Provider::new(
+                    Target::builder()
                         .url("https://api.provider2.com".parse().unwrap())
                         .onwards_key("key2".to_string())
                         .build(),
-                    weight: 1,
-                },
+                    1,
+                ),
             ];
             let pool = ProviderPool::new(providers);
 
@@ -2686,20 +2687,20 @@ mod tests {
         async fn test_load_balancing_with_weighted_providers() {
             // Create a pool with providers having different weights
             let providers = vec![
-                Provider {
-                    target: Target::builder()
+                Provider::new(
+                    Target::builder()
                         .url("https://api.high-weight.com".parse().unwrap())
                         .onwards_key("key-high".to_string())
                         .build(),
-                    weight: 3, // Higher weight = more traffic
-                },
-                Provider {
-                    target: Target::builder()
+                    3,
+                ), // Higher weight = more traffic
+                Provider::new(
+                    Target::builder()
                         .url("https://api.low-weight.com".parse().unwrap())
                         .onwards_key("key-low".to_string())
                         .build(),
-                    weight: 1,
-                },
+                    1,
+                ),
             ];
             let pool = ProviderPool::new(providers);
 
@@ -3185,14 +3186,8 @@ mod tests {
                 .build();
 
             let pool = ProviderPool::new(vec![
-                crate::load_balancer::Provider {
-                    target: provider1,
-                    weight: 1,
-                },
-                crate::load_balancer::Provider {
-                    target: provider2,
-                    weight: 1,
-                },
+                crate::load_balancer::Provider::new(provider1, 1),
+                crate::load_balancer::Provider::new(provider2, 1),
             ]);
 
             let targets_map = Arc::new(DashMap::new());
