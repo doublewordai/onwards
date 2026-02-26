@@ -3477,4 +3477,443 @@ mod tests {
             assert_eq!(body["error"]["message"], "provider-specific detail");
         }
     }
+
+    mod priority_routing {
+        use super::*;
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use axum::http::StatusCode;
+        use axum_test::TestServer;
+        use dashmap::DashMap;
+        use serde_json::json;
+        use std::sync::Arc;
+        use test_utils::MockHttpClient;
+
+        /// Helper: build Targets with priority_routing and batch_header configured
+        fn priority_targets(
+            targets_map: Arc<DashMap<String, ProviderPool>>,
+        ) -> Targets {
+            Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+                priority_routing: true,
+                batch_header: Some("x-fusillade-batch-id".to_string()),
+            }
+        }
+
+        /// Helper: build Targets with priority_routing disabled
+        fn default_targets(
+            targets_map: Arc<DashMap<String, ProviderPool>>,
+        ) -> Targets {
+            Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+                priority_routing: false,
+                batch_header: None,
+            }
+        }
+
+        /// Helper: create a pool with one priority provider and one non-priority provider.
+        /// Uses Priority strategy so provider order is deterministic.
+        fn mixed_pool() -> ProviderPool {
+            let priority_provider = Provider::new(
+                Target::builder()
+                    .url("https://priority.example.com".parse().unwrap())
+                    .supports_priority(true)
+                    .build(),
+                1,
+            );
+            let normal_provider = Provider::new(
+                Target::builder()
+                    .url("https://normal.example.com".parse().unwrap())
+                    .build(),
+                1,
+            );
+            ProviderPool::with_config(
+                vec![priority_provider, normal_provider],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        }
+
+        /// Helper: parse the forwarded body from a mock request
+        fn forwarded_body(mock: &MockHttpClient) -> serde_json::Value {
+            let requests = mock.get_requests();
+            assert_eq!(requests.len(), 1, "Expected exactly one forwarded request");
+            serde_json::from_slice(&requests[0].body).unwrap()
+        }
+
+        fn forwarded_url(mock: &MockHttpClient) -> String {
+            let requests = mock.get_requests();
+            assert_eq!(requests.len(), 1, "Expected exactly one forwarded request");
+            requests[0].uri.clone()
+        }
+
+        // ── Realtime request routing ───────────────────────────────────
+
+        #[tokio::test]
+        async fn realtime_request_routed_to_priority_provider() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), mixed_pool());
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            // Should have gone to the priority provider (first in pool)
+            assert!(
+                forwarded_url(&mock).contains("priority.example.com"),
+                "Realtime request should route to priority provider"
+            );
+        }
+
+        #[tokio::test]
+        async fn realtime_request_gets_priority_zero() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), mixed_pool());
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            assert_eq!(body["priority"], 0, "Realtime request should get priority=0");
+        }
+
+        // ── Batch request routing ──────────────────────────────────────
+
+        #[tokio::test]
+        async fn batch_request_routed_to_any_provider() {
+            // With Priority strategy the first provider (priority) is always picked
+            // when available, so use a pool with only a non-priority provider to
+            // prove batch requests are not filtered out.
+            let normal_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://normal.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), normal_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .add_header("x-fusillade-batch-id", "batch-123")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                forwarded_url(&mock).contains("normal.example.com"),
+                "Batch request should reach non-priority provider"
+            );
+        }
+
+        #[tokio::test]
+        async fn batch_request_to_priority_provider_gets_priority_one() {
+            // Pool with only a priority provider
+            let priority_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://priority.example.com".parse().unwrap())
+                        .supports_priority(true)
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), priority_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            server
+                .post("/v1/chat/completions")
+                .add_header("x-fusillade-batch-id", "batch-123")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            assert_eq!(body["priority"], 1, "Batch request to priority provider should get priority=1");
+        }
+
+        #[tokio::test]
+        async fn batch_request_to_non_priority_provider_has_no_priority() {
+            let normal_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://normal.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), normal_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            server
+                .post("/v1/chat/completions")
+                .add_header("x-fusillade-batch-id", "batch-123")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            assert!(body.get("priority").is_none(), "Non-priority provider should not receive priority field");
+        }
+
+        // ── Priority stripping ─────────────────────────────────────────
+
+        #[tokio::test]
+        async fn user_set_priority_is_always_stripped() {
+            // Even on a priority provider, user-supplied priority should be replaced
+            let priority_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://priority.example.com".parse().unwrap())
+                        .supports_priority(true)
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), priority_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            // User sends priority=99 — should be overwritten to 0
+            server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": [], "priority": 99}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            assert_eq!(body["priority"], 0, "User-set priority should be overwritten to 0 for realtime");
+        }
+
+        #[tokio::test]
+        async fn user_set_priority_stripped_from_non_priority_provider() {
+            let normal_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://normal.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), normal_only);
+
+            // No priority routing (disabled), so realtime can reach non-priority providers
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(default_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": [], "priority": 5}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            assert!(body.get("priority").is_none(), "Priority should be stripped for non-priority provider");
+        }
+
+        // ── priority_routing disabled ──────────────────────────────────
+
+        #[tokio::test]
+        async fn priority_routing_disabled_allows_realtime_to_any_provider() {
+            // When priority_routing is false, realtime requests can go to non-priority providers
+            let normal_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://normal.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), normal_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(default_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                forwarded_url(&mock).contains("normal.example.com"),
+                "With priority_routing disabled, realtime should reach any provider"
+            );
+        }
+
+        // ── No priority providers in pool ──────────────────────────────
+
+        #[tokio::test]
+        async fn pool_with_no_priority_providers_routes_normally() {
+            // Even with priority_routing=true, if no provider supports priority,
+            // all requests should proceed normally (no skip logic).
+            let normal_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://normal.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), normal_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            let app = AppState::with_client(priority_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert!(
+                forwarded_url(&mock).contains("normal.example.com"),
+                "Pool with no priority providers should route normally"
+            );
+        }
+
+        // ── Batch header detection ─────────────────────────────────────
+
+        #[tokio::test]
+        async fn no_batch_header_configured_disables_batch_detection() {
+            // With batch_header=None, even requests with x-fusillade-batch-id
+            // should be treated as realtime
+            let priority_only = ProviderPool::with_config(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://priority.example.com".parse().unwrap())
+                        .supports_priority(true)
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            );
+
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("test-model".to_string(), priority_only);
+
+            let mock = MockHttpClient::new(StatusCode::OK, r#"{"id":"1"}"#);
+            // Use default_targets (batch_header=None)
+            let app = AppState::with_client(default_targets(targets_map), mock.clone());
+            let server = TestServer::new(build_router(app)).unwrap();
+
+            server
+                .post("/v1/chat/completions")
+                .add_header("x-fusillade-batch-id", "batch-123")
+                .json(&json!({"model": "test-model", "messages": []}))
+                .await;
+
+            let body = forwarded_body(&mock);
+            // Without batch_header config, this is treated as realtime → priority=0
+            assert_eq!(body["priority"], 0, "Without batch_header config, request should be treated as realtime");
+        }
+    }
 }
