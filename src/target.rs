@@ -562,6 +562,16 @@ impl ConcurrencyLimiter {
     pub fn limit(&self) -> Option<usize> {
         self.limit
     }
+
+    /// Adopt the active connection counter from another limiter.
+    ///
+    /// This preserves in-flight connection tracking across config reloads:
+    /// existing `ConcurrencyGuard`s still reference the old `Arc<AtomicUsize>`,
+    /// so by sharing it into the new limiter, active counts remain accurate.
+    /// The limit is taken from `self` (the new config), not the old limiter.
+    pub fn adopt_active_counter(&mut self, old: &ConcurrencyLimiter) {
+        self.active = Arc::clone(&old.active);
+    }
 }
 
 /// A target represents a destination for requests, specified by its URL.
@@ -995,9 +1005,17 @@ impl Targets {
                             }
                         }
 
-                        // Insert/update targets
+                        // Insert/update targets, preserving active connection
+                        // counters from existing pools so in-flight ConcurrencyGuards
+                        // stay connected and weighted least-connections sees accurate
+                        // active counts across config reloads.
                         for entry in new_targets.targets.iter() {
-                            targets.insert(entry.key().clone(), entry.value().clone());
+                            let alias = entry.key().clone();
+                            let mut new_pool = entry.value().clone();
+                            if let Some(old_pool) = targets.get(&alias) {
+                                new_pool.adopt_provider_state(&old_pool);
+                            }
+                            targets.insert(alias, new_pool);
                         }
 
                         // Update key rate limiters atomically (same pattern)
@@ -1032,10 +1050,15 @@ impl Targets {
                             }
                         }
 
-                        // Insert/update key concurrency limiters
+                        // Insert/update key concurrency limiters, preserving
+                        // active counters from existing limiters.
                         for entry in new_targets.key_concurrency_limiters.iter() {
-                            key_concurrency_limiters
-                                .insert(entry.key().clone(), entry.value().clone());
+                            let key = entry.key().clone();
+                            let mut new_limiter = entry.value().clone();
+                            if let Some(old_limiter) = key_concurrency_limiters.get(&key) {
+                                new_limiter.adopt_active_counter(&old_limiter);
+                            }
+                            key_concurrency_limiters.insert(key, new_limiter);
                         }
 
                         // Update key labels atomically (same pattern)
