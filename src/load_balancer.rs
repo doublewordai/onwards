@@ -350,6 +350,37 @@ impl ProviderPool {
             matches.then_some(&rule.action)
         })
     }
+
+    /// Adopt active connection counters from an old pool into this (new) pool.
+    ///
+    /// Matches providers by (url, onwards_key, onwards_model) identity. Where a
+    /// provider exists in both old and new pools, the new provider takes ownership
+    /// of the old provider's `ConcurrencyLimiter` counter (`Arc<AtomicUsize>`).
+    /// This keeps in-flight `ConcurrencyGuard`s connected to the live pool, so
+    /// the weighted least-connections algorithm sees accurate active counts
+    /// across config reloads.
+    ///
+    /// New providers (not in the old pool) keep their fresh zero counters.
+    /// Removed providers (not in the new pool) are simply dropped.
+    /// The pool-level concurrency limiter is also preserved if present in both.
+    pub fn adopt_provider_state(&mut self, old: &ProviderPool) {
+        for new_provider in &mut self.providers {
+            if let Some(old_provider) = old.providers.iter().find(|old_p| {
+                old_p.target.url == new_provider.target.url
+                    && old_p.target.onwards_key == new_provider.target.onwards_key
+                    && old_p.target.onwards_model == new_provider.target.onwards_model
+            }) {
+                new_provider.limiter.adopt_active_counter(&old_provider.limiter);
+            }
+        }
+
+        // Preserve pool-level concurrency counter if both old and new have one
+        if let (Some(new_limiter), Some(old_limiter)) =
+            (&mut self.pool_concurrency_limiter, &old.pool_concurrency_limiter)
+        {
+            new_limiter.adopt_active_counter(old_limiter);
+        }
+    }
 }
 
 /// Lazy iterator for fallback provider selection.
@@ -1165,5 +1196,138 @@ mod tests {
             pool.evaluate_routing_rules(&labels),
             Some(RoutingAction::Deny)
         ));
+    }
+
+    #[test]
+    fn test_adopt_provider_state_preserves_active_counts() {
+        let providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 3),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+        let old_pool = ProviderPool::new(providers);
+
+        // Accumulate some active connections on the old pool
+        let mut guards = Vec::new();
+        for _ in 0..8 {
+            if let Some((_, _, guard)) = old_pool.select() {
+                guards.push(guard);
+            }
+        }
+
+        let old_active_0 = old_pool.providers()[0].active_connections();
+        let old_active_1 = old_pool.providers()[1].active_connections();
+        assert!(old_active_0 > 0, "Should have active connections on provider 0");
+        assert!(old_active_1 > 0, "Should have active connections on provider 1");
+
+        // Create a new pool (simulating a config reload) and adopt state
+        let new_providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 3),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+        let mut new_pool = ProviderPool::new(new_providers);
+
+        assert_eq!(new_pool.providers()[0].active_connections(), 0);
+        assert_eq!(new_pool.providers()[1].active_connections(), 0);
+
+        new_pool.adopt_provider_state(&old_pool);
+
+        // New pool should see the same active counts
+        assert_eq!(new_pool.providers()[0].active_connections(), old_active_0);
+        assert_eq!(new_pool.providers()[1].active_connections(), old_active_1);
+
+        // Dropping a guard should decrement both old and new views
+        guards.pop();
+        let total_after = new_pool.providers()[0].active_connections()
+            + new_pool.providers()[1].active_connections();
+        assert_eq!(total_after, old_active_0 + old_active_1 - 1);
+    }
+
+    #[test]
+    fn test_adopt_provider_state_new_provider_starts_at_zero() {
+        let old_providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+        ];
+        let old_pool = ProviderPool::new(old_providers);
+
+        // Accumulate connections on old pool
+        let _guards: Vec<_> = (0..5)
+            .filter_map(|_| old_pool.select().map(|(_, _, g)| g))
+            .collect();
+
+        // New pool has an additional provider
+        let new_providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+        let mut new_pool = ProviderPool::new(new_providers);
+        new_pool.adopt_provider_state(&old_pool);
+
+        // Existing provider should have adopted counts
+        assert_eq!(new_pool.providers()[0].active_connections(), 5);
+        // New provider should start fresh at 0
+        assert_eq!(new_pool.providers()[1].active_connections(), 0);
+    }
+
+    #[test]
+    fn test_adopt_provider_state_removed_provider_ignored() {
+        let old_providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+        let old_pool = ProviderPool::new(old_providers);
+
+        let _guards: Vec<_> = (0..4)
+            .filter_map(|_| old_pool.select().map(|(_, _, g)| g))
+            .collect();
+
+        // New pool removes api2
+        let new_providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+        ];
+        let mut new_pool = ProviderPool::new(new_providers);
+        new_pool.adopt_provider_state(&old_pool);
+
+        // Should only have the surviving provider's count
+        assert!(new_pool.providers()[0].active_connections() > 0);
+        assert_eq!(new_pool.providers().len(), 1);
+    }
+
+    #[test]
+    fn test_adopt_provider_state_preserves_pool_concurrency_limiter() {
+        use crate::target::ConcurrencyLimiter;
+
+        let old_pool = ProviderPool::with_config(
+            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            None,
+            None,
+            Some(ConcurrencyLimiter::with_limit(100)),
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+
+        // Acquire some pool-level concurrency slots
+        let _guard1 = old_pool.pool_concurrency_limiter().unwrap().try_acquire();
+        let _guard2 = old_pool.pool_concurrency_limiter().unwrap().try_acquire();
+        assert_eq!(old_pool.pool_concurrency_limiter().unwrap().active(), 2);
+
+        let mut new_pool = ProviderPool::with_config(
+            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            None,
+            None,
+            Some(ConcurrencyLimiter::with_limit(200)), // new limit
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+
+        new_pool.adopt_provider_state(&old_pool);
+
+        // Should have adopted the active count
+        assert_eq!(new_pool.pool_concurrency_limiter().unwrap().active(), 2);
+        // But the new limit should apply
+        assert_eq!(new_pool.pool_concurrency_limiter().unwrap().limit(), Some(200));
     }
 }
