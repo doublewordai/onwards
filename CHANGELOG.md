@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1](https://github.com/doublewordai/onwards/compare/v0.18.0...v0.18.1) - 2026-02-27
+
+### Fixed
+
+- preserve request counts across config updates ([#118](https://github.com/doublewordai/onwards/pull/118))
+
 ## [0.18.0](https://github.com/doublewordai/onwards/compare/v0.17.1...v0.18.0) - 2026-02-25
 
 ### Added
