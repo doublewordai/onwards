@@ -3,7 +3,9 @@
 //! These schemas match the OpenAI Completions API specification (legacy text completions).
 //! See: https://platform.openai.com/docs/api-reference/completions
 //!
-//! In strict mode, completions requests are always adapted to Chat Completions internally.
+//! In strict mode, completions requests are validated against the typed schema,
+//! forwarded to the upstream `/v1/completions` endpoint, and the response is
+//! sanitized (unknown fields stripped, model field rewritten).
 
 use serde::{Deserialize, Serialize};
 
