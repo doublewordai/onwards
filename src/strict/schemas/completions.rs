@@ -11,14 +11,16 @@ use serde::{Deserialize, Serialize};
 
 use super::chat_completions::{StopSequence, Usage};
 
-/// Prompt input — string, array of strings, or token arrays
+/// Prompt input — matches the OpenAI spec `oneOf`: string | string[] | integer[] | integer[][]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompletionPrompt {
     Single(String),
     Multiple(Vec<String>),
-    /// Token-based prompts (number[] or number[][]); forwarded to upstream as-is
-    Tokens(Vec<serde_json::Value>),
+    /// Pre-tokenized prompt as a flat array of token IDs
+    Tokens(Vec<u32>),
+    /// Pre-tokenized prompt as an array of token ID arrays (batch)
+    TokenArrays(Vec<Vec<u32>>),
 }
 
 /// Request body for POST /v1/completions
@@ -156,6 +158,27 @@ mod tests {
         let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [1, 2, 3]}"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(req.prompt, CompletionPrompt::Tokens(_)));
+    }
+
+    #[test]
+    fn test_deserialize_token_array_of_arrays_prompt() {
+        let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [[1, 2], [3, 4]]}"#;
+        let req: CompletionRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(req.prompt, CompletionPrompt::TokenArrays(_)));
+    }
+
+    #[test]
+    fn test_reject_mixed_token_array_prompt() {
+        // Mixed arrays (e.g. integers and strings) don't match any variant
+        let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [1, "hello"]}"#;
+        assert!(serde_json::from_str::<CompletionRequest>(json).is_err());
+    }
+
+    #[test]
+    fn test_reject_float_token_array_prompt() {
+        // Floats are not integers per the spec
+        let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [1.5, 2.5]}"#;
+        assert!(serde_json::from_str::<CompletionRequest>(json).is_err());
     }
 
     #[test]
