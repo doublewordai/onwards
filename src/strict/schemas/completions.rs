@@ -32,7 +32,7 @@ pub struct CompletionRequest {
     /// The prompt to generate completions for
     pub prompt: CompletionPrompt,
 
-    /// Text to append after the completion (fill-in-the-middle); ignored in adapter mode
+    /// Text to append after the completion (fill-in-the-middle)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suffix: Option<String>,
 
@@ -56,11 +56,11 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
 
-    /// Include log probabilities (0–5); not supported in adapter mode, ignored
+    /// Include log probabilities (0–5)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<u32>,
 
-    /// Echo the prompt in the response; not supported in adapter mode, ignored
+    /// Echo the prompt in the response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo: Option<bool>,
 
@@ -76,7 +76,7 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
 
-    /// Generate best_of completions server-side; not supported in adapter mode, ignored
+    /// Generate best_of completions server-side and return the best
     #[serde(skip_serializing_if = "Option::is_none")]
     pub best_of: Option<u32>,
 
