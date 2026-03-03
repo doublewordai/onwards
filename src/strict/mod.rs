@@ -44,7 +44,7 @@ pub use schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStrea
 /// # Routes
 ///
 /// - `POST /v1/chat/completions` - Chat completions with schema validation
-/// - `POST /v1/completions` - Legacy text completions (adapted to chat completions internally)
+/// - `POST /v1/completions` - Legacy text completions (proxied to upstream /v1/completions)
 /// - `POST /v1/responses` - Open Responses API (validated, optional adapter)
 /// - `POST /v1/embeddings` - Embeddings API with schema validation
 /// - `GET /v1/models` - List available models
@@ -73,7 +73,7 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
             "/chat/completions",
             post(handlers::chat_completions_handler::<T>),
         )
-        // Legacy text completions (adapted to chat completions internally)
+        // Legacy text completions
         .route("/completions", post(handlers::completions_handler::<T>))
         // Open Responses
         .route("/responses", post(handlers::responses_handler::<T>))

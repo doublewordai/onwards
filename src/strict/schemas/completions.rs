@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use super::chat_completions::{StopSequence, Usage};
 
-/// Prompt input — string, array of strings, or token arrays (rejected at handler level)
+/// Prompt input — string, array of strings, or token arrays
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompletionPrompt {
     Single(String),
     Multiple(Vec<String>),
-    /// Token-based prompts (number[] or number[][]); not supported in adapter mode
+    /// Token-based prompts (number[] or number[][]); forwarded to upstream as-is
     Tokens(Vec<serde_json::Value>),
 }
 
