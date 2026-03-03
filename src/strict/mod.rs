@@ -635,9 +635,10 @@ mod tests {
         );
     }
 
-    /// The strict router rejects POST /completions with a missing prompt (422)
+    /// The strict router accepts POST /completions without a prompt — prompt is optional per the
+    /// OpenAI spec (defaults to `<|endoftext|>` server-side)
     #[tokio::test]
-    async fn test_completions_rejects_missing_prompt() {
+    async fn test_completions_accepts_missing_prompt() {
         let (state, _) = create_completions_test_app_state();
         let router = build_strict_router(state);
 
@@ -649,7 +650,7 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Streaming completions: SSE chunks contain text_completion objects

@@ -4428,11 +4428,18 @@ mod tests {
         }
     }
 
-    /// Completions request with missing required `prompt` field is rejected with 422
+    /// Completions request with missing `prompt` is accepted — prompt is optional per the OpenAI
+    /// spec (defaults to `<|endoftext|>` server-side)
     #[tokio::test]
-    async fn test_completions_rejects_missing_prompt() {
-        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+    async fn test_completions_accepts_missing_prompt() {
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            &completions_mock_response("gpt-3.5-turbo-instruct"),
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
@@ -4443,7 +4450,7 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Completions request with missing `model` field is rejected with 422
@@ -4621,10 +4628,22 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // Read Content-Length before consuming the body
+        let content_length: usize = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("content-length header should be present");
+
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-        // Sanitized body is valid JSON with model rewritten and extra fields gone
+        // Content-Length must match the sanitized body (stripped of extra fields)
+        assert_eq!(content_length, body.len());
+        assert!(content_length < mock_response.len(), "sanitized body should be smaller");
+
+        // Sanitized body has model rewritten and extra fields removed
         assert_eq!(body_json["model"], "gpt-3.5-turbo-instruct");
         assert!(body_json.get("provider_metadata").is_none());
         assert!(body_json.get("cost").is_none());

@@ -29,8 +29,9 @@ pub struct CompletionRequest {
     /// The model to use for completion
     pub model: String,
 
-    /// The prompt to generate completions for
-    pub prompt: CompletionPrompt,
+    /// The prompt to generate completions for (optional; defaults to `<|endoftext|>` server-side)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<CompletionPrompt>,
 
     /// Text to append after the completion (fill-in-the-middle)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,7 +113,9 @@ pub struct CompletionResponse {
 pub struct CompletionChoice {
     pub text: String,
     pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
@@ -131,7 +134,9 @@ pub struct CompletionChunk {
 pub struct CompletionChunkChoice {
     pub text: String,
     pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
 }
 
@@ -143,28 +148,28 @@ mod tests {
     fn test_deserialize_string_prompt() {
         let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Say hello"}"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.prompt, CompletionPrompt::Single(_)));
+        assert!(matches!(req.prompt, Some(CompletionPrompt::Single(_))));
     }
 
     #[test]
     fn test_deserialize_array_of_strings_prompt() {
         let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": ["Hello", "World"]}"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.prompt, CompletionPrompt::Multiple(_)));
+        assert!(matches!(req.prompt, Some(CompletionPrompt::Multiple(_))));
     }
 
     #[test]
     fn test_deserialize_token_array_prompt() {
         let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [1, 2, 3]}"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.prompt, CompletionPrompt::Tokens(_)));
+        assert!(matches!(req.prompt, Some(CompletionPrompt::Tokens(_))));
     }
 
     #[test]
     fn test_deserialize_token_array_of_arrays_prompt() {
         let json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": [[1, 2], [3, 4]]}"#;
         let req: CompletionRequest = serde_json::from_str(json).unwrap();
-        assert!(matches!(req.prompt, CompletionPrompt::TokenArrays(_)));
+        assert!(matches!(req.prompt, Some(CompletionPrompt::TokenArrays(_))));
     }
 
     #[test]
