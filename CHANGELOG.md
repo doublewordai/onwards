@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.2](https://github.com/doublewordai/onwards/compare/v0.18.1...v0.18.2) - 2026-03-04
+
+### Added
+
+- add POST /v1/completions to strict router ([#121](https://github.com/doublewordai/onwards/pull/121))
+
 ## [0.18.1](https://github.com/doublewordai/onwards/compare/v0.18.0...v0.18.1) - 2026-02-27
 
 ### Fixed
