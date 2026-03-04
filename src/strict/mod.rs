@@ -44,6 +44,7 @@ pub use schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStrea
 /// # Routes
 ///
 /// - `POST /v1/chat/completions` - Chat completions with schema validation
+/// - `POST /v1/completions` - Legacy text completions (proxied to upstream /v1/completions)
 /// - `POST /v1/responses` - Open Responses API (validated, optional adapter)
 /// - `POST /v1/embeddings` - Embeddings API with schema validation
 /// - `GET /v1/models` - List available models
@@ -72,6 +73,8 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
             "/chat/completions",
             post(handlers::chat_completions_handler::<T>),
         )
+        // Legacy text completions
+        .route("/completions", post(handlers::completions_handler::<T>))
         // Open Responses
         .route("/responses", post(handlers::responses_handler::<T>))
         // Embeddings
@@ -542,5 +545,170 @@ mod tests {
             request_json["stream_options"]["include_usage"], true,
             "Should set include_usage for streaming"
         );
+    }
+
+    fn create_completions_test_app_state() -> (AppState<MockHttpClient>, MockHttpClient) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-3.5-turbo-instruct".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id": "cmpl-abc123",
+            "object": "text_completion",
+            "created": 1677652288,
+            "model": "gpt-3.5-turbo-instruct",
+            "choices": [{"text": "Hello!", "index": 0, "logprobs": null, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
+        }"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        (AppState::with_client(targets, mock_client.clone()), mock_client)
+    }
+
+    /// The strict router accepts POST /completions with a valid request body
+    #[tokio::test]
+    async fn test_strict_router_accepts_completions_endpoint() {
+        let (state, _) = create_completions_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Response is in legacy completions format
+        assert_eq!(body_json["object"], "text_completion");
+        assert!(body_json["choices"].is_array());
+        assert!(body_json["choices"][0]["text"].is_string());
+    }
+
+    /// The strict router forwards to the upstream /completions endpoint (not /chat/completions)
+    #[tokio::test]
+    async fn test_completions_proxied_to_upstream_completions() {
+        let (state, mock_client) = create_completions_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
+            .unwrap();
+
+        router.oneshot(request).await.unwrap();
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].uri.contains("completions"),
+            "Should proxy to /completions, got: {}",
+            requests[0].uri
+        );
+        assert!(
+            !requests[0].uri.contains("chat"),
+            "Must NOT proxy to /chat/completions"
+        );
+    }
+
+    /// The strict router accepts POST /completions without a prompt — prompt is optional per the
+    /// OpenAI spec (defaults to `<|endoftext|>` server-side)
+    #[tokio::test]
+    async fn test_completions_accepts_missing_prompt() {
+        let (state, _) = create_completions_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct"}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Streaming completions: SSE chunks contain text_completion objects
+    #[tokio::test]
+    async fn test_completions_streaming_response_format() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-3.5-turbo-instruct".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let chunks = vec![
+            "data: {\"id\":\"cmpl-abc\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\"Hello\",\"index\":0,\"logprobs\":null,\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"cmpl-abc\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\" world\",\"index\":0,\"logprobs\":null,\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"cmpl-abc\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\"\",\"index\":0,\"logprobs\":null,\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(content_type.contains("text/event-stream"));
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = std::str::from_utf8(&body).unwrap();
+
+        // Each SSE chunk is a text_completion object
+        assert!(body_str.contains("\"object\":\"text_completion\""));
+        assert!(body_str.contains("\"text\":\"Hello\""));
+        assert!(body_str.contains("\"text\":\" world\""));
+        assert!(body_str.contains("[DONE]"));
     }
 }
