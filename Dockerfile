@@ -20,6 +20,8 @@ RUN cargo build --release
 # Runtime stage - use Ubuntu for better compatibility
 FROM ubuntu:24.04
 
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
 # Copy the binary from builder stage
 COPY --from=builder /app/target/release/onwards /app/onwards
 

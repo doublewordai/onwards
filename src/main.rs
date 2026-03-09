@@ -6,19 +6,15 @@ use onwards::{
     create_openai_sanitizer,
     strict::build_strict_router,
     target::{Targets, WatchedFile},
+    telemetry,
 };
 use tokio::{net::TcpListener, task::JoinSet};
 use tracing::{error, info, instrument};
 #[tokio::main]
 #[instrument]
 pub async fn main() -> anyhow::Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Initialize tracing (with optional OTLP export if OTEL_EXPORTER_OTLP_ENDPOINT is set)
+    let _tracer_provider = telemetry::init_telemetry()?;
 
     let config = Config::parse().validate()?;
     info!("Starting AI Gateway with config: {:?}", config);
