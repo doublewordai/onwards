@@ -553,7 +553,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     "Error forwarding request to target url {}: {}",
                     upstream_uri, e
                 );
-                last_error = Some(OnwardsErrorResponse::bad_gateway());
+                last_error = Some(OnwardsErrorResponse::service_unavailable());
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
                     continue;
