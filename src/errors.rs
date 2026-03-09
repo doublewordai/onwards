@@ -88,6 +88,18 @@ impl OnwardsErrorResponse {
         }
     }
 
+    pub fn service_unavailable() -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: "An internal error occurred. Please try again later.".to_string(),
+                r#type: "internal_error".to_string(),
+                param: None,
+                code: "service_unavailable".to_string(),
+            }),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
     pub fn gateway_timeout() -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
