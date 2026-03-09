@@ -226,12 +226,6 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // Check if pool has no providers (e.g., composite model with no components)
-    if pool.is_empty() {
-        debug!("Pool for model '{}' has no providers", model_name);
-        return Err(OnwardsErrorResponse::bad_gateway());
-    }
-
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
         .headers()
@@ -313,6 +307,13 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
         // If no bearer token, no labels to match — rules are skipped (allow by default)
+    }
+
+    // Check if pool has no providers (e.g., composite model with no enabled components).
+    // This runs after routing rules so that redirects get a chance to replace the pool.
+    if pool.is_empty() {
+        debug!("Pool for model '{}' has no providers", model_name);
+        return Err(OnwardsErrorResponse::bad_gateway());
     }
 
     // Check pool-level rate limit before selecting a provider
