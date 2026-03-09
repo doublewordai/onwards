@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.3](https://github.com/doublewordai/onwards/compare/v0.18.2...v0.18.3) - 2026-03-09
+
+### Added
+
+- return 503 for connection errors to disambiguate scaled-down backends ([#128](https://github.com/doublewordai/onwards/pull/128))
+
 ## [0.18.2](https://github.com/doublewordai/onwards/compare/v0.18.1...v0.18.2) - 2026-03-04
 
 ### Added
