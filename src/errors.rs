@@ -140,10 +140,10 @@ impl OnwardsErrorResponse {
     pub fn forbidden() -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
-                message: "Unauthorized".to_string(),
+                message: "Forbidden".to_string(),
                 r#type: "invalid_request_error".to_string(),
                 param: None,
-                code: "unauthorized".to_string(),
+                code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
         }
@@ -220,5 +220,19 @@ mod tests {
 
         let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
         assert!(body_bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_forbidden_response_uses_forbidden_message_and_code() {
+        let error = OnwardsErrorResponse::forbidden();
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+        assert_eq!(body["error"]["message"], "Forbidden");
+        assert_eq!(body["error"]["code"], "forbidden");
     }
 }
