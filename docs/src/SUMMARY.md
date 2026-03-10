@@ -19,6 +19,7 @@
 - [Strict Mode](strict-mode.md)
 - [Response Sanitization](sanitization.md)
 - [Load Balancing](load-balancing.md)
+- [Session Affinity](session-affinity.md)
 
 # Development
 

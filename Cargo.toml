@@ -50,6 +50,9 @@ subtle = "2.6.1"
 axum-prometheus = "0.10.0"
 governor = "0.10.1"
 rand = "0.9"
+hex = "0.4.3"
+sha2 = "0.10.9"
+metrics = "0.24.3"
 
 [dev-dependencies]
 axum-test = "18.0.0"

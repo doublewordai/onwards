@@ -8,9 +8,10 @@
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
+use crate::session_affinity::key::compute_provider_id;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
-    RoutingAction, RoutingRule, Target,
+    RoutingAction, RoutingRule, SessionAffinityConfig, Target,
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -40,6 +41,8 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
+    /// Optional session affinity configuration for this pool
+    session_affinity: Option<SessionAffinityConfig>,
 }
 
 /// A single provider within a pool
@@ -51,30 +54,39 @@ pub struct Provider {
     pub weight: u32,
     /// Tracks active connections and enforces optional concurrency limit
     limiter: ConcurrencyLimiter,
+    identity: String,
 }
 
 impl Provider {
     /// Create a new provider with no concurrency limit
     pub fn new(target: Target, weight: u32) -> Self {
+        let identity = compute_provider_id(&target);
         Self {
             target,
             weight,
             limiter: ConcurrencyLimiter::new(),
+            identity,
         }
     }
 
     /// Create a new provider with a concurrency limit
     pub fn with_concurrency_limit(target: Target, weight: u32, limit: usize) -> Self {
+        let identity = compute_provider_id(&target);
         Self {
             target,
             weight,
             limiter: ConcurrencyLimiter::with_limit(limit),
+            identity,
         }
     }
 
     /// Get the current number of active connections to this provider
     pub fn active_connections(&self) -> usize {
         self.limiter.active()
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
     }
 }
 
@@ -90,6 +102,7 @@ impl ProviderPool {
             strategy: LoadBalanceStrategy::default(),
             trusted: false,
             routing_rules: Vec::new(),
+            session_affinity: None,
         }
     }
 
@@ -104,6 +117,30 @@ impl ProviderPool {
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
+        Self::with_config_and_affinity(
+            providers,
+            keys,
+            pool_limiter,
+            pool_concurrency_limiter,
+            fallback,
+            strategy,
+            trusted,
+            routing_rules,
+            None,
+        )
+    }
+
+    pub fn with_config_and_affinity(
+        providers: Vec<Provider>,
+        keys: Option<KeySet>,
+        pool_limiter: Option<Arc<dyn RateLimiter>>,
+        pool_concurrency_limiter: Option<ConcurrencyLimiter>,
+        fallback: Option<FallbackConfig>,
+        strategy: LoadBalanceStrategy,
+        trusted: bool,
+        routing_rules: Vec<RoutingRule>,
+        session_affinity: Option<SessionAffinityConfig>,
+    ) -> Self {
         Self {
             providers,
             keys,
@@ -113,6 +150,7 @@ impl ProviderPool {
             strategy,
             trusted,
             routing_rules,
+            session_affinity,
         }
     }
 
@@ -145,6 +183,13 @@ impl ProviderPool {
     /// The number of attempts is controlled by `fallback.max_attempts`
     /// (defaults to provider count).
     pub fn select_iter(&self) -> SelectIter<'_> {
+        self.select_iter_with_preferred(None)
+    }
+
+    pub fn select_iter_with_preferred(
+        &self,
+        preferred_provider_id: Option<&str>,
+    ) -> SelectIter<'_> {
         let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
         let max_attempts = self
             .fallback
@@ -158,7 +203,21 @@ impl ProviderPool {
             max_attempts,
             attempts: 0,
             with_replacement,
+            preferred: preferred_provider_id.and_then(|id| self.provider_index_by_id(id)),
+            preferred_tried: false,
         }
+    }
+
+    fn try_select_index(&self, idx: usize) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        let provider = self.providers.get(idx)?;
+        let guard = provider.limiter.try_acquire()?;
+        Some((idx, &provider.target, guard))
+    }
+
+    fn provider_index_by_id(&self, provider_id: &str) -> Option<usize> {
+        self.providers
+            .iter()
+            .position(|provider| provider.identity() == provider_id)
     }
 
     /// Internal: select excluding specific provider indices
@@ -331,9 +390,20 @@ impl ProviderPool {
         self.trusted
     }
 
+    pub fn session_affinity(&self) -> Option<&SessionAffinityConfig> {
+        self.session_affinity.as_ref()
+    }
+
     /// Get the routing rules for this pool
     pub fn routing_rules(&self) -> &[RoutingRule] {
         &self.routing_rules
+    }
+
+    pub fn get_provider_by_id(&self, provider_id: &str) -> Option<(usize, &Provider)> {
+        self.providers
+            .iter()
+            .enumerate()
+            .find(|(_, provider)| provider.identity() == provider_id)
     }
 
     /// Evaluate routing rules against key labels.
@@ -370,14 +440,17 @@ impl ProviderPool {
                     && old_p.target.onwards_key == new_provider.target.onwards_key
                     && old_p.target.onwards_model == new_provider.target.onwards_model
             }) {
-                new_provider.limiter.adopt_active_counter(&old_provider.limiter);
+                new_provider
+                    .limiter
+                    .adopt_active_counter(&old_provider.limiter);
             }
         }
 
         // Preserve pool-level concurrency counter if both old and new have one
-        if let (Some(new_limiter), Some(old_limiter)) =
-            (&mut self.pool_concurrency_limiter, &old.pool_concurrency_limiter)
-        {
+        if let (Some(new_limiter), Some(old_limiter)) = (
+            &mut self.pool_concurrency_limiter,
+            &old.pool_concurrency_limiter,
+        ) {
             new_limiter.adopt_active_counter(old_limiter);
         }
     }
@@ -393,6 +466,8 @@ pub struct SelectIter<'a> {
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
+    preferred: Option<usize>,
+    preferred_tried: bool,
 }
 
 impl<'a> Iterator for SelectIter<'a> {
@@ -402,6 +477,26 @@ impl<'a> Iterator for SelectIter<'a> {
         if self.attempts >= self.max_attempts {
             return None;
         }
+
+        if let Some(preferred) = self.preferred {
+            if !self.preferred_tried {
+                self.preferred_tried = true;
+                self.attempts += 1;
+                if !self.excluded.contains(&preferred) {
+                    if let Some(result) = self.pool.try_select_index(preferred) {
+                        let should_exclude = match self.pool.strategy {
+                            LoadBalanceStrategy::Priority => true,
+                            LoadBalanceStrategy::WeightedRandom => !self.with_replacement,
+                        };
+                        if should_exclude {
+                            self.excluded.insert(result.0);
+                        }
+                        return Some(result);
+                    }
+                }
+            }
+        }
+
         self.attempts += 1;
 
         let result = self.pool.select_excluding(&self.excluded)?;
@@ -1216,8 +1311,14 @@ mod tests {
 
         let old_active_0 = old_pool.providers()[0].active_connections();
         let old_active_1 = old_pool.providers()[1].active_connections();
-        assert!(old_active_0 > 0, "Should have active connections on provider 0");
-        assert!(old_active_1 > 0, "Should have active connections on provider 1");
+        assert!(
+            old_active_0 > 0,
+            "Should have active connections on provider 0"
+        );
+        assert!(
+            old_active_1 > 0,
+            "Should have active connections on provider 1"
+        );
 
         // Create a new pool (simulating a config reload) and adopt state
         let new_providers = vec![
@@ -1244,9 +1345,10 @@ mod tests {
 
     #[test]
     fn test_adopt_provider_state_new_provider_starts_at_zero() {
-        let old_providers = vec![
-            Provider::new(create_test_target("https://api1.example.com"), 1),
-        ];
+        let old_providers = vec![Provider::new(
+            create_test_target("https://api1.example.com"),
+            1,
+        )];
         let old_pool = ProviderPool::new(old_providers);
 
         // Accumulate connections on old pool
@@ -1281,9 +1383,10 @@ mod tests {
             .collect();
 
         // New pool removes api2
-        let new_providers = vec![
-            Provider::new(create_test_target("https://api1.example.com"), 1),
-        ];
+        let new_providers = vec![Provider::new(
+            create_test_target("https://api1.example.com"),
+            1,
+        )];
         let mut new_pool = ProviderPool::new(new_providers);
         new_pool.adopt_provider_state(&old_pool);
 
@@ -1297,7 +1400,10 @@ mod tests {
         use crate::target::ConcurrencyLimiter;
 
         let old_pool = ProviderPool::with_config(
-            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            vec![Provider::new(
+                create_test_target("https://api1.example.com"),
+                1,
+            )],
             None,
             None,
             Some(ConcurrencyLimiter::with_limit(100)),
@@ -1313,7 +1419,10 @@ mod tests {
         assert_eq!(old_pool.pool_concurrency_limiter().unwrap().active(), 2);
 
         let mut new_pool = ProviderPool::with_config(
-            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            vec![Provider::new(
+                create_test_target("https://api1.example.com"),
+                1,
+            )],
             None,
             None,
             Some(ConcurrencyLimiter::with_limit(200)), // new limit
@@ -1328,6 +1437,65 @@ mod tests {
         // Should have adopted the active count
         assert_eq!(new_pool.pool_concurrency_limiter().unwrap().active(), 2);
         // But the new limit should apply
-        assert_eq!(new_pool.pool_concurrency_limiter().unwrap().limit(), Some(200));
+        assert_eq!(
+            new_pool.pool_concurrency_limiter().unwrap().limit(),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn test_select_iter_with_preferred_provider_uses_binding_first() {
+        let providers = vec![
+            Provider::new(create_test_target("https://api1.example.com"), 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+
+        let preferred_id = providers[1].identity().to_string();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::WeightedRandom,
+            false,
+            Vec::new(),
+        );
+
+        let (idx, target, _guard) = pool
+            .select_iter_with_preferred(Some(&preferred_id))
+            .next()
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(target.url.as_str(), "https://api2.example.com/");
+    }
+
+    #[test]
+    fn test_select_iter_with_preferred_provider_falls_back_when_full() {
+        let providers = vec![
+            Provider::with_concurrency_limit(create_test_target("https://api1.example.com"), 1, 1),
+            Provider::new(create_test_target("https://api2.example.com"), 1),
+        ];
+
+        let preferred_id = providers[0].identity().to_string();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let (_idx, _target, preferred_guard) = pool.select().unwrap();
+        let (fallback_idx, fallback_target, _guard) = pool
+            .select_iter_with_preferred(Some(&preferred_id))
+            .next()
+            .unwrap();
+        assert_eq!(fallback_idx, 1);
+        assert_eq!(fallback_target.url.as_str(), "https://api2.example.com/");
+        drop(preferred_guard);
     }
 }

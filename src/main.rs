@@ -30,10 +30,17 @@ pub async fn main() -> anyhow::Result<()> {
     // Check if strict mode is enabled
     let strict_mode = targets.strict_mode;
 
+    // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
+    let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
+
     // Start file watcher if a config file was specified
     if config.watch {
-        targets
-            .receive_updates(WatchedFile(config.targets.clone()))
+        app_state
+            .targets
+            .receive_updates_with_session_affinity(
+                WatchedFile(config.targets.clone()),
+                Some(app_state.session_affinity_store.clone()),
+            )
             .await?;
     }
 
@@ -53,9 +60,6 @@ pub async fn main() -> anyhow::Result<()> {
         info!("Metrics endpoint disabled");
         None
     };
-
-    // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
-    let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
 
     // Use strict router if strict_mode is enabled, otherwise use standard router
     let mut router = if strict_mode {

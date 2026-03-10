@@ -26,6 +26,7 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance for responses only (see [Sanitization](sanitization.md)) |
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
+| `session_affinity` | object | No | Session stickiness configuration for model-routed requests (see [Session Affinity](session-affinity.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |
 
 ## Rate limit object
@@ -40,6 +41,14 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | Field | Type | Description |
 |-------|------|-------------|
 | `max_concurrent_requests` | integer | Maximum number of concurrent requests |
+
+## Session affinity object
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `header_name` | string | Header used to read explicit session id, default `x-session-id` |
+| `ttl_secs` | integer | Sliding TTL for session binding, default `300` |
+| `rebind_on_fallback` | bool | Whether successful fallback rewrites the binding, default `true` |
 
 ## Auth configuration
 

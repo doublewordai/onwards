@@ -2,6 +2,8 @@
 
 Onwards supports load balancing across multiple providers for a single alias, with automatic failover, weighted distribution, and configurable retry behavior.
 
+If you need cache-aware stickiness on top of load balancing, see [Session Affinity](session-affinity.md).
+
 ## Configuration
 
 ```json
@@ -58,6 +60,7 @@ Settings that apply to the entire alias:
 | `response_headers` | Headers added to all responses |
 | `strategy` | `weighted_random` or `priority` |
 | `fallback` | Retry configuration (see above) |
+| `session_affinity` | Sticky session overlay for this alias |
 | `providers` | Array of provider configurations |
 
 ## Provider-level options
