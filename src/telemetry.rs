@@ -65,8 +65,6 @@ fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, Sdk
         format!("{}/v1/traces", base.trim_end_matches('/'))
     };
 
-    eprintln!("[OTLP] onwards: service={}, endpoint={}", service_name, endpoint);
-
     let mut headers = HashMap::new();
     if let Ok(headers_str) = std::env::var("OTEL_EXPORTER_OTLP_HEADERS") {
         let decoded = headers_str.replace("%20", " ");

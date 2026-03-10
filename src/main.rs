@@ -14,8 +14,21 @@ use tracing::{error, info, instrument};
 #[instrument]
 pub async fn main() -> anyhow::Result<()> {
     // Initialize tracing (with optional OTLP export if OTEL_EXPORTER_OTLP_ENDPOINT is set)
-    let _tracer_provider = telemetry::init_telemetry()?;
+    let tracer_provider = telemetry::init_telemetry()?;
 
+    let result = run().await;
+
+    // Flush pending spans before exit
+    if let Some(provider) = tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("Failed to shutdown tracer provider: {e}");
+        }
+    }
+
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     let config = Config::parse().validate()?;
     info!("Starting AI Gateway with config: {:?}", config);
 

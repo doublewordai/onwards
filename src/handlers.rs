@@ -20,9 +20,36 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace};
-use opentelemetry::trace::TraceContextExt;
+
+/// Adapter to extract W3C trace context from an axum HeaderMap.
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Adapter to inject W3C trace context into an axum HeaderMap.
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            key.parse::<HeaderName>(),
+            HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
 
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
@@ -187,31 +214,14 @@ pub async fn target_message_handler<T: HttpClient>(
         http.response.status_code = tracing::field::Empty,
     );
 
-    // If a W3C traceparent header is present, wire up the remote parent context
+    // Extract W3C trace context (traceparent + tracestate) from inbound headers
     // BEFORE the span is first entered. This stitches cross-service traces (e.g.
     // remote onwards receiving requests from local onwards).
-    if let Some(traceparent) = req.headers().get("traceparent")
-        && let Ok(tp) = traceparent.to_str()
-    {
-        let parts: Vec<&str> = tp.split('-').collect();
-        if parts.len() == 4
-            && let (Ok(trace_id), Ok(span_id)) = (
-                opentelemetry::trace::TraceId::from_hex(parts[1]),
-                opentelemetry::trace::SpanId::from_hex(parts[2]),
-            )
-        {
-            let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
-            let parent_ctx = opentelemetry::trace::SpanContext::new(
-                trace_id,
-                span_id,
-                opentelemetry::trace::TraceFlags::new(flags),
-                true,
-                opentelemetry::trace::TraceState::default(),
-            );
-            let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            let _ = span.set_parent(parent);
-        }
+    if req.headers().contains_key("traceparent") {
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let _ = span.set_parent(parent_ctx);
     }
 
     async move {
@@ -585,27 +595,14 @@ pub async fn target_message_handler<T: HttpClient>(
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
 
-        // Inject W3C traceparent header for distributed tracing.
+        // Inject W3C traceparent + tracestate headers for distributed tracing.
         // This propagates the current span context to upstream services (e.g. vLLM),
         // creating a continuous trace: fusillade → dwctl → onwards → vLLM
         {
-            use opentelemetry::trace::TraceContextExt;
             use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
-            let span_ref = ctx.span();
-            let span_ctx = span_ref.span_context();
-            if span_ctx.is_valid() {
-                let traceparent = format!(
-                    "00-{}-{}-{:02x}",
-                    span_ctx.trace_id(),
-                    span_ctx.span_id(),
-                    span_ctx.trace_flags().to_u8()
-                );
-                attempt_headers.insert(
-                    "traceparent",
-                    HeaderValue::from_str(&traceparent).unwrap(),
-                );
-            }
+            let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+            propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
         }
 
         // Build the request
