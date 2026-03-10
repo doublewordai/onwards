@@ -52,6 +52,7 @@ url = { version = "2.5", features = ["serde"] }
 bon = "3.6.5"
 subtle = "2.6.1"
 axum-prometheus = "0.10.0"
+metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 

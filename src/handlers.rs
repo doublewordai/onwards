@@ -35,13 +35,24 @@ enum UpstreamOutcome {
     Error(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// A stream wrapper that keeps a [`ConcurrencyGuard`] alive until the stream
-/// is fully consumed or dropped. This ensures the active connection count is
-/// decremented when the response body finishes, not when the handler returns —
-/// critical for streaming responses where the body outlives the handler.
+/// RAII guard that decrements the `onwards_requests_inflight` gauge on drop.
+struct InflightGuard;
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("onwards_requests_inflight").decrement(1.0);
+    }
+}
+
+/// A stream wrapper that keeps a [`ConcurrencyGuard`] and [`InflightGuard`] alive
+/// until the stream is fully consumed or dropped. This ensures the active connection
+/// count and inflight gauge are decremented when the response body finishes, not
+/// when the handler returns — critical for streaming responses where the body
+/// outlives the handler.
 struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
+    _inflight_guard: InflightGuard,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -204,6 +215,12 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     async move {
+
+    // Track inflight requests for observability. The guard is moved into GuardedStream
+    // on the success path so the gauge stays incremented for the full lifetime of
+    // streaming response bodies.
+    metrics::gauge!("onwards_requests_inflight").increment(1.0);
+    let mut inflight_guard = Some(InflightGuard);
 
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
@@ -916,13 +933,14 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
 
-        // Attach the connection guard to the response body so the active
-        // connection count is decremented when the body stream completes,
-        // not when the handler returns. Critical for streaming responses.
+        // Attach the connection guard and inflight guard to the response body so both
+        // are decremented when the body stream completes, not when the handler returns.
+        // Critical for streaming responses where the body outlives the handler.
         let (parts, body) = response.into_parts();
         let guarded = GuardedStream {
             inner: body.into_data_stream(),
             _guard: connection_guard,
+            _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
