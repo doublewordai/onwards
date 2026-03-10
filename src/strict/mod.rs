@@ -575,7 +575,10 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
         }"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        (AppState::with_client(targets, mock_client.clone()), mock_client)
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
     }
 
     /// The strict router accepts POST /completions with a valid request body
