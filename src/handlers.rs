@@ -313,7 +313,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
-        return Err(OnwardsErrorResponse::bad_gateway());
+        return Err(OnwardsErrorResponse::service_unavailable());
     }
 
     // Check pool-level rate limit before selecting a provider
