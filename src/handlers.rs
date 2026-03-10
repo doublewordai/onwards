@@ -262,46 +262,46 @@ pub async fn target_message_handler<T: HttpClient>(
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
-    if !pool.routing_rules().is_empty() {
-        if let Some(token) = bearer_token {
-            let labels = state
-                .targets
-                .key_labels
-                .get(token)
-                .map(|r| r.value().clone())
-                .unwrap_or_default();
+    if !pool.routing_rules().is_empty()
+        && let Some(token) = bearer_token
+    {
+        let labels = state
+            .targets
+            .key_labels
+            .get(token)
+            .map(|r| r.value().clone())
+            .unwrap_or_default();
 
-            // Clone the action to release the borrow on pool before potentially reassigning it
-            let action = pool.evaluate_routing_rules(&labels).cloned();
+        // Clone the action to release the borrow on pool before potentially reassigning it
+        let action = pool.evaluate_routing_rules(&labels).cloned();
 
-            if let Some(action) = action {
-                match action {
-                    RoutingAction::Deny => {
-                        debug!(
-                            "Routing rule denied request for model '{}' with labels {:?}",
-                            model_name, labels
-                        );
-                        record_response_status(403);
-                        return Err(OnwardsErrorResponse::forbidden());
-                    }
-                    RoutingAction::Redirect {
-                        target: ref redirect_alias,
-                    } => {
-                        debug!(
-                            "Routing rule redirecting from '{}' to '{}' with labels {:?}",
-                            model_name, redirect_alias, labels
-                        );
-                        pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p.clone(),
-                            None => {
-                                debug!("Redirect target '{}' not found", redirect_alias);
-                                return Err(OnwardsErrorResponse::bad_gateway());
-                            }
-                        };
-                        if pool.is_empty() {
-                            debug!("Redirect target pool '{}' has no providers", redirect_alias);
+        if let Some(action) = action {
+            match action {
+                RoutingAction::Deny => {
+                    debug!(
+                        "Routing rule denied request for model '{}' with labels {:?}",
+                        model_name, labels
+                    );
+                    record_response_status(403);
+                    return Err(OnwardsErrorResponse::forbidden());
+                }
+                RoutingAction::Redirect {
+                    target: ref redirect_alias,
+                } => {
+                    debug!(
+                        "Routing rule redirecting from '{}' to '{}' with labels {:?}",
+                        model_name, redirect_alias, labels
+                    );
+                    pool = match state.targets.targets.get(redirect_alias) {
+                        Some(p) => p.clone(),
+                        None => {
+                            debug!("Redirect target '{}' not found", redirect_alias);
                             return Err(OnwardsErrorResponse::bad_gateway());
                         }
+                    };
+                    if pool.is_empty() {
+                        debug!("Redirect target pool '{}' has no providers", redirect_alias);
+                        return Err(OnwardsErrorResponse::bad_gateway());
                     }
                 }
             }
