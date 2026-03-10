@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.5](https://github.com/doublewordai/onwards/compare/v0.18.4...v0.18.5) - 2026-03-10
+
+### Fixed
+
+- return 503 when model has no providers ([#133](https://github.com/doublewordai/onwards/pull/133))
+- use PAT in release-plz so Docker build triggers ([#134](https://github.com/doublewordai/onwards/pull/134))
+
 ## [0.18.4](https://github.com/doublewordai/onwards/compare/v0.18.3...v0.18.4) - 2026-03-09
 
 ### Fixed
