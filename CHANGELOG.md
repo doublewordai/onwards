@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1](https://github.com/doublewordai/onwards/compare/v0.19.0...v0.19.1) - 2026-03-11
+
+### Fixed
+
+- use reqwest-blocking-client for OTLP batch export ([#144](https://github.com/doublewordai/onwards/pull/144))
+
+### Other
+
+- release v0.19.0 ([#140](https://github.com/doublewordai/onwards/pull/140))
+
 ## [0.19.0](https://github.com/doublewordai/onwards/compare/v0.18.6...v0.19.0) - 2026-03-11
 
 ### Added
