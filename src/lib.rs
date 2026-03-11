@@ -55,6 +55,7 @@ pub mod response_sanitizer;
 pub mod sse;
 pub mod strict;
 pub mod target;
+pub mod telemetry;
 pub mod traits;
 
 use client::{HttpClient, HyperClient};

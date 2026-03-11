@@ -20,21 +20,66 @@ use axum::{
     },
     response::{IntoResponse, Response},
 };
+use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{debug, error, instrument, trace};
+use tracing::{Instrument, debug, error, instrument, trace};
+
+/// Adapter to extract W3C trace context from an axum HeaderMap.
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Adapter to inject W3C trace context into an axum HeaderMap.
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl Injector for HeaderInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(val)) = (
+            key.parse::<HeaderName>(),
+            HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, val);
+        }
+    }
+}
 
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
 }
 
-/// A stream wrapper that keeps a [`ConcurrencyGuard`] alive until the stream
-/// is fully consumed or dropped. This ensures the active connection count is
-/// decremented when the response body finishes, not when the handler returns —
-/// critical for streaming responses where the body outlives the handler.
+/// Internal enum to distinguish timeout from network error in upstream requests
+enum UpstreamOutcome {
+    Timeout,
+    Error(Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// RAII guard that decrements the `onwards_requests_inflight` gauge on drop.
+struct InflightGuard;
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("onwards_requests_inflight").decrement(1.0);
+    }
+}
+
+/// A stream wrapper that keeps a [`ConcurrencyGuard`] and [`InflightGuard`] alive
+/// until the stream is fully consumed or dropped. This ensures the active connection
+/// count and inflight gauge are decremented when the response body finishes, not
+/// when the handler returns — critical for streaming responses where the body
+/// outlives the handler.
 struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
+    _inflight_guard: InflightGuard,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -152,14 +197,41 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
 
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
-#[instrument(skip(state, req), fields(
-    gen_ai.request.model = tracing::field::Empty,
-    http.response.status_code = tracing::field::Empty,
-))]
 pub async fn target_message_handler<T: HttpClient>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
 ) -> Result<Response, OnwardsErrorResponse> {
+    // Create the tracing span BEFORE entering it so that set_parent() correctly
+    // updates the OTel parent context. With #[instrument], the OTel span is started
+    // on the first enter() which happens before the function body runs — making
+    // set_parent() inside the body too late to change the trace ID.
+    // Here we create the span, optionally set the parent, then run the body via
+    // .instrument(span) which enters it for the first time with the correct context.
+    let span = tracing::info_span!(
+        "onwards.request",
+        otel.name = "onwards.request",
+        gen_ai.request.model = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    );
+
+    // Extract W3C trace context (traceparent + tracestate) from inbound headers
+    // BEFORE the span is first entered. This stitches cross-service traces (e.g.
+    // remote onwards receiving requests from local onwards).
+    if req.headers().contains_key("traceparent") {
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let _ = span.set_parent(parent_ctx);
+    }
+
+    async move {
+
+    // Track inflight requests for observability. The guard is moved into GuardedStream
+    // on the success path so the gauge stays incremented for the full lifetime of
+    // streaming response bodies.
+    metrics::gauge!("onwards_requests_inflight").increment(1.0);
+    let mut inflight_guard = Some(InflightGuard);
+
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
@@ -317,55 +389,62 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     // Check pool-level rate limit before selecting a provider
-    if let Some(limiter) = pool.pool_limiter()
-        && limiter.check().is_err()
     {
-        debug!("Pool-level rate limit exceeded for model: {}", model_name);
-        record_response_status(429);
-        return Err(OnwardsErrorResponse::rate_limited());
-    }
+        let _rate_limit_span = tracing::info_span!("onwards.rate_limit_check", otel.name = "onwards.rate_limit_check", model = %model_name).entered();
+        if let Some(limiter) = pool.pool_limiter()
+            && limiter.check().is_err()
+        {
+            debug!("Pool-level rate limit exceeded for model: {}", model_name);
+            record_response_status(429);
+            return Err(OnwardsErrorResponse::rate_limited());
+        }
 
-    // Check per-key rate limits if bearer token is present
-    if let Some(token) = bearer_token
-        && let Some(limiter) = state.targets.key_rate_limiters.get(token)
-        && limiter.check().is_err()
-    {
-        debug!("Per-key rate limit exceeded for token: {}", token);
-        record_response_status(429);
-        return Err(OnwardsErrorResponse::rate_limited());
+        // Check per-key rate limits if bearer token is present
+        if let Some(token) = bearer_token
+            && let Some(limiter) = state.targets.key_rate_limiters.get(token)
+            && limiter.check().is_err()
+        {
+            debug!("Per-key rate limit exceeded for token: {}", token);
+            record_response_status(429);
+            return Err(OnwardsErrorResponse::rate_limited());
+        }
     }
 
     // Acquire pool-level concurrency permit
-    let _pool_concurrency_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
-        match limiter.try_acquire() {
-            Some(guard) => Some(guard),
-            None => {
-                debug!(
-                    "Pool-level concurrency limit exceeded for model: {}",
-                    model_name
-                );
-                return Err(OnwardsErrorResponse::concurrency_limited());
-            }
-        }
-    } else {
-        None
-    };
-
-    // Acquire per-key concurrency permit
-    let _key_concurrency_guard = if let Some(token) = bearer_token {
-        if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
+    let (_pool_concurrency_guard, _key_concurrency_guard) = {
+        let _concurrency_span = tracing::info_span!("onwards.acquire_concurrency", otel.name = "onwards.acquire_concurrency", model = %model_name).entered();
+        let pool_guard = if let Some(limiter) = pool.pool_concurrency_limiter() {
             match limiter.try_acquire() {
                 Some(guard) => Some(guard),
                 None => {
-                    debug!("Per-key concurrency limit exceeded for token: {}", token);
+                    debug!(
+                        "Pool-level concurrency limit exceeded for model: {}",
+                        model_name
+                    );
                     return Err(OnwardsErrorResponse::concurrency_limited());
                 }
             }
         } else {
             None
-        }
-    } else {
-        None
+        };
+
+        // Acquire per-key concurrency permit
+        let key_guard = if let Some(token) = bearer_token {
+            if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
+                match limiter.try_acquire() {
+                    Some(guard) => Some(guard),
+                    None => {
+                        debug!("Per-key concurrency limit exceeded for token: {}", token);
+                        return Err(OnwardsErrorResponse::concurrency_limited());
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        (pool_guard, key_guard)
     };
 
     // Extract path info once (used for each provider attempt)
@@ -388,13 +467,29 @@ pub async fn target_message_handler<T: HttpClient>(
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
+    let mut attempt_number: u32 = 0;
     for (_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
+        attempt_number += 1;
+
+        let attempt_span = tracing::info_span!(
+            "onwards.provider_attempt",
+            otel.name = "onwards.provider_attempt",
+            attempt = attempt_number,
+            provider.url = %target.url,
+            provider.model = target.onwards_model.as_deref().unwrap_or(""),
+            provider.timeout_secs = target.request_timeout_secs,
+            http.response.status_code = tracing::field::Empty,
+            onwards.fallback = tracing::field::Empty,
+        );
+        let _attempt_guard = attempt_span.enter();
+
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
         if let Some(ref limiter) = target.limiter
             && limiter.check().is_err()
         {
             debug!("Provider rate limited: {:?}", target.url);
+            tracing::Span::current().record("onwards.fallback", "rate_limited");
             last_error = Some(OnwardsErrorResponse::rate_limited());
             if pool.should_fallback_on_rate_limit() {
                 debug!("Fallback on rate limit enabled, trying next provider");
@@ -500,6 +595,16 @@ pub async fn target_message_handler<T: HttpClient>(
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
 
+        // Inject W3C traceparent + tracestate headers for distributed tracing.
+        // This propagates the current span context to upstream services (e.g. vLLM),
+        // creating a continuous trace: fusillade → dwctl → onwards → vLLM
+        {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            let ctx = tracing::Span::current().context();
+            let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+            propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
+        }
+
         // Build the request
         let attempt_req = axum::extract::Request::builder()
             .method(method.clone())
@@ -519,42 +624,58 @@ pub async fn target_message_handler<T: HttpClient>(
         // Make the request with optional timeout
         // Note: Timeout only applies to receiving response headers, not reading the full body.
         // For streaming responses, the body may take much longer than the timeout.
-        let request_result = if let Some(timeout_secs) = target.request_timeout_secs {
-            let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-            match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
-                .await
-            {
-                Err(_) => {
-                    // Timeout occurred
-                    debug!(
-                        "Request to {} timed out after {:?}",
-                        upstream_uri, timeout_duration
-                    );
-                    last_error = Some(OnwardsErrorResponse::gateway_timeout());
-
-                    // Only retry on timeout if fallback is enabled
-                    if pool.fallback_enabled() {
-                        continue;
-                    } else {
-                        record_response_status(504);
-                        return Err(last_error.unwrap());
+        let upstream_span = tracing::info_span!(
+            "onwards.upstream_request",
+            otel.name = "onwards.upstream_request",
+            otel.kind = "Client",
+            http.request.method = %method,
+            url.full = %upstream_uri,
+            http.response.status_code = tracing::field::Empty,
+        );
+        let request_result = async {
+            if let Some(timeout_secs) = target.request_timeout_secs {
+                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+                    .await
+                {
+                    Err(_) => {
+                        // Timeout occurred
+                        debug!(
+                            "Request to {} timed out after {:?}",
+                            upstream_uri, timeout_duration
+                        );
+                        Err(UpstreamOutcome::Timeout)
                     }
+                    Ok(result) => result.map_err(UpstreamOutcome::Error),
                 }
-                Ok(result) => result,
+            } else {
+                // No timeout configured
+                state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
             }
-        } else {
-            // No timeout configured
-            state.http_client.request(attempt_req).await
-        };
+        }
+        .instrument(upstream_span.clone())
+        .await;
 
         // Handle request errors
         let mut response = match request_result {
-            Err(e) => {
+            Err(UpstreamOutcome::Timeout) => {
+                upstream_span.record("http.response.status_code", 504_u16);
+                tracing::Span::current().record("onwards.fallback", "timeout");
+                last_error = Some(OnwardsErrorResponse::gateway_timeout());
+                if pool.fallback_enabled() {
+                    continue;
+                } else {
+                    record_response_status(504);
+                    return Err(last_error.unwrap());
+                }
+            }
+            Err(UpstreamOutcome::Error(e)) => {
                 error!(
                     "Error forwarding request to target url {}: {}",
                     upstream_uri, e
                 );
-                last_error = Some(OnwardsErrorResponse::service_unavailable());
+                tracing::Span::current().record("onwards.fallback", "network_error");
+                last_error = Some(OnwardsErrorResponse::bad_gateway());
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
                     continue;
@@ -566,6 +687,8 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
+        upstream_span.record("http.response.status_code", status);
+        tracing::Span::current().record("http.response.status_code", status);
 
         // Check if we should fallback based on status code
         if pool.should_fallback_on_status(status) {
@@ -573,6 +696,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
             );
+            tracing::Span::current().record("onwards.fallback", "status_fallback");
             last_error = Some(OnwardsErrorResponse::bad_gateway());
             continue;
         }
@@ -806,13 +930,14 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
 
-        // Attach the connection guard to the response body so the active
-        // connection count is decremented when the body stream completes,
-        // not when the handler returns. Critical for streaming responses.
+        // Attach the connection guard and inflight guard to the response body so both
+        // are decremented when the body stream completes, not when the handler returns.
+        // Critical for streaming responses where the body outlives the handler.
         let (parts, body) = response.into_parts();
         let guarded = GuardedStream {
             inner: body.into_data_stream(),
             _guard: connection_guard,
+            _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
@@ -837,6 +962,9 @@ pub async fn target_message_handler<T: HttpClient>(
         record_response_status(err.status.as_u16());
         Err(err)
     }
+    }
+    .instrument(span)
+    .await
 }
 
 #[instrument(skip(state, req))]
