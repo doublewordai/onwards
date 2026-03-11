@@ -56,6 +56,7 @@ pub mod session_affinity;
 pub mod sse;
 pub mod strict;
 pub mod target;
+pub mod telemetry;
 pub mod traits;
 
 use client::{HttpClient, HyperClient};
