@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0](https://github.com/doublewordai/onwards/compare/v0.18.6...v0.19.0) - 2026-03-11
+
+### Added
+
+- otel tracing: clean commit with only relevant files ([#130](https://github.com/doublewordai/onwards/pull/130))
+
+### Fixed
+
+- *(errors)* correct forbidden error response body ([#138](https://github.com/doublewordai/onwards/pull/138))
+
+### Other
+
+- *(deps)* update docker/login-action action to v4 ([#123](https://github.com/doublewordai/onwards/pull/123))
+- *(deps)* update docker/build-push-action action to v7 ([#127](https://github.com/doublewordai/onwards/pull/127))
+
 ## [0.18.6](https://github.com/doublewordai/onwards/compare/v0.18.5...v0.18.6) - 2026-03-10
 
 ### Fixed
