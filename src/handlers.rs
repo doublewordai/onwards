@@ -685,7 +685,29 @@ pub async fn target_message_handler<T: HttpClient>(
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
         );
-        let _attempt_guard = attempt_span.enter();
+
+        // The loop body is wrapped in an instrumented async block so that
+        // attempt_span is the "current" span for all logging / field recording,
+        // without using Span::enter() which is thread-local and unsafe across
+        // .await points (it leaked spans onto tokio worker threads, causing
+        // ever-growing nested span chains in logs).
+        //
+        // Because `continue` / `return` cannot cross the async-block boundary
+        // we return an enum: Continue (try next provider) or Done (propagate
+        // the final result out of the for-loop).
+        enum LoopAction<T> {
+            Continue(Option<OnwardsErrorResponse>),
+            Done(T),
+        }
+
+        // Extract original_model before the async block so we don't capture &req
+        // (Request<Body> is !Sync, which would make the future !Send)
+        let original_model = req
+            .extensions()
+            .get::<OriginalModel>()
+            .map(|m| m.0.to_string());
+
+        let action = async {
 
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
         if let Some(ref limiter) = target.limiter
@@ -699,12 +721,11 @@ pub async fn target_message_handler<T: HttpClient>(
                 session_affinity.preferred_provider_id(),
                 idx,
             );
-            last_error = Some(OnwardsErrorResponse::rate_limited());
             if pool.should_fallback_on_rate_limit() {
                 debug!("Fallback on rate limit enabled, trying next provider");
-                continue;
+                return LoopAction::Continue(Some(OnwardsErrorResponse::rate_limited()));
             } else {
-                return Err(OnwardsErrorResponse::rate_limited());
+                return LoopAction::Done(Err(OnwardsErrorResponse::rate_limited()));
             }
         }
 
@@ -726,23 +747,23 @@ pub async fn target_message_handler<T: HttpClient>(
             let mut body_serialized: serde_json::Value = match serde_json::from_slice(&attempt_body)
             {
                 Ok(value) => value,
-                Err(_) => return Err(error.clone()),
+                Err(_) => return LoopAction::Done(Err(error.clone())),
             };
-            let entry = body_serialized
-                .as_object_mut()
-                .ok_or(error.clone())?
-                .entry("model");
+            let entry = match body_serialized.as_object_mut() {
+                Some(obj) => obj.entry("model"),
+                None => return LoopAction::Done(Err(error.clone())),
+            };
             match entry {
                 Entry::Occupied(mut entry) => {
                     entry.insert(serde_json::Value::String(rewrite.clone()));
                 }
                 Entry::Vacant(_entry) => {
-                    return Err(error.clone());
+                    return LoopAction::Done(Err(error.clone()));
                 }
             }
             attempt_body = match serde_json::to_vec(&body_serialized) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
-                Err(_) => return Err(OnwardsErrorResponse::internal()),
+                Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
             };
         }
 
@@ -767,13 +788,13 @@ pub async fn target_message_handler<T: HttpClient>(
 
         let upstream_uri = match target.url.join(path_to_join) {
             Ok(url) => url.to_string(),
-            Err(_) => return Err(OnwardsErrorResponse::internal()),
+            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
         };
         let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
             Ok(uri) => uri,
             Err(_) => {
                 error!("Invalid URI: {}", upstream_uri);
-                return Err(OnwardsErrorResponse::internal());
+                return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
             }
         };
 
@@ -876,12 +897,11 @@ pub async fn target_message_handler<T: HttpClient>(
                     session_affinity.preferred_provider_id(),
                     idx,
                 );
-                last_error = Some(OnwardsErrorResponse::gateway_timeout());
                 if pool.fallback_enabled() {
-                    continue;
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                 } else {
                     record_response_status(504);
-                    return Err(last_error.unwrap());
+                    return LoopAction::Done(Err(OnwardsErrorResponse::gateway_timeout()));
                 }
             }
             Err(UpstreamOutcome::Error(e)) => {
@@ -896,12 +916,11 @@ pub async fn target_message_handler<T: HttpClient>(
                     session_affinity.preferred_provider_id(),
                     idx,
                 );
-                last_error = Some(OnwardsErrorResponse::service_unavailable());
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
-                    continue;
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
                 } else {
-                    return Err(last_error.unwrap());
+                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_gateway()));
                 }
             }
             Ok(response) => response,
@@ -924,8 +943,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 session_affinity.preferred_provider_id(),
                 idx,
             );
-            last_error = Some(OnwardsErrorResponse::bad_gateway());
-            continue;
+            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -971,7 +989,7 @@ pub async fn target_message_handler<T: HttpClient>(
             };
 
             record_response_status(status);
-            return Err(sanitized_error);
+            return LoopAction::Done(Err(sanitized_error));
         }
 
         // Check content type for SSE handling
@@ -1016,11 +1034,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, path_and_query
             );
 
-            // Extract original model from request extensions
-            let original_model = req
-                .extensions()
-                .get::<OriginalModel>()
-                .map(|m| m.0.to_string());
+            // original_model extracted before the async block (to avoid capturing &req)
 
             if is_sse {
                 // Streaming SSE response - transform chunk-by-chunk
@@ -1061,13 +1075,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 // Non-streaming response - buffer and transform
                 debug!("Applying non-streaming sanitization");
 
-                let response_body =
+                let response_body = match
                     axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
                         .await
-                        .map_err(|e| {
-                            error!("Failed to buffer response body: {}", e);
-                            OnwardsErrorResponse::internal()
-                        })?;
+                {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to buffer response body: {}", e);
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+                    }
+                };
 
                 debug!(
                     "Response body buffered: {} bytes, content-type: {}",
@@ -1123,7 +1140,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     }
                     Err(e) => {
                         error!("Response sanitization failed: {}", e);
-                        return Err(OnwardsErrorResponse::internal());
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
                     }
                 }
             }
@@ -1180,7 +1197,17 @@ pub async fn target_message_handler<T: HttpClient>(
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
-        return Ok(response);
+        LoopAction::Done(Ok(response))
+
+        }.instrument(attempt_span).await;
+
+        match action {
+            LoopAction::Continue(err) => {
+                last_error = err;
+                continue;
+            }
+            LoopAction::Done(result) => return result,
+        }
     }
 
     // All providers exhausted — distinguish "no providers found" from
