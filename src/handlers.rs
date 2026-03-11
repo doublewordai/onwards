@@ -48,10 +48,7 @@ struct HeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for HeaderInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(val)) = (
-            key.parse::<HeaderName>(),
-            HeaderValue::from_str(&value),
-        ) {
+        if let (Ok(name), Ok(val)) = (key.parse::<HeaderName>(), HeaderValue::from_str(&value)) {
             self.0.insert(name, val);
         }
     }
@@ -72,6 +69,35 @@ fn is_preferred_provider_attempt(
             .get(idx)
             .is_some_and(|provider| provider.identity() == id)
     })
+}
+
+fn session_affinity_ttl(config: &crate::target::SessionAffinityConfig) -> std::time::Duration {
+    std::time::Duration::from_secs(config.ttl_secs)
+}
+
+fn bind_session_affinity(
+    state: &AppState<impl HttpClient>,
+    key: &AffinityKey,
+    config: &crate::target::SessionAffinityConfig,
+    provider: &crate::load_balancer::Provider,
+) {
+    state.session_affinity_store.insert(
+        key.clone(),
+        AffinityEntry {
+            provider_id: provider.identity().to_string(),
+        },
+        session_affinity_ttl(config),
+    );
+}
+
+fn touch_session_affinity(
+    state: &AppState<impl HttpClient>,
+    key: &AffinityKey,
+    config: &crate::target::SessionAffinityConfig,
+) {
+    state
+        .session_affinity_store
+        .touch(key, session_affinity_ttl(config));
 }
 
 fn handle_session_affinity_success(
@@ -96,13 +122,7 @@ fn handle_session_affinity_success(
                     "session affinity rebound"
                 );
                 record_session_affinity_result(model_name, SessionAffinityResult::Rebound);
-                state.session_affinity_store.insert(
-                    key.clone(),
-                    AffinityEntry {
-                        provider_id: provider.identity().to_string(),
-                    },
-                    std::time::Duration::from_secs(config.ttl_secs),
-                );
+                bind_session_affinity(state, key, config, provider);
             } else {
                 debug!(
                     model = %model_name,
@@ -113,21 +133,124 @@ fn handle_session_affinity_success(
                 record_session_affinity_result(model_name, SessionAffinityResult::FallbackNoRebind);
             }
         }
-        Some(_) => {
-            state
-                .session_affinity_store
-                .touch(key, std::time::Duration::from_secs(config.ttl_secs));
-        }
+        Some(_) => touch_session_affinity(state, key, config),
         None => {
             record_session_affinity_result(model_name, SessionAffinityResult::Bound);
-            state.session_affinity_store.insert(
-                key.clone(),
-                AffinityEntry {
-                    provider_id: provider.identity().to_string(),
-                },
-                std::time::Duration::from_secs(config.ttl_secs),
-            );
+            bind_session_affinity(state, key, config, provider);
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedSessionAffinity {
+    config: Option<crate::target::SessionAffinityConfig>,
+    key: Option<AffinityKey>,
+    preferred_provider_id: Option<String>,
+}
+
+impl ResolvedSessionAffinity {
+    fn resolve<T: HttpClient>(
+        state: &AppState<T>,
+        pool: &crate::load_balancer::ProviderPool,
+        model_name: &str,
+        headers: &HeaderMap,
+    ) -> Self {
+        let config = pool.session_affinity().cloned();
+        let key = config
+            .as_ref()
+            .and_then(|affinity| build_session_context(headers, &affinity.header_name))
+            .map(|context| AffinityKey {
+                model: model_name.to_string(),
+                session_fingerprint: context.fingerprint,
+            });
+
+        let preferred_provider_id = key.as_ref().and_then(|affinity_key| {
+            let entry = state.session_affinity_store.get(affinity_key)?;
+            if pool.get_provider_by_id(&entry.provider_id).is_some() {
+                debug!(model = %model_name, provider_id = %entry.provider_id, "session affinity hit");
+                record_session_affinity_result(model_name, SessionAffinityResult::Hit);
+                Some(entry.provider_id)
+            } else {
+                debug!(model = %model_name, provider_id = %entry.provider_id, "session affinity stale binding");
+                state.session_affinity_store.delete(affinity_key);
+                record_session_affinity_result(model_name, SessionAffinityResult::Stale);
+                None
+            }
+        });
+
+        if config.is_some() && key.is_some() && preferred_provider_id.is_none() {
+            debug!(model = %model_name, "session affinity miss");
+            record_session_affinity_result(model_name, SessionAffinityResult::Miss);
+        }
+
+        Self {
+            config,
+            key,
+            preferred_provider_id,
+        }
+    }
+
+    fn config(&self) -> Option<&crate::target::SessionAffinityConfig> {
+        self.config.as_ref()
+    }
+
+    fn key(&self) -> Option<&AffinityKey> {
+        self.key.as_ref()
+    }
+
+    fn preferred_provider_id(&self) -> Option<&str> {
+        self.preferred_provider_id.as_deref()
+    }
+}
+
+fn record_preferred_provider_error(
+    model_name: &str,
+    pool: &crate::load_balancer::ProviderPool,
+    preferred_provider_id: Option<&str>,
+    idx: usize,
+) {
+    record_preferred_provider_outcome(
+        model_name,
+        pool,
+        preferred_provider_id,
+        idx,
+        SessionAffinityResult::Error,
+        "session affinity error",
+    );
+}
+
+fn record_preferred_provider_unavailable(
+    model_name: &str,
+    pool: &crate::load_balancer::ProviderPool,
+    preferred_provider_id: Option<&str>,
+    idx: usize,
+) {
+    record_preferred_provider_outcome(
+        model_name,
+        pool,
+        preferred_provider_id,
+        idx,
+        SessionAffinityResult::Unavailable,
+        "session affinity unavailable",
+    );
+}
+
+fn record_preferred_provider_outcome(
+    model_name: &str,
+    pool: &crate::load_balancer::ProviderPool,
+    preferred_provider_id: Option<&str>,
+    idx: usize,
+    result: SessionAffinityResult,
+    message: &'static str,
+) {
+    if is_preferred_provider_attempt(preferred_provider_id, pool, idx) {
+        debug!(
+            model = %model_name,
+            provider_id = %pool.providers()[idx].identity(),
+            outcome = message,
+            "session affinity outcome"
+        );
+        record_session_affinity_result(model_name, result);
     }
 }
 
@@ -534,31 +657,8 @@ pub async fn target_message_handler<T: HttpClient>(
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
-    let session_affinity = pool.session_affinity().cloned();
-    let affinity_key = session_affinity
-        .as_ref()
-        .and_then(|config| build_session_context(req.headers(), &config.header_name))
-        .map(|context| AffinityKey {
-            model: model_name.clone(),
-            session_fingerprint: context.fingerprint,
-        });
-    let preferred_provider_id = affinity_key.as_ref().and_then(|key| {
-        let entry = state.session_affinity_store.get(key)?;
-        if pool.get_provider_by_id(&entry.provider_id).is_some() {
-            debug!(model = %model_name, provider_id = %entry.provider_id, "session affinity hit");
-            record_session_affinity_result(&model_name, SessionAffinityResult::Hit);
-            Some(entry.provider_id)
-        } else {
-            debug!(model = %model_name, provider_id = %entry.provider_id, "session affinity stale binding");
-            state.session_affinity_store.delete(key);
-            record_session_affinity_result(&model_name, SessionAffinityResult::Stale);
-            None
-        }
-    });
-    if session_affinity.is_some() && affinity_key.is_some() && preferred_provider_id.is_none() {
-        debug!(model = %model_name, "session affinity miss");
-        record_session_affinity_result(&model_name, SessionAffinityResult::Miss);
-    }
+    let session_affinity =
+        ResolvedSessionAffinity::resolve(&state, &pool, &model_name, req.headers());
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
@@ -569,8 +669,8 @@ pub async fn target_message_handler<T: HttpClient>(
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
-    for (_idx, target, connection_guard) in
-        pool.select_iter_with_preferred(preferred_provider_id.as_deref())
+    for (idx, target, connection_guard) in
+        pool.select_iter_with_preferred(session_affinity.preferred_provider_id())
     {
         any_attempted = true;
         attempt_number += 1;
@@ -593,10 +693,12 @@ pub async fn target_message_handler<T: HttpClient>(
         {
             debug!("Provider rate limited: {:?}", target.url);
             tracing::Span::current().record("onwards.fallback", "rate_limited");
-            if is_preferred_provider_attempt(preferred_provider_id.as_deref(), &pool, _idx) {
-                debug!(model = %model_name, provider_id = %pool.providers()[_idx].identity(), "session affinity unavailable");
-                record_session_affinity_result(&model_name, SessionAffinityResult::Unavailable);
-            }
+            record_preferred_provider_unavailable(
+                &model_name,
+                &pool,
+                session_affinity.preferred_provider_id(),
+                idx,
+            );
             last_error = Some(OnwardsErrorResponse::rate_limited());
             if pool.should_fallback_on_rate_limit() {
                 debug!("Fallback on rate limit enabled, trying next provider");
@@ -739,7 +841,7 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
-        let request_result = async {
+        let request_result: Result<Response, UpstreamOutcome> = async {
             if let Some(timeout_secs) = target.request_timeout_secs {
                 let timeout_duration = std::time::Duration::from_secs(timeout_secs);
                 match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
@@ -751,19 +853,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             "Request to {} timed out after {:?}",
                             upstream_uri, timeout_duration
                         );
-                        if is_preferred_provider_attempt(preferred_provider_id.as_deref(), &pool, idx) {
-                            debug!(model = %model_name, provider_id = %pool.providers()[idx].identity(), "session affinity error");
-                            record_session_affinity_result(&model_name, SessionAffinityResult::Error);
-                        }
-                        last_error = Some(OnwardsErrorResponse::gateway_timeout());
-
-                        // Only retry on timeout if fallback is enabled
-                        if pool.fallback_enabled() {
-                            continue;
-                        } else {
-                            record_response_status(504);
-                            return Err(last_error.unwrap());
-                        }
+                        Err(UpstreamOutcome::Timeout)
                     }
                     Ok(result) => result.map_err(UpstreamOutcome::Error),
                 }
@@ -776,10 +866,16 @@ pub async fn target_message_handler<T: HttpClient>(
         .await;
 
         // Handle request errors
-        let mut response = match request_result {
+        let mut response: Response = match request_result {
             Err(UpstreamOutcome::Timeout) => {
                 upstream_span.record("http.response.status_code", 504_u16);
                 tracing::Span::current().record("onwards.fallback", "timeout");
+                record_preferred_provider_error(
+                    &model_name,
+                    &pool,
+                    session_affinity.preferred_provider_id(),
+                    idx,
+                );
                 last_error = Some(OnwardsErrorResponse::gateway_timeout());
                 if pool.fallback_enabled() {
                     continue;
@@ -794,11 +890,12 @@ pub async fn target_message_handler<T: HttpClient>(
                     upstream_uri, e
                 );
                 tracing::Span::current().record("onwards.fallback", "network_error");
-                last_error = Some(OnwardsErrorResponse::bad_gateway());
-                if is_preferred_provider_attempt(preferred_provider_id.as_deref(), &pool, _idx) {
-                    debug!(model = %model_name, provider_id = %pool.providers()[_idx].identity(), "session affinity error");
-                    record_session_affinity_result(&model_name, SessionAffinityResult::Error);
-                }
+                record_preferred_provider_error(
+                    &model_name,
+                    &pool,
+                    session_affinity.preferred_provider_id(),
+                    idx,
+                );
                 last_error = Some(OnwardsErrorResponse::service_unavailable());
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
@@ -821,10 +918,12 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            if is_preferred_provider_attempt(preferred_provider_id.as_deref(), &pool, _idx) {
-                debug!(model = %model_name, provider_id = %pool.providers()[_idx].identity(), status, "session affinity error");
-                record_session_affinity_result(&model_name, SessionAffinityResult::Error);
-            }
+            record_preferred_provider_error(
+                &model_name,
+                &pool,
+                session_affinity.preferred_provider_id(),
+                idx,
+            );
             last_error = Some(OnwardsErrorResponse::bad_gateway());
             continue;
         }
@@ -1054,14 +1153,14 @@ pub async fn target_message_handler<T: HttpClient>(
             state.targets.strict_mode
         );
         if response.status().is_success()
-            && let Some(provider) = pool.providers().get(_idx)
+            && let Some(provider) = pool.providers().get(idx)
         {
             handle_session_affinity_success(
                 &state,
                 &model_name,
-                affinity_key.as_ref(),
-                session_affinity.as_ref(),
-                preferred_provider_id.as_deref(),
+                session_affinity.key(),
+                session_affinity.config(),
+                session_affinity.preferred_provider_id(),
                 provider,
             );
         }

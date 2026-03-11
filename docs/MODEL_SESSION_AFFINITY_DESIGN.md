@@ -27,12 +27,22 @@ The design in this document is now implemented in the current codebase with the 
 
 - pool-level `session_affinity` config is supported
 - session identity is derived from configured session header and/or `Authorization: Bearer`
+- non-`Bearer` authorization schemes are ignored for affinity fallback
 - provider identity is hashed and cached on `Provider`
 - affinity applies to all model-routed requests that pass through `target_message_handler`
 - fallback can optionally rebind according to `rebind_on_fallback`
 - request-path lazy stale cleanup is implemented
 - single-process hot reload eager cleanup is implemented for the default in-memory store
 - Prometheus counters are emitted for affinity result and reload cleanup events
+
+The current test suite covers the key behavioral guarantees from this design, including:
+
+- same-session reuse across `/chat/completions`, `/responses`, `/completions`, and `/embeddings`
+- strict-mode and streaming affinity behavior
+- authorization-scoped fingerprints and special-character stability
+- fallback rebinding semantics and capacity-based fallback
+- TTL expiry, lazy stale rebinding, and eager reload cleanup
+- config validation for lowercase normalization, empty header rejection, and non-zero TTL
 
 Current implementation files:
 

@@ -2706,6 +2706,29 @@ mod tests {
     }
 
     #[test]
+    fn test_session_affinity_rejects_empty_header_name() {
+        let json = r#"{
+            "targets": {
+                "gpt-4o": {
+                    "session_affinity": {
+                        "header_name": "   ",
+                        "ttl_secs": 300
+                    },
+                    "providers": [
+                        {
+                            "url": "https://api.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let err = Targets::from_config(config).unwrap_err();
+        assert!(err.to_string().contains("session_affinity.header_name"));
+    }
+
+    #[test]
     fn test_provider_spec_trusted_defaults_to_none() {
         let json = r#"{"url": "https://example.com"}"#;
         let spec: ProviderSpec = serde_json::from_str(json).unwrap();

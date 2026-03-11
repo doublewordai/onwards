@@ -54,4 +54,44 @@ mod tests {
             .build();
         assert_ne!(compute_provider_id(&left), compute_provider_id(&right));
     }
+
+    #[test]
+    fn fingerprint_is_stable_for_special_character_identity() {
+        let first =
+            compute_session_fingerprint(Some("session:one/alpha"), Some("tenant+a@example"))
+                .unwrap();
+        let second =
+            compute_session_fingerprint(Some("session:one/alpha"), Some("tenant+a@example"))
+                .unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn provider_id_changes_when_identity_inputs_change() {
+        let base = Target::builder()
+            .url("https://api.example.com/".parse().unwrap())
+            .onwards_key("key-a".to_string())
+            .onwards_model("model-a".to_string())
+            .build();
+        let different_url = Target::builder()
+            .url("https://api-alt.example.com/".parse().unwrap())
+            .onwards_key("key-a".to_string())
+            .onwards_model("model-a".to_string())
+            .build();
+        let different_key = Target::builder()
+            .url("https://api.example.com/".parse().unwrap())
+            .onwards_key("key-b".to_string())
+            .onwards_model("model-a".to_string())
+            .build();
+        let different_model = Target::builder()
+            .url("https://api.example.com/".parse().unwrap())
+            .onwards_key("key-a".to_string())
+            .onwards_model("model-b".to_string())
+            .build();
+
+        let base_id = compute_provider_id(&base);
+        assert_ne!(base_id, compute_provider_id(&different_url));
+        assert_ne!(base_id, compute_provider_id(&different_key));
+        assert_ne!(base_id, compute_provider_id(&different_model));
+    }
 }

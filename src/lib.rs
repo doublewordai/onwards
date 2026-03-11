@@ -865,6 +865,137 @@ mod tests {
         target.into_pool()
     }
 
+    fn build_session_affinity_pool(
+        strategy: target::LoadBalanceStrategy,
+        fallback: Option<target::FallbackConfig>,
+        ttl_secs: u64,
+        rebind_on_fallback: bool,
+    ) -> ProviderPool {
+        let providers = vec![
+            Provider::new(
+                Target::builder()
+                    .url("https://api1.example.com".parse().unwrap())
+                    .build(),
+                1,
+            ),
+            Provider::new(
+                Target::builder()
+                    .url("https://api2.example.com".parse().unwrap())
+                    .build(),
+                1,
+            ),
+        ];
+
+        ProviderPool::with_config_and_affinity(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            strategy,
+            false,
+            Vec::new(),
+            Some(target::SessionAffinityConfig {
+                header_name: "x-session-id".to_string(),
+                ttl_secs,
+                rebind_on_fallback,
+            }),
+        )
+    }
+
+    fn build_session_affinity_targets(pool: ProviderPool, strict_mode: bool) -> Targets {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert("gpt-4o".to_string(), pool);
+
+        Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode,
+            http_pool_config: None,
+        }
+    }
+
+    fn build_session_affinity_state<T: HttpClient>(
+        client: T,
+        pool: ProviderPool,
+        strict_mode: bool,
+    ) -> AppState<T> {
+        AppState::with_client(build_session_affinity_targets(pool, strict_mode), client)
+    }
+
+    fn build_test_server<T: HttpClient + Clone + Send + Sync + 'static>(
+        state: AppState<T>,
+        strict_mode: bool,
+    ) -> TestServer {
+        let router = if strict_mode {
+            Router::new().nest("/v1", crate::strict::build_strict_router(state))
+        } else {
+            build_router(state)
+        };
+        TestServer::new(router).unwrap()
+    }
+
+    async fn assert_json_request_ok(
+        server: &TestServer,
+        path: &str,
+        body: &serde_json::Value,
+        session_id: Option<&str>,
+        authorization: Option<&str>,
+    ) {
+        let mut request = server.post(path);
+        if let Some(session_id) = session_id {
+            request = request.add_header("x-session-id", session_id);
+        }
+        if let Some(authorization) = authorization {
+            request = request.add_header("authorization", authorization);
+        }
+
+        let response = request.json(body).await;
+        assert_eq!(response.status_code(), 200);
+    }
+
+    async fn assert_chat_completion_ok(
+        server: &TestServer,
+        session_id: Option<&str>,
+        authorization: Option<&str>,
+    ) {
+        assert_json_request_ok(
+            server,
+            "/v1/chat/completions",
+            &json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }),
+            session_id,
+            authorization,
+        )
+        .await;
+    }
+
+    fn count_provider_hits(requests: &[test_utils::MockRequest]) -> (usize, usize) {
+        let api1_hits = requests
+            .iter()
+            .filter(|request| request.uri.contains("api1.example.com"))
+            .count();
+        let api2_hits = requests
+            .iter()
+            .filter(|request| request.uri.contains("api2.example.com"))
+            .count();
+        (api1_hits, api2_hits)
+    }
+
+    fn provider_host(uri: &str) -> &'static str {
+        if uri.contains("api1.example.com") {
+            "api1"
+        } else if uri.contains("api2.example.com") {
+            "api2"
+        } else {
+            panic!("unexpected provider uri: {uri}");
+        }
+    }
+
     #[tokio::test]
     async fn test_empty_targets_returns_404() {
         // Create empty targets
@@ -977,66 +1108,55 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_affinity_reuses_provider_for_same_session() {
-        let targets_map = Arc::new(DashMap::new());
-        let providers = vec![
-            Provider::new(
-                Target::builder()
-                    .url("https://api1.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-            Provider::new(
-                Target::builder()
-                    .url("https://api2.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-        ];
-        let pool = ProviderPool::with_config_and_affinity(
-            providers,
-            None,
-            None,
-            None,
-            None,
-            target::LoadBalanceStrategy::WeightedRandom,
-            false,
-            Vec::new(),
-            Some(target::SessionAffinityConfig {
-                header_name: "x-session-id".to_string(),
-                ttl_secs: 300,
-                rebind_on_fallback: true,
-            }),
-        );
-        targets_map.insert("gpt-4o".to_string(), pool);
-
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
         let mock_client = MockHttpClient::new(
             StatusCode::OK,
             r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
         );
-        let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
 
         for _ in 0..2 {
-            let response = server
-                .post("/v1/chat/completions")
-                .add_header("x-session-id", "session-1")
-                .add_header("authorization", "Bearer tenant-a")
-                .json(&json!({
-                    "model": "gpt-4o",
-                    "messages": [{"role": "user", "content": "Hello"}]
-                }))
-                .await;
-            assert_eq!(response.status_code(), 200);
+            assert_chat_completion_ok(&server, Some("session-1"), Some("Bearer tenant-a")).await;
+        }
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri, requests[1].uri);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_uses_authorization_when_session_header_missing() {
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
+        );
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
+
+        for _ in 0..2 {
+            assert_chat_completion_ok(&server, None, Some("Bearer tenant-a")).await;
         }
 
         let requests = mock_client.get_requests();
@@ -1046,80 +1166,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_session_affinity_first_requests_still_distribute_across_providers() {
-        let targets_map = Arc::new(DashMap::new());
-        let providers = vec![
-            Provider::new(
-                Target::builder()
-                    .url("https://api1.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-            Provider::new(
-                Target::builder()
-                    .url("https://api2.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-        ];
-        let pool = ProviderPool::with_config_and_affinity(
-            providers,
-            None,
-            None,
-            None,
-            None,
-            target::LoadBalanceStrategy::WeightedRandom,
-            false,
-            Vec::new(),
-            Some(target::SessionAffinityConfig {
-                header_name: "x-session-id".to_string(),
-                ttl_secs: 300,
-                rebind_on_fallback: true,
-            }),
-        );
-        targets_map.insert("gpt-4o".to_string(), pool);
-
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
         let mock_client = MockHttpClient::new(
             StatusCode::OK,
             r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
         );
-        let app_state = AppState::with_client(targets, mock_client.clone());
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
 
         let first_request_sessions = 400;
         for i in 0..first_request_sessions {
-            let response = server
-                .post("/v1/chat/completions")
-                .add_header("x-session-id", format!("session-{i}"))
-                .add_header("authorization", "Bearer tenant-a")
-                .json(&json!({
-                    "model": "gpt-4o",
-                    "messages": [{"role": "user", "content": "Hello"}]
-                }))
+            let session_id = format!("session-{i}");
+            assert_chat_completion_ok(&server, Some(session_id.as_str()), Some("Bearer tenant-a"))
                 .await;
-            assert_eq!(response.status_code(), 200);
         }
 
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), first_request_sessions);
 
-        let api1_hits = requests
-            .iter()
-            .filter(|request| request.uri.contains("api1.example.com"))
-            .count();
-        let api2_hits = requests
-            .iter()
-            .filter(|request| request.uri.contains("api2.example.com"))
-            .count();
+        let (api1_hits, api2_hits) = count_provider_hits(&requests);
 
         assert_eq!(api1_hits + api2_hits, first_request_sessions);
         assert!(api1_hits > 0, "api1 should receive some first requests");
@@ -1138,82 +1213,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_affinity_without_identity_preserves_existing_distribution() {
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
+        );
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
+
+        let requests_without_identity = 400;
+        for _ in 0..requests_without_identity {
+            assert_chat_completion_ok(&server, None, None).await;
+        }
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), requests_without_identity);
+
+        let (api1_hits, api2_hits) = count_provider_hits(&requests);
+
+        assert_eq!(api1_hits + api2_hits, requests_without_identity);
+        assert!(api1_hits > 0, "api1 should receive some requests");
+        assert!(api2_hits > 0, "api2 should receive some requests");
+        assert!(
+            (120..=280).contains(&api1_hits),
+            "expected roughly balanced requests without identity, got api1={}, api2={}",
+            api1_hits,
+            api2_hits
+        );
+    }
+
+    #[tokio::test]
     async fn test_session_affinity_scopes_same_session_id_by_authorization() {
         use crate::session_affinity::key::compute_session_fingerprint;
         use crate::session_affinity::store::InMemorySessionAffinityStore;
-
-        let targets_map = Arc::new(DashMap::new());
-        let providers = vec![
-            Provider::new(
-                Target::builder()
-                    .url("https://api1.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-            Provider::new(
-                Target::builder()
-                    .url("https://api2.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-        ];
-        let pool = ProviderPool::with_config_and_affinity(
-            providers,
-            None,
-            None,
-            None,
-            None,
-            target::LoadBalanceStrategy::WeightedRandom,
-            false,
-            Vec::new(),
-            Some(target::SessionAffinityConfig {
-                header_name: "x-session-id".to_string(),
-                ttl_secs: 300,
-                rebind_on_fallback: true,
-            }),
-        );
-        targets_map.insert("gpt-4o".to_string(), pool);
-
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
 
         let mock_client = MockHttpClient::new(
             StatusCode::OK,
             r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
         );
         let store = Arc::new(InMemorySessionAffinityStore::new());
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_session_affinity_store(store.clone());
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
+        let app_state = build_session_affinity_state(
+            mock_client.clone(),
+            build_session_affinity_pool(
+                target::LoadBalanceStrategy::WeightedRandom,
+                None,
+                300,
+                true,
+            ),
+            false,
+        )
+        .with_session_affinity_store(store.clone());
+        let server = build_test_server(app_state, false);
 
-        let response = server
-            .post("/v1/chat/completions")
-            .add_header("x-session-id", "shared-session")
-            .add_header("authorization", "Bearer tenant-a")
-            .json(&json!({
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        let response = server
-            .post("/v1/chat/completions")
-            .add_header("x-session-id", "shared-session")
-            .add_header("authorization", "Bearer tenant-b")
-            .json(&json!({
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
+        assert_chat_completion_ok(&server, Some("shared-session"), Some("Bearer tenant-a")).await;
+        assert_chat_completion_ok(&server, Some("shared-session"), Some("Bearer tenant-b")).await;
 
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 2);
@@ -1238,6 +1302,177 @@ mod tests {
         assert!(store.get(&key_a).is_some());
         assert!(store.get(&key_b).is_some());
         assert_ne!(key_a, key_b);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_reuses_provider_across_model_routes() {
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
+
+        let requests = [
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": "gpt-4o",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }),
+            ),
+            (
+                "/v1/responses",
+                json!({
+                    "model": "gpt-4o",
+                    "input": "Hello"
+                }),
+            ),
+            (
+                "/v1/completions",
+                json!({
+                    "model": "gpt-4o",
+                    "prompt": "Hello"
+                }),
+            ),
+            (
+                "/v1/embeddings",
+                json!({
+                    "model": "gpt-4o",
+                    "input": "Hello"
+                }),
+            ),
+        ];
+
+        for (path, body) in requests {
+            assert_json_request_ok(
+                &server,
+                path,
+                &body,
+                Some("shared-session"),
+                Some("Bearer tenant-a"),
+            )
+            .await;
+        }
+
+        let upstream_requests = mock_client.get_requests();
+        assert_eq!(upstream_requests.len(), 4);
+        let first_host = provider_host(&upstream_requests[0].uri);
+        assert!(
+            upstream_requests
+                .iter()
+                .all(|request| provider_host(&request.uri) == first_host)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_preserves_provider_for_streaming_requests() {
+        let streaming_chunks = vec![
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string(),
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                false,
+            ),
+            false,
+        );
+
+        for _ in 0..2 {
+            assert_json_request_ok(
+                &server,
+                "/v1/chat/completions",
+                &json!({
+                    "model": "gpt-4o",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }),
+                Some("stream-session"),
+                Some("Bearer tenant-a"),
+            )
+            .await;
+        }
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri, requests[1].uri);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_lazy_rebinds_after_stale_provider_identity() {
+        use crate::session_affinity::key::{compute_provider_id, compute_session_fingerprint};
+        use crate::session_affinity::store::InMemorySessionAffinityStore;
+
+        let stale_target = Target::builder()
+            .url("https://api-stale.example.com".parse().unwrap())
+            .build();
+        let pool = ProviderPool::with_config_and_affinity(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://api-fresh.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            target::LoadBalanceStrategy::WeightedRandom,
+            false,
+            Vec::new(),
+            Some(target::SessionAffinityConfig {
+                header_name: "x-session-id".to_string(),
+                ttl_secs: 300,
+                rebind_on_fallback: true,
+            }),
+        );
+        let current_provider_id = pool.providers()[0].identity().to_string();
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let key = crate::session_affinity::AffinityKey {
+            model: "gpt-4o".to_string(),
+            session_fingerprint: compute_session_fingerprint(
+                Some("stale-session"),
+                Some("tenant-a"),
+            )
+            .unwrap(),
+        };
+        store.insert(
+            key.clone(),
+            crate::session_affinity::AffinityEntry {
+                provider_id: compute_provider_id(&stale_target),
+            },
+            std::time::Duration::from_secs(300),
+        );
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = build_session_affinity_state(mock_client.clone(), pool, false)
+            .with_session_affinity_store(store.clone());
+        let server = build_test_server(app_state, false);
+
+        assert_chat_completion_ok(&server, Some("stale-session"), Some("Bearer tenant-a")).await;
+
+        let entry = store.get(&key).unwrap();
+        assert_eq!(entry.provider_id, current_provider_id);
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].uri.contains("api-fresh.example.com"));
     }
 
     #[derive(Clone, Debug)]
@@ -1276,71 +1511,26 @@ mod tests {
         use crate::session_affinity::key::compute_session_fingerprint;
         use crate::session_affinity::store::InMemorySessionAffinityStore;
 
-        let targets_map = Arc::new(DashMap::new());
-        let providers = vec![
-            Provider::new(
-                Target::builder()
-                    .url("https://api1.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-            Provider::new(
-                Target::builder()
-                    .url("https://api2.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-        ];
-        let pool = ProviderPool::with_config_and_affinity(
-            providers,
-            None,
-            None,
-            None,
+        let pool = build_session_affinity_pool(
+            target::LoadBalanceStrategy::Priority,
             Some(target::FallbackConfig {
                 enabled: true,
                 on_status: vec![5],
                 ..Default::default()
             }),
-            target::LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-            Some(target::SessionAffinityConfig {
-                header_name: "x-session-id".to_string(),
-                ttl_secs: 300,
-                rebind_on_fallback: true,
-            }),
+            300,
+            true,
         );
         let rebound_provider_id = pool.providers()[1].identity().to_string();
-        targets_map.insert("gpt-4o".to_string(), pool);
-
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
         let store = Arc::new(InMemorySessionAffinityStore::new());
         let client = RoutingMockClient {
             requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        let app_state = AppState::with_client(targets, client.clone())
+        let app_state = build_session_affinity_state(client.clone(), pool, false)
             .with_session_affinity_store(store.clone());
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
+        let server = build_test_server(app_state, false);
 
-        let response = server
-            .post("/v1/chat/completions")
-            .add_header("x-session-id", "session-1")
-            .add_header("authorization", "Bearer tenant-a")
-            .json(&json!({
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
+        assert_chat_completion_ok(&server, Some("session-1"), Some("Bearer tenant-a")).await;
 
         let key = crate::session_affinity::AffinityKey {
             model: "gpt-4o".to_string(),
@@ -1357,56 +1547,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_session_affinity_does_not_rebind_on_fallback_when_disabled() {
+    async fn test_session_affinity_binding_overrides_provider_weights() {
         use crate::session_affinity::key::compute_session_fingerprint;
         use crate::session_affinity::store::InMemorySessionAffinityStore;
 
-        let targets_map = Arc::new(DashMap::new());
-        let providers = vec![
-            Provider::new(
-                Target::builder()
-                    .url("https://api1.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-            Provider::new(
-                Target::builder()
-                    .url("https://api2.example.com".parse().unwrap())
-                    .build(),
-                1,
-            ),
-        ];
         let pool = ProviderPool::with_config_and_affinity(
-            providers,
+            vec![
+                Provider::new(
+                    Target::builder()
+                        .url("https://api-light.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                ),
+                Provider::new(
+                    Target::builder()
+                        .url("https://api-heavy.example.com".parse().unwrap())
+                        .build(),
+                    99,
+                ),
+            ],
             None,
             None,
             None,
-            Some(target::FallbackConfig {
-                enabled: true,
-                on_status: vec![5],
-                ..Default::default()
-            }),
-            target::LoadBalanceStrategy::Priority,
+            None,
+            target::LoadBalanceStrategy::WeightedRandom,
             false,
             Vec::new(),
             Some(target::SessionAffinityConfig {
                 header_name: "x-session-id".to_string(),
                 ttl_secs: 300,
-                rebind_on_fallback: false,
+                rebind_on_fallback: true,
             }),
         );
-        let original_provider_id = pool.providers()[0].identity().to_string();
-        targets_map.insert("gpt-4o".to_string(), pool);
-
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
+        let bound_provider_id = pool.providers()[0].identity().to_string();
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let key = crate::session_affinity::AffinityKey {
+            model: "gpt-4o".to_string(),
+            session_fingerprint: compute_session_fingerprint(
+                Some("bound-session"),
+                Some("tenant-a"),
+            )
+            .unwrap(),
         };
+        store.insert(
+            key.clone(),
+            crate::session_affinity::AffinityEntry {
+                provider_id: bound_provider_id,
+            },
+            std::time::Duration::from_secs(300),
+        );
 
+        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = build_session_affinity_state(mock_client.clone(), pool, false)
+            .with_session_affinity_store(store);
+        let server = build_test_server(app_state, false);
+
+        for _ in 0..5 {
+            assert_chat_completion_ok(&server, Some("bound-session"), Some("Bearer tenant-a"))
+                .await;
+        }
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.uri.contains("api-light.example.com"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_does_not_rebind_on_fallback_when_disabled() {
+        use crate::session_affinity::key::compute_session_fingerprint;
+        use crate::session_affinity::store::InMemorySessionAffinityStore;
+
+        let pool = build_session_affinity_pool(
+            target::LoadBalanceStrategy::Priority,
+            Some(target::FallbackConfig {
+                enabled: true,
+                on_status: vec![5],
+                ..Default::default()
+            }),
+            300,
+            false,
+        );
+        let original_provider_id = pool.providers()[0].identity().to_string();
         let store = Arc::new(InMemorySessionAffinityStore::new());
         let key = crate::session_affinity::AffinityKey {
             model: "gpt-4o".to_string(),
@@ -1424,21 +1649,11 @@ mod tests {
         let client = RoutingMockClient {
             requests: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        let app_state = AppState::with_client(targets, client.clone())
+        let app_state = build_session_affinity_state(client.clone(), pool, false)
             .with_session_affinity_store(store.clone());
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
+        let server = build_test_server(app_state, false);
 
-        let response = server
-            .post("/v1/chat/completions")
-            .add_header("x-session-id", "session-1")
-            .add_header("authorization", "Bearer tenant-a")
-            .json(&json!({
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
+        assert_chat_completion_ok(&server, Some("session-1"), Some("Bearer tenant-a")).await;
 
         let entry = store.get(&key).unwrap();
         assert_eq!(entry.provider_id, original_provider_id);
@@ -1447,6 +1662,247 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].contains("api1.example.com"));
         assert!(requests[1].contains("api2.example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_ttl_expiration_evicts_and_rebinds() {
+        use crate::session_affinity::key::compute_session_fingerprint;
+        use crate::session_affinity::store::InMemorySessionAffinityStore;
+
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"choices":[{"message":{"role":"assistant","content":"hi"}}]}"#,
+        );
+        let app_state = build_session_affinity_state(
+            mock_client.clone(),
+            build_session_affinity_pool(target::LoadBalanceStrategy::WeightedRandom, None, 1, true),
+            false,
+        )
+        .with_session_affinity_store(store.clone());
+        let server = build_test_server(app_state, false);
+
+        let affinity_key = crate::session_affinity::AffinityKey {
+            model: "gpt-4o".to_string(),
+            session_fingerprint: compute_session_fingerprint(Some("session-ttl"), Some("tenant-a"))
+                .unwrap(),
+        };
+
+        assert_chat_completion_ok(&server, Some("session-ttl"), Some("Bearer tenant-a")).await;
+        assert!(store.get(&affinity_key).is_some());
+
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert!(store.get(&affinity_key).is_none());
+
+        assert_chat_completion_ok(&server, Some("session-ttl"), Some("Bearer tenant-a")).await;
+        assert!(store.get(&affinity_key).is_some());
+        assert_eq!(mock_client.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_concurrent_requests_leave_consistent_binding() {
+        use crate::session_affinity::key::compute_session_fingerprint;
+        use crate::session_affinity::store::InMemorySessionAffinityStore;
+        use std::rc::Rc;
+
+        let pool = build_session_affinity_pool(
+            target::LoadBalanceStrategy::WeightedRandom,
+            None,
+            300,
+            true,
+        );
+        let provider_ids = [
+            pool.providers()[0].identity().to_string(),
+            pool.providers()[1].identity().to_string(),
+        ];
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let key = crate::session_affinity::AffinityKey {
+            model: "gpt-4o".to_string(),
+            session_fingerprint: compute_session_fingerprint(
+                Some("concurrent-session"),
+                Some("tenant-a"),
+            )
+            .unwrap(),
+        };
+
+        let mock_client =
+            test_utils::TriggeredMockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = build_session_affinity_state(mock_client.clone(), pool, false)
+            .with_session_affinity_store(store.clone());
+        let server = Rc::new(build_test_server(app_state, false));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server_a = Rc::clone(&server);
+                let handle_a = tokio::task::spawn_local(async move {
+                    assert_chat_completion_ok(
+                        server_a.as_ref(),
+                        Some("concurrent-session"),
+                        Some("Bearer tenant-a"),
+                    )
+                    .await;
+                });
+
+                let server_b = Rc::clone(&server);
+                let handle_b = tokio::task::spawn_local(async move {
+                    assert_chat_completion_ok(
+                        server_b.as_ref(),
+                        Some("concurrent-session"),
+                        Some("Bearer tenant-a"),
+                    )
+                    .await;
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                mock_client.complete_all();
+
+                handle_a.await.unwrap();
+                handle_b.await.unwrap();
+
+                let entry = store.get(&key).unwrap();
+                assert!(provider_ids.contains(&entry.provider_id));
+                assert_eq!(mock_client.get_requests().len(), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_falls_back_when_bound_provider_is_at_capacity() {
+        use crate::session_affinity::key::compute_session_fingerprint;
+        use crate::session_affinity::store::InMemorySessionAffinityStore;
+        use std::rc::Rc;
+
+        let pool = ProviderPool::with_config_and_affinity(
+            vec![
+                Provider::with_concurrency_limit(
+                    Target::builder()
+                        .url("https://api1.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                    1,
+                ),
+                Provider::new(
+                    Target::builder()
+                        .url("https://api2.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                ),
+            ],
+            None,
+            None,
+            None,
+            Some(target::FallbackConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            target::LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+            Some(target::SessionAffinityConfig {
+                header_name: "x-session-id".to_string(),
+                ttl_secs: 300,
+                rebind_on_fallback: false,
+            }),
+        );
+        let bound_provider_id = pool.providers()[0].identity().to_string();
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let key = crate::session_affinity::AffinityKey {
+            model: "gpt-4o".to_string(),
+            session_fingerprint: compute_session_fingerprint(
+                Some("busy-session"),
+                Some("tenant-a"),
+            )
+            .unwrap(),
+        };
+        store.insert(
+            key.clone(),
+            crate::session_affinity::AffinityEntry {
+                provider_id: bound_provider_id.clone(),
+            },
+            std::time::Duration::from_secs(300),
+        );
+
+        let client =
+            test_utils::TriggeredMockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+        let app_state = build_session_affinity_state(client.clone(), pool, false)
+            .with_session_affinity_store(store.clone());
+        let server = Rc::new(build_test_server(app_state, false));
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server_a = Rc::clone(&server);
+                let handle_a = tokio::task::spawn_local(async move {
+                    assert_chat_completion_ok(
+                        server_a.as_ref(),
+                        Some("busy-session"),
+                        Some("Bearer tenant-a"),
+                    )
+                    .await;
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+                let server_b = Rc::clone(&server);
+                let handle_b = tokio::task::spawn_local(async move {
+                    assert_chat_completion_ok(
+                        server_b.as_ref(),
+                        Some("busy-session"),
+                        Some("Bearer tenant-a"),
+                    )
+                    .await;
+                });
+
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                client.complete_all();
+
+                handle_a.await.unwrap();
+                handle_b.await.unwrap();
+
+                let requests = client.get_requests();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[0].uri.contains("api1.example.com"));
+                assert!(requests[1].uri.contains("api2.example.com"));
+
+                let entry = store.get(&key).unwrap();
+                assert_eq!(entry.provider_id, bound_provider_id);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_session_affinity_reuses_provider_in_strict_mode() {
+        let mock_response = r#"{
+            "id":"chatcmpl-123",
+            "object":"chat.completion",
+            "created":123,
+            "model":"gpt-4o",
+            "choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]
+        }"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let server = build_test_server(
+            build_session_affinity_state(
+                mock_client.clone(),
+                build_session_affinity_pool(
+                    target::LoadBalanceStrategy::WeightedRandom,
+                    None,
+                    300,
+                    true,
+                ),
+                true,
+            ),
+            true,
+        );
+
+        for _ in 0..2 {
+            assert_chat_completion_ok(&server, Some("strict-session"), Some("Bearer tenant-a"))
+                .await;
+        }
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].uri, requests[1].uri);
     }
 
     #[tokio::test]

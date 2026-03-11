@@ -79,6 +79,8 @@ Onwards uses two possible identity inputs:
 - explicit session header from `header_name`
 - `Authorization: Bearer <token>`
 
+Non-`Bearer` authorization schemes are ignored for affinity.
+
 Fingerprint rules:
 
 - if both exist: `SHA256(authorization + "|" + session_id)`
@@ -91,6 +93,7 @@ This means:
 - explicit `session_id` is preferred for routing stickiness
 - when `Authorization` is present, it is folded into the fingerprint to keep affinity scoped to the caller boundary
 - two tenants using the same `x-session-id` will not collide if their bearer tokens differ
+- request header casing does not matter because HTTP header lookup is case-insensitive
 
 ## Fallback Behavior
 
@@ -110,6 +113,7 @@ Binding updates on success:
 - success on the same bound provider refreshes TTL
 - success on a different provider updates the binding only if `rebind_on_fallback = true`
 - if `rebind_on_fallback = false`, the request still succeeds but the original binding is preserved
+- once a provider is already bound, that preference wins over provider weights until the binding expires or becomes stale
 
 ## Hot Reload Semantics
 
@@ -124,6 +128,9 @@ Important deployment note:
 
 - eager cleanup is appropriate for the default in-process store
 - for a shared external store across multiple gateway instances, prefer lazy cleanup only to avoid cross-instance races during staggered reloads
+
+Provider identity is derived from upstream URL, `onwards_key`, and `onwards_model`.
+Changing any of those values invalidates existing bindings for that provider.
 
 ## Metrics
 
@@ -144,6 +151,18 @@ Current `result` values:
 - `fallback_no_rebind`
 
 Raw session ids, bearer tokens, fingerprints, and provider ids are not emitted as metric labels.
+
+## Supported Request Paths
+
+Affinity is applied consistently anywhere Onwards resolves a model alias through the shared provider-selection path, including:
+
+- `/v1/chat/completions`
+- `/v1/responses`
+- `/v1/completions`
+- `/v1/embeddings`
+
+Strict mode uses the same affinity behavior because validated requests flow through the same routing path.
+Streaming requests also preserve provider affinity.
 
 ## Example Client Requests
 

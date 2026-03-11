@@ -50,6 +50,13 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `ttl_secs` | integer | Sliding TTL for session binding, default `300` |
 | `rebind_on_fallback` | bool | Whether successful fallback rewrites the binding, default `true` |
 
+Validation rules:
+
+- `header_name` must be non-empty after trimming
+- `header_name` is normalized to lowercase at config load time
+- `ttl_secs` must be greater than `0`
+- affinity fallback identity uses only `Authorization: Bearer <token>`
+
 ## Auth configuration
 
 The top-level `auth` object configures global authentication:
