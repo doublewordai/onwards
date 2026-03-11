@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2](https://github.com/doublewordai/onwards/compare/v0.19.1...v0.19.2) - 2026-03-11
+
+### Fixed
+
+- replace Span::enter() with .instrument() in async retry loop ([#145](https://github.com/doublewordai/onwards/pull/145))
+
 ## [0.19.1](https://github.com/doublewordai/onwards/compare/v0.19.0...v0.19.1) - 2026-03-11
 
 ### Fixed
