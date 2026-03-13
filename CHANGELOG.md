@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0](https://github.com/doublewordai/onwards/compare/v0.19.2...v0.20.0) - 2026-03-13
+
+### Added
+
+- [**breaking**] RequestContext-based ToolExecutor trait ([#151](https://github.com/doublewordai/onwards/pull/151))
+
 ## [0.19.2](https://github.com/doublewordai/onwards/compare/v0.19.1...v0.19.2) - 2026-03-11
 
 ### Fixed
