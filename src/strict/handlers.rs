@@ -12,12 +12,13 @@
 use super::adapter::{OpenResponsesAdapter, PendingToolCall};
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionCall,
-    FunctionDefinition, Tool as ChatTool, ToolCall,
+    FunctionDefinition, Tool as ChatTool, ToolCall, Usage,
 };
 use super::schemas::completions::{CompletionChunk, CompletionRequest, CompletionResponse};
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use super::schemas::responses::{
-    ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent,
+    InputTokensDetails, OutputTokensDetails, ResponseUsage, ResponsesRequest, ResponsesResponse,
+    ResponsesStreamingEvent,
 };
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
@@ -428,6 +429,10 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     let max_iterations = adapter.max_iterations();
     let mut iteration = 0;
 
+    // Accumulate token usage across all loop iterations so the final response
+    // reports aggregate totals rather than just the last iteration's counts.
+    let mut accumulated_usage: Option<Usage> = None;
+
     loop {
         iteration += 1;
         debug!(
@@ -448,6 +453,15 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                 );
             }
         };
+
+        // Open a child span for this model call; attributes are recorded after
+        // we have the response so we know the token counts.
+        let model_call_span = tracing::info_span!(
+            "model.call",
+            llm.token_count.input = tracing::field::Empty,
+            llm.token_count.output = tracing::field::Empty,
+            loop.iteration = iteration as i64,
+        );
 
         // Forward to Chat Completions endpoint
         let response = forward_request_raw(
@@ -497,6 +511,25 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
         };
 
+        // Record token counts on the model.call span and accumulate totals.
+        if let Some(ref usage) = chat_response.usage {
+            model_call_span.record("llm.token_count.input", usage.prompt_tokens as i64);
+            model_call_span.record("llm.token_count.output", usage.completion_tokens as i64);
+
+            accumulated_usage = Some(match accumulated_usage.take() {
+                None => usage.clone(),
+                Some(prev) => Usage {
+                    prompt_tokens: prev.prompt_tokens + usage.prompt_tokens,
+                    completion_tokens: prev.completion_tokens + usage.completion_tokens,
+                    total_tokens: prev.total_tokens + usage.total_tokens,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                },
+            });
+        }
+        // model_call_span is dropped (and therefore closed) at end of loop body.
+        drop(model_call_span);
+
         // Check if the response requires tool action
         if OpenResponsesAdapter::requires_tool_action(&chat_response) && iteration < max_iterations
         {
@@ -514,8 +547,19 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             // Check if there are unhandled tools
             if adapter.has_unhandled_tools(&results) {
                 debug!("Some tools are unhandled, returning to client");
-                // Return to client with requires_action status
-                let responses_response = adapter.to_responses_response(&chat_response, &request);
+                // Return to client with requires_action status, using aggregate usage
+                let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                    input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+                    output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+                });
+                let responses_response = adapter.to_responses_response_with_usage(
+                    &chat_response,
+                    &request,
+                    aggregate_response_usage,
+                );
 
                 let response_bytes = match serde_json::to_vec(&responses_response) {
                     Ok(bytes) => bytes,
@@ -559,7 +603,18 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
 
         // No tool action required or max iterations reached - return final response
-        let responses_response = adapter.to_responses_response(&chat_response, &request);
+        let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+            output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+        });
+        let responses_response = adapter.to_responses_response_with_usage(
+            &chat_response,
+            &request,
+            aggregate_response_usage,
+        );
 
         info!(
             response_id = %responses_response.id,
