@@ -1128,4 +1128,77 @@ mod tests {
             "usage should be None when override is None"
         );
     }
+
+    #[tokio::test]
+    async fn test_server_tool_routing() {
+        use crate::traits::{RequestContext, ToolError, ToolExecutor, ToolSchema};
+
+        /// A test executor that handles a single tool called "server_tool".
+        struct TestExecutor;
+
+        #[async_trait::async_trait]
+        impl ToolExecutor for TestExecutor {
+            async fn tools(&self, _ctx: &RequestContext) -> Vec<ToolSchema> {
+                vec![ToolSchema {
+                    name: "server_tool".to_string(),
+                    description: "A server-side tool".to_string(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                    strict: false,
+                }]
+            }
+
+            async fn execute(
+                &self,
+                tool_name: &str,
+                _tool_call_id: &str,
+                _arguments: &serde_json::Value,
+                _ctx: &RequestContext,
+            ) -> Result<serde_json::Value, ToolError> {
+                if tool_name == "server_tool" {
+                    Ok(serde_json::json!({"result": "ok"}))
+                } else {
+                    Err(ToolError::NotFound(tool_name.to_string()))
+                }
+            }
+        }
+
+        let adapter = OpenResponsesAdapter::new(
+            Arc::new(crate::traits::NoOpResponseStore),
+            Arc::new(TestExecutor),
+        );
+        let ctx = RequestContext::new();
+
+        let server_tool_names: HashSet<String> =
+            ["server_tool".to_string()].into_iter().collect();
+
+        // A tool call matching a server tool should be routed to the executor.
+        let server_call = PendingToolCall {
+            id: "call_1".to_string(),
+            name: "server_tool".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let result = adapter
+            .execute_tool(&server_call, &server_tool_names, &ctx)
+            .await
+            .expect("server tool should succeed");
+        assert!(
+            matches!(result, ToolCallResult::Executed { .. }),
+            "server tool call should be Executed"
+        );
+
+        // A tool call NOT in server_tool_names should be returned as Unhandled.
+        let client_call = PendingToolCall {
+            id: "call_2".to_string(),
+            name: "client_tool".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let result = adapter
+            .execute_tool(&client_call, &server_tool_names, &ctx)
+            .await
+            .expect("client tool should return Unhandled, not error");
+        assert!(
+            matches!(result, ToolCallResult::Unhandled(_)),
+            "non-server tool call should be Unhandled"
+        );
+    }
 }

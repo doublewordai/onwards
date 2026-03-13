@@ -28,7 +28,7 @@ use crate::handlers::{ResolvedTrust, target_message_handler};
 use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{FromRequest, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
@@ -124,22 +124,14 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     req: Request<Body>,
 ) -> Response {
-    // Extract extensions before consuming the body for JSON parsing.
-    let extensions = req.extensions().clone();
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!(error = %e, "Failed to read request body");
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Failed to read request body",
-            );
-        }
-    };
+    // Split the request so we can grab extensions (inserted by middleware)
+    // before Axum's Json extractor consumes the body.
+    let (mut parts, body) = req.into_parts();
+    let extensions = std::mem::take(&mut parts.extensions);
+    let req = Request::from_parts(parts, body);
 
-    let request: ResponsesRequest = match serde_json::from_slice(&body_bytes) {
-        Ok(r) => r,
+    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+        Ok(Json(r)) => r,
         Err(e) => {
             error!(error = %e, "Failed to parse responses request");
             return error_response(
@@ -408,6 +400,34 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // Merge server-side tool schemas into the chat request tools.
     if !server_tools.is_empty() {
+        // Check for duplicate tool names between client and server tools
+        if let Some(ref client_tools) = request.tools {
+            let client_tool_names: HashSet<String> = client_tools
+                .iter()
+                .filter_map(|t| match t {
+                    super::schemas::responses::Tool::Function { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            let collisions: Vec<&str> = server_tool_names
+                .iter()
+                .filter(|name| client_tool_names.contains(*name))
+                .map(|s| s.as_str())
+                .collect();
+
+            if !collisions.is_empty() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!(
+                        "Tool name collision: the following tools are provided by both the client and server: {}",
+                        collisions.join(", ")
+                    ),
+                );
+            }
+        }
+
         merge_server_tools(&mut chat_request, &server_tools);
     }
 
@@ -1010,14 +1030,28 @@ fn merge_server_tools(
 ) {
     let chat_tools: Vec<ChatTool> = server_tools
         .iter()
-        .map(|ts| ChatTool {
-            tool_type: "function".to_string(),
-            function: FunctionDefinition {
-                name: ts.name.clone(),
-                description: Some(ts.description.clone()),
-                parameters: Some(ts.parameters.clone()),
-                strict: Some(ts.strict),
-            },
+        .map(|ts| {
+            // OpenAI requires `additionalProperties: false` in strict mode.
+            // Apply the same patch that `convert_tools()` applies to client tools.
+            let mut params = ts.parameters.clone();
+            if let Some(obj) = params.as_object_mut()
+                && !obj.contains_key("additionalProperties")
+            {
+                obj.insert(
+                    "additionalProperties".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+
+            ChatTool {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: ts.name.clone(),
+                    description: Some(ts.description.clone()),
+                    parameters: Some(params),
+                    strict: Some(ts.strict),
+                },
+            }
         })
         .collect();
 

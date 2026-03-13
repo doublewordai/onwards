@@ -87,6 +87,8 @@ mod tests {
     use super::*;
     use crate::target::{OpenResponsesConfig, Target, Targets};
     use crate::test_utils::MockHttpClient;
+    use crate::traits::{RequestContext, ToolError, ToolExecutor, ToolSchema};
+    use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use dashmap::DashMap;
@@ -710,5 +712,97 @@ mod tests {
         assert!(body_str.contains("\"text\":\"Hello\""));
         assert!(body_str.contains("\"text\":\" world\""));
         assert!(body_str.contains("[DONE]"));
+    }
+
+    /// A tool executor that advertises a single server-side tool.
+    struct CollisionTestExecutor;
+
+    #[async_trait]
+    impl ToolExecutor for CollisionTestExecutor {
+        async fn tools(&self, _ctx: &RequestContext) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                name: "get_weather".to_string(),
+                description: "Get weather for a location".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "location": { "type": "string" }
+                    }
+                }),
+                strict: false,
+            }]
+        }
+
+        async fn execute(
+            &self,
+            _tool_name: &str,
+            _tool_call_id: &str,
+            _arguments: &serde_json::Value,
+            _ctx: &RequestContext,
+        ) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({"temp": 20}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_tool_name_returns_400() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"Hi"}}]}"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client)
+            .with_tool_executor(Arc::new(CollisionTestExecutor));
+        let router = build_strict_router(state);
+
+        // Client sends a tool with the same name as the server-side tool
+        let request_body = r#"{
+            "model": "gpt-4o",
+            "input": "What's the weather?",
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Client-side get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body_json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("get_weather"),
+            "Error should mention the colliding tool name"
+        );
     }
 }

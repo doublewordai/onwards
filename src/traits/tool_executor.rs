@@ -11,6 +11,19 @@ use std::fmt;
 ///
 /// Carries the model name (for per-deployment resolution) and arbitrary
 /// extension data inserted by middleware (e.g. resolved user/group info).
+///
+/// # Extensions
+///
+/// The `extensions` field is an in-process type map — it does **not** transit
+/// HTTP. It exists primarily for **library mode**, where onwards is embedded in
+/// another service: middleware layers can insert typed data (e.g. resolved
+/// user/group info, tenant context) that the `ToolExecutor` implementation
+/// reads when executing tools.
+///
+/// In **service mode** (onwards running as a standalone proxy), the
+/// `ToolExecutor` implementation typically resolves tools from its own state
+/// (database, config files, etc.) using information already present in the
+/// request such as the model name or auth headers, and `extensions` is unused.
 #[derive(Debug, Default)]
 pub struct RequestContext {
     /// The model alias from the request body (if available).
