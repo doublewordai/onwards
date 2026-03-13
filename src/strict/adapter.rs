@@ -20,7 +20,8 @@ use super::schemas::responses::{
 use crate::traits::{ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{Instrument, debug, warn};
 
 /// The Open Responses adapter that bridges the Responses API to Chat Completions
 pub struct OpenResponsesAdapter {
@@ -212,6 +213,57 @@ impl OpenResponsesAdapter {
             safety_identifier: None,
             prompt_cache_key: None,
         }
+    }
+
+    /// Convert a Chat Completions response to a Responses response, overriding the usage
+    /// with the provided aggregate usage. This is used by the tool loop to report
+    /// accumulated token counts across all iterations rather than just the last one.
+    pub fn to_responses_response_with_usage(
+        &self,
+        chat_response: &ChatCompletionResponse,
+        request: &ResponsesRequest,
+        usage: Option<ResponseUsage>,
+    ) -> ResponsesResponse {
+        let mut response = self.to_responses_response(chat_response, request);
+        response.usage = usage;
+        response
+    }
+
+    /// Execute all tool calls with OTel instrumentation and return results.
+    ///
+    /// Each tool call is wrapped in a `tool.execute` child span carrying
+    /// `tool.name` and `tool.duration_ms` attributes.
+    pub async fn execute_tool_calls_instrumented(
+        &self,
+        tool_calls: &[PendingToolCall],
+    ) -> Vec<ToolCallResult> {
+        let mut results = Vec::new();
+        for tc in tool_calls {
+            let span = tracing::info_span!(
+                "tool.execute",
+                tool.name = %tc.name,
+                tool.duration_ms = tracing::field::Empty,
+            );
+            let start = Instant::now();
+            let result = async {
+                match self.execute_tool(tc).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(error = %e, "Tool execution failed");
+                        ToolCallResult::Error {
+                            call_id: tc.id.clone(),
+                            error: e.to_string(),
+                        }
+                    }
+                }
+            }
+            .instrument(span.clone())
+            .await;
+            let duration_ms = start.elapsed().as_millis() as i64;
+            span.record("tool.duration_ms", duration_ms);
+            results.push(result);
+        }
+        results
     }
 
     /// Store a response and return the stored response with ID
@@ -934,6 +986,155 @@ mod tests {
             ids.len(),
             unique.len(),
             "All generated IDs should be unique"
+        );
+    }
+
+    /// Helper to create a minimal ChatCompletionResponse with the given token counts.
+    fn make_chat_response_with_usage(
+        prompt: u32,
+        completion: u32,
+        finish_reason: &str,
+    ) -> ChatCompletionResponse {
+        use super::super::schemas::chat_completions::Usage;
+        ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 0,
+            model: "gpt-4o".to_string(),
+            choices: vec![Choice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(MessageContent::Text("done".to_string())),
+                    name: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    extra: None,
+                },
+                finish_reason: Some(finish_reason.to_string()),
+                logprobs: None,
+            }],
+            usage: Some(Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            }),
+            system_fingerprint: None,
+            service_tier: None,
+        }
+    }
+
+    /// Helper to build a minimal ResponsesRequest.
+    fn make_responses_request() -> ResponsesRequest {
+        ResponsesRequest {
+            model: "gpt-4o".to_string(),
+            input: Input::Text("Hello".to_string()),
+            instructions: None,
+            previous_response_id: None,
+            store: None,
+            metadata: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stop: None,
+            stream: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            truncation: None,
+            user: None,
+            reasoning: None,
+            text: None,
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn test_to_responses_response_with_usage_overrides_token_counts() {
+        let adapter = create_test_adapter();
+        let request = make_responses_request();
+
+        // A chat response whose usage we will *not* use — we override it.
+        let chat_response = make_chat_response_with_usage(10, 5, "stop");
+
+        // Override with aggregate values that differ from the chat response.
+        let overriding_usage = Some(ResponseUsage {
+            input_tokens: 30,
+            output_tokens: 20,
+            total_tokens: 50,
+            input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+            output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+        });
+
+        let response =
+            adapter.to_responses_response_with_usage(&chat_response, &request, overriding_usage);
+
+        let usage = response.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 30, "input_tokens should be aggregate");
+        assert_eq!(usage.output_tokens, 20, "output_tokens should be aggregate");
+        assert_eq!(usage.total_tokens, 50, "total_tokens should be aggregate");
+    }
+
+    #[test]
+    fn test_token_accumulation_across_iterations() {
+        // Simulate accumulating tokens from three loop iterations and verify
+        // the aggregate matches the sum.
+        use super::super::schemas::chat_completions::Usage as ChatUsage;
+
+        // Iteration token counts: (prompt, completion)
+        let iterations: &[(u32, u32)] = &[(100, 50), (80, 40), (60, 30)];
+
+        let mut accumulated: Option<ChatUsage> = None;
+
+        for &(prompt, completion) in iterations {
+            let iter_usage = ChatUsage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: prompt + completion,
+                prompt_tokens_details: None,
+                completion_tokens_details: None,
+            };
+
+            accumulated = Some(match accumulated.take() {
+                None => iter_usage,
+                Some(prev) => ChatUsage {
+                    prompt_tokens: prev.prompt_tokens + iter_usage.prompt_tokens,
+                    completion_tokens: prev.completion_tokens + iter_usage.completion_tokens,
+                    total_tokens: prev.total_tokens + iter_usage.total_tokens,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                },
+            });
+        }
+
+        let total: ChatUsage = accumulated.expect("should have accumulated usage");
+
+        assert_eq!(total.prompt_tokens, 100 + 80 + 60, "prompt tokens should be summed");
+        assert_eq!(
+            total.completion_tokens,
+            50 + 40 + 30,
+            "completion tokens should be summed"
+        );
+        assert_eq!(
+            total.total_tokens,
+            (100 + 50) + (80 + 40) + (60 + 30),
+            "total tokens should be summed"
+        );
+    }
+
+    #[test]
+    fn test_to_responses_response_with_usage_none_preserves_none() {
+        let adapter = create_test_adapter();
+        let request = make_responses_request();
+        let chat_response = make_chat_response_with_usage(10, 5, "stop");
+
+        // Passing None should set usage to None (no usage information available).
+        let response = adapter.to_responses_response_with_usage(&chat_response, &request, None);
+        assert!(
+            response.usage.is_none(),
+            "usage should be None when override is None"
         );
     }
 }
