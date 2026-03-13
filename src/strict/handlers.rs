@@ -484,7 +484,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             debug!(tool_count = tool_calls.len(), "Extracted tool calls");
 
             // Execute tool calls with OTel instrumentation (one span per tool)
-            let results = adapter.execute_tool_calls_instrumented(&tool_calls).await;
+            let results = adapter.execute_tool_calls(&tool_calls).await;
 
             // Check if there are unhandled tools
             if adapter.has_unhandled_tools(&results) {

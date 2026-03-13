@@ -229,43 +229,6 @@ impl OpenResponsesAdapter {
         response
     }
 
-    /// Execute all tool calls with OTel instrumentation and return results.
-    ///
-    /// Each tool call is wrapped in a `tool.execute` child span carrying
-    /// `tool.name` and `tool.duration_ms` attributes.
-    pub async fn execute_tool_calls_instrumented(
-        &self,
-        tool_calls: &[PendingToolCall],
-    ) -> Vec<ToolCallResult> {
-        let mut results = Vec::new();
-        for tc in tool_calls {
-            let span = tracing::info_span!(
-                "tool.execute",
-                tool.name = %tc.name,
-                tool.duration_ms = tracing::field::Empty,
-            );
-            let start = Instant::now();
-            let result = async {
-                match self.execute_tool(tc).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Tool execution failed");
-                        ToolCallResult::Error {
-                            call_id: tc.id.clone(),
-                            error: e.to_string(),
-                        }
-                    }
-                }
-            }
-            .instrument(span.clone())
-            .await;
-            let duration_ms = start.elapsed().as_millis() as i64;
-            span.record("tool.duration_ms", duration_ms);
-            results.push(result);
-        }
-        results
-    }
-
     /// Store a response and return the stored response with ID
     ///
     /// The entire response is stored to allow future access to metadata, instructions,
@@ -334,19 +297,32 @@ impl OpenResponsesAdapter {
         })
     }
 
-    /// Execute all tool calls and return results
+    /// Execute all tool calls and return results.
+    ///
+    /// Each call is wrapped in a `tool.execute` child span carrying
+    /// `tool.name` and `tool.duration_ms` attributes.
     pub async fn execute_tool_calls(&self, tool_calls: &[PendingToolCall]) -> Vec<ToolCallResult> {
         let mut results = Vec::new();
         for tc in tool_calls {
-            match self.execute_tool(tc).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    results.push(ToolCallResult::Error {
+            let span = tracing::info_span!(
+                "tool.execute",
+                tool.name = %tc.name,
+                tool.duration_ms = tracing::field::Empty,
+            );
+            let start = Instant::now();
+            let result = async {
+                match self.execute_tool(tc).await {
+                    Ok(result) => result,
+                    Err(e) => ToolCallResult::Error {
                         call_id: tc.id.clone(),
                         error: e.to_string(),
-                    });
+                    },
                 }
             }
+            .instrument(span.clone())
+            .await;
+            span.record("tool.duration_ms", start.elapsed().as_millis() as i64);
+            results.push(result);
         }
         results
     }
