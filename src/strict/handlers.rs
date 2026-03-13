@@ -12,16 +12,19 @@
 use super::adapter::{OpenResponsesAdapter, PendingToolCall};
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionCall,
-    ToolCall,
+    FunctionDefinition, Tool as ChatTool, ToolCall,
 };
 use super::schemas::completions::{CompletionChunk, CompletionRequest, CompletionResponse};
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
-use super::schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent};
+use super::schemas::responses::{
+    ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent,
+};
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::extract_model_from_request;
 use crate::handlers::{ResolvedTrust, target_message_handler};
+use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
@@ -30,6 +33,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
+use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
 /// Result of forwarding a request to an upstream provider.
@@ -347,6 +351,19 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     let adapter =
         OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
 
+    // Build per-request context from the request extensions and model name.
+    let ctx = RequestContext::new().with_model(&request.model);
+
+    // Resolve server-side tools for this request context.
+    let server_tools = state.tool_executor.tools(&ctx).await;
+    let server_tool_names: HashSet<String> =
+        server_tools.iter().map(|t| t.name.clone()).collect();
+
+    debug!(
+        server_tool_count = server_tools.len(),
+        "Resolved server-side tools"
+    );
+
     // Convert the Responses request to a Chat Completions request
     let mut chat_request = match adapter.to_chat_request(&request).await {
         Ok(req) => req,
@@ -360,10 +377,23 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
+    // Merge server-side tool schemas into the chat request tools.
+    if !server_tools.is_empty() {
+        merge_server_tools(&mut chat_request, &server_tools);
+    }
+
     // Check if streaming is requested
     if request.stream == Some(true) {
         debug!("Using streaming adapter mode");
-        return handle_streaming_adapter_request(state, headers, request, chat_request).await;
+        return handle_streaming_adapter_request(
+            state,
+            headers,
+            request,
+            chat_request,
+            server_tool_names,
+            ctx,
+        )
+        .await;
     }
 
     // Tool loop orchestration for non-streaming requests
@@ -448,8 +478,10 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             let tool_calls = OpenResponsesAdapter::extract_tool_calls(&chat_response);
             debug!(tool_count = tool_calls.len(), "Extracted tool calls");
 
-            // Execute tool calls
-            let results = adapter.execute_tool_calls(&tool_calls).await;
+            // Execute tool calls (server-side tools only; others returned as Unhandled)
+            let results = adapter
+                .execute_tool_calls(&tool_calls, &server_tool_names, &ctx)
+                .await;
 
             // Check if there are unhandled tools
             if adapter.has_unhandled_tools(&results) {
@@ -548,6 +580,8 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     headers: HeaderMap,
     request: ResponsesRequest,
     mut chat_request: ChatCompletionRequest,
+    server_tool_names: HashSet<String>,
+    ctx: RequestContext,
 ) -> Response {
     // Ensure stream is enabled on the chat request
     chat_request.stream = Some(true);
@@ -685,7 +719,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     })
                     .collect();
 
-                let results = adapter.execute_tool_calls(&tool_calls).await;
+                let results = adapter.execute_tool_calls(&tool_calls, &server_tool_names, &ctx).await;
 
                 // If any tools are unhandled, stop looping — the client
                 // already has the tool_call events and can act on them.
@@ -880,6 +914,33 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
+    }
+}
+
+/// Merge server-side tool schemas into the chat completions request.
+///
+/// Converts each `ToolSchema` into a `ChatTool` and appends it to (or initialises)
+/// the request's `tools` field.
+fn merge_server_tools(
+    chat_request: &mut ChatCompletionRequest,
+    server_tools: &[crate::traits::ToolSchema],
+) {
+    let chat_tools: Vec<ChatTool> = server_tools
+        .iter()
+        .map(|ts| ChatTool {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: ts.name.clone(),
+                description: Some(ts.description.clone()),
+                parameters: Some(ts.parameters.clone()),
+                strict: Some(ts.strict),
+            },
+        })
+        .collect();
+
+    match chat_request.tools {
+        Some(ref mut existing) => existing.extend(chat_tools),
+        None => chat_request.tools = Some(chat_tools),
     }
 }
 

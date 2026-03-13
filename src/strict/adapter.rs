@@ -17,10 +17,12 @@ use super::schemas::responses::{
     ResponseUsage, ResponsesRequest, ResponsesResponse, TextConfig, TextFormat,
     Tool as ResponseTool, ToolChoice as ResponseToolChoice, TruncationStrategy,
 };
-use crate::traits::{ResponseStore, StoreError, ToolError, ToolExecutor};
+use crate::traits::{RequestContext, ResponseStore, StoreError, ToolError, ToolExecutor};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, warn};
+use std::time::Instant;
+use tracing::{Instrument, debug, warn};
 
 /// The Open Responses adapter that bridges the Responses API to Chat Completions
 pub struct OpenResponsesAdapter {
@@ -256,13 +258,18 @@ impl OpenResponsesAdapter {
             .collect()
     }
 
-    /// Execute a tool call using the configured executor
+    /// Execute a tool call using the configured executor.
+    ///
+    /// `server_tool_names` is the set of tool names returned by `ToolExecutor::tools()`.
+    /// Tool calls not in this set are returned as `Unhandled`.
     pub async fn execute_tool(
         &self,
         tool_call: &PendingToolCall,
+        server_tool_names: &HashSet<String>,
+        ctx: &RequestContext,
     ) -> Result<ToolCallResult, ToolError> {
-        // Check if the executor can handle this tool
-        if !self.executor.can_handle(&tool_call.name) {
+        // Check if this is a server-side tool
+        if !server_tool_names.contains(&tool_call.name) {
             return Ok(ToolCallResult::Unhandled(tool_call.clone()));
         }
 
@@ -273,7 +280,7 @@ impl OpenResponsesAdapter {
         // Execute the tool
         let result = self
             .executor
-            .execute(&tool_call.name, &tool_call.id, &args)
+            .execute(&tool_call.name, &tool_call.id, &args, ctx)
             .await?;
 
         Ok(ToolCallResult::Executed {
@@ -282,19 +289,37 @@ impl OpenResponsesAdapter {
         })
     }
 
-    /// Execute all tool calls and return results
-    pub async fn execute_tool_calls(&self, tool_calls: &[PendingToolCall]) -> Vec<ToolCallResult> {
+    /// Execute all tool calls and return results.
+    ///
+    /// `server_tool_names` is the set of tool names returned by `ToolExecutor::tools()`.
+    /// Tool calls not in this set are returned as `Unhandled`.
+    pub async fn execute_tool_calls(
+        &self,
+        tool_calls: &[PendingToolCall],
+        server_tool_names: &HashSet<String>,
+        ctx: &RequestContext,
+    ) -> Vec<ToolCallResult> {
         let mut results = Vec::new();
         for tc in tool_calls {
-            match self.execute_tool(tc).await {
-                Ok(result) => results.push(result),
-                Err(e) => {
-                    results.push(ToolCallResult::Error {
+            let span = tracing::info_span!(
+                "tool.execute",
+                tool.name = %tc.name,
+                tool.duration_ms = tracing::field::Empty,
+            );
+            let start = Instant::now();
+            let result = async {
+                match self.execute_tool(tc, server_tool_names, ctx).await {
+                    Ok(result) => result,
+                    Err(e) => ToolCallResult::Error {
                         call_id: tc.id.clone(),
                         error: e.to_string(),
-                    });
+                    },
                 }
             }
+            .instrument(span.clone())
+            .await;
+            span.record("tool.duration_ms", start.elapsed().as_millis() as i64);
+            results.push(result);
         }
         results
     }
