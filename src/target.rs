@@ -15,6 +15,9 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
+use crate::session_affinity::{
+    SessionAffinityStore, metrics::record_cleanup as record_affinity_cleanup,
+};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -22,6 +25,7 @@ use dashmap::DashMap;
 use futures_util::{Stream, StreamExt};
 use governor::{DefaultDirectRateLimiter, Quota};
 use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
@@ -29,6 +33,67 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, WatchStream};
 use tracing::{debug, error, info, trace};
 use url::Url;
+
+fn deserialize_lowercase<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    Ok(value.trim().to_ascii_lowercase())
+}
+
+fn default_session_affinity_header_name() -> String {
+    "x-session-id".to_string()
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    300
+}
+
+fn default_session_affinity_rebind_on_fallback() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct SessionAffinityConfig {
+    #[serde(
+        default = "default_session_affinity_header_name",
+        deserialize_with = "deserialize_lowercase"
+    )]
+    #[builder(default = default_session_affinity_header_name())]
+    pub header_name: String,
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    #[builder(default = default_session_affinity_ttl_secs())]
+    pub ttl_secs: u64,
+    #[serde(default = "default_session_affinity_rebind_on_fallback")]
+    #[builder(default = default_session_affinity_rebind_on_fallback())]
+    pub rebind_on_fallback: bool,
+}
+
+impl SessionAffinityConfig {
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.header_name.trim().is_empty() {
+            return Err(anyhow!("session_affinity.header_name must not be empty"));
+        }
+        if self.ttl_secs == 0 {
+            return Err(anyhow!(
+                "session_affinity.ttl_secs must be greater than zero"
+            ));
+        }
+        if self.ttl_secs > 3600 {
+            tracing::warn!(
+                ttl_secs = self.ttl_secs,
+                "session_affinity.ttl_secs > 3600 may increase memory pressure"
+            );
+        }
+        if !self.rebind_on_fallback {
+            tracing::info!(
+                "session_affinity.rebind_on_fallback=false may keep sessions sticky to degraded providers"
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitParameters {
@@ -213,6 +278,9 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
+    #[serde(default)]
+    pub session_affinity: Option<SessionAffinityConfig>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -296,6 +364,7 @@ pub struct PoolConfig {
     pub open_responses: Option<OpenResponsesConfig>,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
+    pub session_affinity: Option<SessionAffinityConfig>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -314,6 +383,7 @@ impl TargetSpecOrList {
                 open_responses: pool.open_responses,
                 trusted: pool.trusted,
                 routing_rules: pool.routing_rules,
+                session_affinity: pool.session_affinity,
                 providers: pool.providers,
             }),
             TargetSpecOrList::List(list) => {
@@ -359,6 +429,7 @@ impl TargetSpecOrList {
                     open_responses: None,
                     trusted,
                     routing_rules: Vec::new(),
+                    session_affinity: None,
                     providers,
                 })
             }
@@ -394,6 +465,7 @@ impl TargetSpecOrList {
                     open_responses,
                     trusted,
                     routing_rules: Vec::new(),
+                    session_affinity: None,
                     providers: vec![provider],
                 })
             }
@@ -821,6 +893,38 @@ impl TargetsStream for WatchTargetsStream {
     }
 }
 
+fn cleanup_session_affinity_bindings(
+    targets: &Arc<DashMap<String, ProviderPool>>,
+    models: &std::collections::HashSet<String>,
+    store: &Arc<dyn SessionAffinityStore>,
+) {
+    for model in models {
+        let valid_provider_ids = targets
+            .get(model)
+            .map(|pool| {
+                if pool.session_affinity().is_some() {
+                    pool.providers()
+                        .iter()
+                        .map(|provider| provider.identity().to_string())
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                }
+            })
+            .unwrap_or_default();
+        let removed = store.remove_stale_for_model(model, &valid_provider_ids);
+
+        if removed > 0 {
+            info!(
+                model = %model,
+                removed,
+                "removed stale session affinity bindings after config reload"
+            );
+            record_affinity_cleanup(model, "reload", removed);
+        }
+    }
+}
+
 impl Targets {
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
@@ -914,6 +1018,10 @@ impl Targets {
                 .concurrency_limit
                 .map(|cl| ConcurrencyLimiter::with_limit(cl.max_concurrent_requests));
 
+            if let Some(ref config) = pool_config.session_affinity {
+                config.validate()?;
+            }
+
             // Convert provider specs to providers
             // Pool-level sanitize_response enables sanitization for all providers
             let pool_sanitize = pool_config.sanitize_response;
@@ -936,7 +1044,7 @@ impl Targets {
                 })
                 .collect();
 
-            let pool = ProviderPool::with_config(
+            let pool = ProviderPool::with_config_and_affinity(
                 providers,
                 merged_keys,
                 pool_limiter,
@@ -945,6 +1053,7 @@ impl Targets {
                 pool_config.strategy,
                 pool_config.trusted,
                 pool_config.routing_rules,
+                pool_config.session_affinity,
             );
             debug!(
                 "Created provider pool '{}' with {} provider(s), fallback enabled: {}, strategy: {:?}",
@@ -976,10 +1085,26 @@ impl Targets {
         W: TargetsStream + Send + 'static,
         W::Error: Into<anyhow::Error>,
     {
+        self.receive_updates_with_session_affinity(targets_stream, None)
+            .await
+    }
+
+    /// Receives updates and optionally performs eager stale session-affinity cleanup.
+    /// Request-path lazy cleanup remains in place as the correctness fallback.
+    pub async fn receive_updates_with_session_affinity<W>(
+        &self,
+        targets_stream: W,
+        session_affinity_store: Option<Arc<dyn SessionAffinityStore>>,
+    ) -> Result<(), W::Error>
+    where
+        W: TargetsStream + Send + 'static,
+        W::Error: Into<anyhow::Error>,
+    {
         let targets = Arc::clone(&self.targets);
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
         let key_labels = Arc::clone(&self.key_labels);
+        let session_affinity_store = session_affinity_store.clone();
 
         let mut stream = targets_stream.stream().await?;
 
@@ -994,6 +1119,8 @@ impl Targets {
                         // Update targets atomically
                         let current_target_keys: Vec<String> =
                             targets.iter().map(|entry| entry.key().clone()).collect();
+                        let cleanup_models: std::collections::HashSet<String> =
+                            current_target_keys.iter().cloned().collect();
 
                         // Do it like this for atomicity (if you delete and recreate, there's a
                         // moment with no targets during which requests can fail)
@@ -1074,6 +1201,10 @@ impl Targets {
                         for entry in new_targets.key_labels.iter() {
                             key_labels.insert(entry.key().clone(), entry.value().clone());
                         }
+
+                        if let Some(store) = session_affinity_store.as_ref() {
+                            cleanup_session_affinity_bindings(&targets, &cleanup_models, store);
+                        }
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
@@ -1091,6 +1222,8 @@ impl Targets {
 mod tests {
     use super::*;
     use crate::auth::ConstantTimeString;
+    use crate::session_affinity::store::InMemorySessionAffinityStore;
+    use crate::session_affinity::{AffinityEntry, AffinityKey};
     use dashmap::DashMap;
     use std::collections::HashSet;
     use std::sync::Arc;
@@ -1304,6 +1437,150 @@ mod tests {
         assert_eq!(target.url.as_str(), "https://api.openai.com/v2");
         assert_eq!(target.onwards_key, Some("new-key".to_string()));
         assert_eq!(target.onwards_model, Some("gpt-4-turbo".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_config_watcher_cleans_stale_session_affinity_bindings() {
+        let initial_targets = Targets {
+            targets: Arc::new(DashMap::new()),
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+
+        let initial_pool = ProviderPool::with_config_and_affinity(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://api1.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+            Some(SessionAffinityConfig {
+                header_name: "x-session-id".into(),
+                ttl_secs: 300,
+                rebind_on_fallback: true,
+            }),
+        );
+        let valid_provider_id = initial_pool.providers()[0].identity().to_string();
+        initial_targets
+            .targets
+            .insert("gpt-4o".to_string(), initial_pool);
+        initial_targets.targets.insert(
+            "claude-3".to_string(),
+            ProviderPool::with_config_and_affinity(
+                vec![Provider::new(
+                    Target::builder()
+                        .url("https://anthropic.example.com".parse().unwrap())
+                        .build(),
+                    1,
+                )],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+                Some(SessionAffinityConfig {
+                    header_name: "x-session-id".into(),
+                    ttl_secs: 300,
+                    rebind_on_fallback: true,
+                }),
+            ),
+        );
+
+        let updated_pool = ProviderPool::with_config_and_affinity(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://api2.example.com".parse().unwrap())
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+            Some(SessionAffinityConfig {
+                header_name: "x-session-id".into(),
+                ttl_secs: 300,
+                rebind_on_fallback: true,
+            }),
+        );
+        let updated_provider_id = updated_pool.providers()[0].identity().to_string();
+
+        let updated_targets = Targets {
+            targets: Arc::new(DashMap::new()),
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        updated_targets
+            .targets
+            .insert("gpt-4o".to_string(), updated_pool);
+
+        let store = Arc::new(InMemorySessionAffinityStore::new());
+        let stale_key = AffinityKey {
+            model: "gpt-4o".into(),
+            session_fingerprint: "stale".into(),
+        };
+        let removed_model_key = AffinityKey {
+            model: "claude-3".into(),
+            session_fingerprint: "deleted-model".into(),
+        };
+        let valid_key = AffinityKey {
+            model: "gpt-4o".into(),
+            session_fingerprint: "valid".into(),
+        };
+        store.insert(
+            stale_key.clone(),
+            AffinityEntry {
+                provider_id: valid_provider_id,
+            },
+            tokio::time::Duration::from_secs(300),
+        );
+        store.insert(
+            removed_model_key.clone(),
+            AffinityEntry {
+                provider_id: "provider-removed".into(),
+            },
+            tokio::time::Duration::from_secs(300),
+        );
+        store.insert(
+            valid_key.clone(),
+            AffinityEntry {
+                provider_id: updated_provider_id.clone(),
+            },
+            tokio::time::Duration::from_secs(300),
+        );
+
+        let mock_watcher = MockConfigWatcher::with_targets(vec![updated_targets]);
+        initial_targets
+            .receive_updates_with_session_affinity(mock_watcher, Some(store.clone()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        assert!(store.get(&stale_key).is_none());
+        assert!(store.get(&removed_model_key).is_none());
+        assert_eq!(
+            store.get(&valid_key).unwrap().provider_id,
+            updated_provider_id
+        );
     }
 
     #[test]
@@ -2130,6 +2407,7 @@ mod tests {
             open_responses: None,
             trusted: true,
             routing_rules: Vec::new(),
+            session_affinity: None,
             providers: vec![ProviderSpec {
                 url: "https://api.example.com".parse().unwrap(),
                 onwards_key: None,
@@ -2377,6 +2655,77 @@ mod tests {
             !pool.is_trusted(),
             "Pool without trusted flag should default to false"
         );
+    }
+
+    #[test]
+    fn test_session_affinity_header_name_is_normalized_to_lowercase() {
+        let json = r#"{
+            "targets": {
+                "gpt-4o": {
+                    "session_affinity": {
+                        "header_name": "X-Session-ID",
+                        "ttl_secs": 300
+                    },
+                    "providers": [
+                        {
+                            "url": "https://api.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("gpt-4o").unwrap();
+        let affinity = pool.session_affinity().unwrap();
+        assert_eq!(affinity.header_name, "x-session-id");
+    }
+
+    #[test]
+    fn test_session_affinity_rejects_zero_ttl() {
+        let json = r#"{
+            "targets": {
+                "gpt-4o": {
+                    "session_affinity": {
+                        "header_name": "x-session-id",
+                        "ttl_secs": 0
+                    },
+                    "providers": [
+                        {
+                            "url": "https://api.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let err = Targets::from_config(config).unwrap_err();
+        assert!(err.to_string().contains("session_affinity.ttl_secs"));
+    }
+
+    #[test]
+    fn test_session_affinity_rejects_empty_header_name() {
+        let json = r#"{
+            "targets": {
+                "gpt-4o": {
+                    "session_affinity": {
+                        "header_name": "   ",
+                        "ttl_secs": 300
+                    },
+                    "providers": [
+                        {
+                            "url": "https://api.example.com"
+                        }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let err = Targets::from_config(config).unwrap_err();
+        assert!(err.to_string().contains("session_affinity.header_name"));
     }
 
     #[test]

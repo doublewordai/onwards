@@ -4658,7 +4658,10 @@ mod tests {
     #[tokio::test]
     async fn test_completions_rejects_missing_model() {
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
@@ -4726,20 +4729,27 @@ mod tests {
         }"#;
 
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Standard fields present
@@ -4786,11 +4796,15 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Client-requested model reflected back, not the internal provider model
@@ -4816,14 +4830,19 @@ mod tests {
         let mut mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
         mock_client.set_header("content-length", mock_response.len().to_string());
 
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
@@ -4837,12 +4856,17 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .expect("content-length header should be present");
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Content-Length must match the sanitized body (stripped of extra fields)
         assert_eq!(content_length, body.len());
-        assert!(content_length < mock_response.len(), "sanitized body should be smaller");
+        assert!(
+            content_length < mock_response.len(),
+            "sanitized body should be smaller"
+        );
 
         // Sanitized body has model rewritten and extra fields removed
         assert_eq!(body_json["model"], "gpt-3.5-turbo-instruct");
@@ -4877,8 +4901,7 @@ mod tests {
 
         // The prompt array is forwarded to the upstream (it can handle it)
         let requests = mock_client.get_requests();
-        let request_json: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert!(request_json["prompt"].is_array());
     }
 
@@ -4892,7 +4915,10 @@ mod tests {
                 "data: [DONE]\n\n".to_string(),
             ],
         );
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
@@ -4907,7 +4933,9 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Standard completions chunk fields present
@@ -4964,7 +4992,9 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Client-requested model reflected back, not the internal provider version
@@ -4977,20 +5007,27 @@ mod tests {
     async fn test_completions_untrusted_error_sanitized() {
         let mock_error = r#"{"error":{"message":"Provider internal error: OOM on GPU 3","code":"oom","provider":"custom-llm"}}"#;
         let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error);
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Provider-specific error details not leaked
@@ -5043,13 +5080,17 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Trusted provider: original error passed through verbatim
@@ -5108,13 +5149,17 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Model rewritten even for trusted provider
