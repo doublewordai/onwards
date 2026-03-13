@@ -121,8 +121,34 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<ResponsesRequest>,
+    req: Request<Body>,
 ) -> Response {
+    // Extract extensions before consuming the body for JSON parsing.
+    let extensions = req.extensions().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!(error = %e, "Failed to read request body");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Failed to read request body",
+            );
+        }
+    };
+
+    let request: ResponsesRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, "Failed to parse responses request");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid request: {}", e),
+            );
+        }
+    };
+
     debug!(
         model = %request.model,
         has_previous_response_id = request.previous_response_id.is_some(),
@@ -136,7 +162,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request).await;
+        return handle_adapter_request(state, headers, request, extensions).await;
     }
 
     // Passthrough mode: forward request as-is
@@ -347,12 +373,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     headers: HeaderMap,
     request: ResponsesRequest,
+    extensions: axum::http::Extensions,
 ) -> Response {
     let adapter =
         OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
 
     // Build per-request context from the request extensions and model name.
-    let ctx = RequestContext::new().with_model(&request.model);
+    let mut ctx = RequestContext::new().with_model(&request.model);
+    ctx.extensions = extensions;
 
     // Resolve server-side tools for this request context.
     let server_tools = state.tool_executor.tools(&ctx).await;
