@@ -62,7 +62,8 @@ use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, ResponseStore, StoreError, ToolError, ToolExecutor,
+    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
+    ToolExecutor, ToolSchema,
 };
 
 /// Type alias for body transformation function

@@ -12,24 +12,29 @@
 use super::adapter::{OpenResponsesAdapter, PendingToolCall};
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionCall,
-    ToolCall,
+    FunctionDefinition, Tool as ChatTool, ToolCall, Usage,
 };
 use super::schemas::completions::{CompletionChunk, CompletionRequest, CompletionResponse};
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
-use super::schemas::responses::{ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent};
+use super::schemas::responses::{
+    InputTokensDetails, OutputTokensDetails, ResponseUsage, ResponsesRequest, ResponsesResponse,
+    ResponsesStreamingEvent,
+};
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::extract_model_from_request;
 use crate::handlers::{ResolvedTrust, target_message_handler};
+use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{FromRequest, State};
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
+use std::collections::HashSet;
 use tracing::{debug, error, info, trace, warn};
 
 /// Result of forwarding a request to an upstream provider.
@@ -117,8 +122,26 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<ResponsesRequest>,
+    req: Request<Body>,
 ) -> Response {
+    // Split the request so we can grab extensions (inserted by middleware)
+    // before Axum's Json extractor consumes the body.
+    let (mut parts, body) = req.into_parts();
+    let extensions = std::mem::take(&mut parts.extensions);
+    let req = Request::from_parts(parts, body);
+
+    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+        Ok(Json(r)) => r,
+        Err(e) => {
+            error!(error = %e, "Failed to parse responses request");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Invalid request: {}", e),
+            );
+        }
+    };
+
     debug!(
         model = %request.model,
         has_previous_response_id = request.previous_response_id.is_some(),
@@ -132,7 +155,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request).await;
+        return handle_adapter_request(state, headers, request, extensions).await;
     }
 
     // Passthrough mode: forward request as-is
@@ -343,9 +366,24 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     headers: HeaderMap,
     request: ResponsesRequest,
+    extensions: axum::http::Extensions,
 ) -> Response {
     let adapter =
         OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
+
+    // Build per-request context from the request extensions and model name.
+    let mut ctx = RequestContext::new().with_model(&request.model);
+    ctx.extensions = extensions;
+
+    // Resolve server-side tools for this request context.
+    let server_tools = state.tool_executor.tools(&ctx).await;
+    let server_tool_names: HashSet<String> =
+        server_tools.iter().map(|t| t.name.clone()).collect();
+
+    debug!(
+        server_tool_count = server_tools.len(),
+        "Resolved server-side tools"
+    );
 
     // Convert the Responses request to a Chat Completions request
     let mut chat_request = match adapter.to_chat_request(&request).await {
@@ -360,15 +398,60 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
+    // Merge server-side tool schemas into the chat request tools.
+    if !server_tools.is_empty() {
+        // Check for duplicate tool names between client and server tools
+        if let Some(ref client_tools) = request.tools {
+            let client_tool_names: HashSet<String> = client_tools
+                .iter()
+                .filter_map(|t| match t {
+                    super::schemas::responses::Tool::Function { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+
+            let collisions: Vec<&str> = server_tool_names
+                .iter()
+                .filter(|name| client_tool_names.contains(*name))
+                .map(|s| s.as_str())
+                .collect();
+
+            if !collisions.is_empty() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &format!(
+                        "Tool name collision: the following tools are provided by both the client and server: {}",
+                        collisions.join(", ")
+                    ),
+                );
+            }
+        }
+
+        merge_server_tools(&mut chat_request, &server_tools);
+    }
+
     // Check if streaming is requested
     if request.stream == Some(true) {
         debug!("Using streaming adapter mode");
-        return handle_streaming_adapter_request(state, headers, request, chat_request).await;
+        return handle_streaming_adapter_request(
+            state,
+            headers,
+            request,
+            chat_request,
+            server_tool_names,
+            ctx,
+        )
+        .await;
     }
 
     // Tool loop orchestration for non-streaming requests
     let max_iterations = adapter.max_iterations();
     let mut iteration = 0;
+
+    // Accumulate token usage across all loop iterations so the final response
+    // reports aggregate totals rather than just the last iteration's counts.
+    let mut accumulated_usage: Option<Usage> = None;
 
     loop {
         iteration += 1;
@@ -390,6 +473,15 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                 );
             }
         };
+
+        // Open a child span for this model call; attributes are recorded after
+        // we have the response so we know the token counts.
+        let model_call_span = tracing::info_span!(
+            "model.call",
+            llm.token_count.input = tracing::field::Empty,
+            llm.token_count.output = tracing::field::Empty,
+            loop.iteration = iteration as i64,
+        );
 
         // Forward to Chat Completions endpoint
         let response = forward_request_raw(
@@ -439,6 +531,25 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
         };
 
+        // Record token counts on the model.call span and accumulate totals.
+        if let Some(ref usage) = chat_response.usage {
+            model_call_span.record("llm.token_count.input", usage.prompt_tokens as i64);
+            model_call_span.record("llm.token_count.output", usage.completion_tokens as i64);
+
+            accumulated_usage = Some(match accumulated_usage.take() {
+                None => usage.clone(),
+                Some(prev) => Usage {
+                    prompt_tokens: prev.prompt_tokens + usage.prompt_tokens,
+                    completion_tokens: prev.completion_tokens + usage.completion_tokens,
+                    total_tokens: prev.total_tokens + usage.total_tokens,
+                    prompt_tokens_details: None,
+                    completion_tokens_details: None,
+                },
+            });
+        }
+        // model_call_span is dropped (and therefore closed) at end of loop body.
+        drop(model_call_span);
+
         // Check if the response requires tool action
         if OpenResponsesAdapter::requires_tool_action(&chat_response) && iteration < max_iterations
         {
@@ -448,14 +559,27 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             let tool_calls = OpenResponsesAdapter::extract_tool_calls(&chat_response);
             debug!(tool_count = tool_calls.len(), "Extracted tool calls");
 
-            // Execute tool calls
-            let results = adapter.execute_tool_calls(&tool_calls).await;
+            // Execute tool calls (server-side tools only; others returned as Unhandled)
+            let results = adapter
+                .execute_tool_calls(&tool_calls, &server_tool_names, &ctx)
+                .await;
 
             // Check if there are unhandled tools
             if adapter.has_unhandled_tools(&results) {
                 debug!("Some tools are unhandled, returning to client");
-                // Return to client with requires_action status
-                let responses_response = adapter.to_responses_response(&chat_response, &request);
+                // Return to client with requires_action status, using aggregate usage
+                let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
+                    input_tokens: u.prompt_tokens,
+                    output_tokens: u.completion_tokens,
+                    total_tokens: u.total_tokens,
+                    input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+                    output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+                });
+                let responses_response = adapter.to_responses_response_with_usage(
+                    &chat_response,
+                    &request,
+                    aggregate_response_usage,
+                );
 
                 let response_bytes = match serde_json::to_vec(&responses_response) {
                     Ok(bytes) => bytes,
@@ -499,7 +623,18 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
 
         // No tool action required or max iterations reached - return final response
-        let responses_response = adapter.to_responses_response(&chat_response, &request);
+        let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
+            input_tokens: u.prompt_tokens,
+            output_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+            input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+            output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+        });
+        let responses_response = adapter.to_responses_response_with_usage(
+            &chat_response,
+            &request,
+            aggregate_response_usage,
+        );
 
         info!(
             response_id = %responses_response.id,
@@ -548,6 +683,8 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     headers: HeaderMap,
     request: ResponsesRequest,
     mut chat_request: ChatCompletionRequest,
+    server_tool_names: HashSet<String>,
+    ctx: RequestContext,
 ) -> Response {
     // Ensure stream is enabled on the chat request
     chat_request.stream = Some(true);
@@ -685,7 +822,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     })
                     .collect();
 
-                let results = adapter.execute_tool_calls(&tool_calls).await;
+                let results = adapter.execute_tool_calls(&tool_calls, &server_tool_names, &ctx).await;
 
                 // If any tools are unhandled, stop looping — the client
                 // already has the tool_call events and can act on them.
@@ -880,6 +1017,47 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
+    }
+}
+
+/// Merge server-side tool schemas into the chat completions request.
+///
+/// Converts each `ToolSchema` into a `ChatTool` and appends it to (or initialises)
+/// the request's `tools` field.
+fn merge_server_tools(
+    chat_request: &mut ChatCompletionRequest,
+    server_tools: &[crate::traits::ToolSchema],
+) {
+    let chat_tools: Vec<ChatTool> = server_tools
+        .iter()
+        .map(|ts| {
+            // OpenAI requires `additionalProperties: false` in strict mode.
+            // Apply the same patch that `convert_tools()` applies to client tools.
+            let mut params = ts.parameters.clone();
+            if let Some(obj) = params.as_object_mut()
+                && !obj.contains_key("additionalProperties")
+            {
+                obj.insert(
+                    "additionalProperties".to_string(),
+                    serde_json::Value::Bool(false),
+                );
+            }
+
+            ChatTool {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: ts.name.clone(),
+                    description: Some(ts.description.clone()),
+                    parameters: Some(params),
+                    strict: Some(ts.strict),
+                },
+            }
+        })
+        .collect();
+
+    match chat_request.tools {
+        Some(ref mut existing) => existing.extend(chat_tools),
+        None => chat_request.tools = Some(chat_tools),
     }
 }
 

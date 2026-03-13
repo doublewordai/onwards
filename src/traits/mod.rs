@@ -10,4 +10,4 @@ mod response_store;
 mod tool_executor;
 
 pub use response_store::{NoOpResponseStore, ResponseStore, StoreError};
-pub use tool_executor::{NoOpToolExecutor, ToolError, ToolExecutor};
+pub use tool_executor::{NoOpToolExecutor, RequestContext, ToolError, ToolExecutor, ToolSchema};
