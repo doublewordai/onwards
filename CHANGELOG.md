@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1](https://github.com/doublewordai/onwards/compare/v0.21.0...v0.21.1) - 2026-03-16
+
+### Fixed
+
+- follow routing rule redirects when checking adapter mode ([#156](https://github.com/doublewordai/onwards/pull/156))
+
 ## [0.21.0](https://github.com/doublewordai/onwards/compare/v0.20.0...v0.21.0) - 2026-03-16
 
 ### Added
