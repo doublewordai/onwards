@@ -577,7 +577,10 @@ mod tests {
             "usage": {"prompt_tokens": 5, "completion_tokens": 7, "total_tokens": 12}
         }"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        (AppState::with_client(targets, mock_client.clone()), mock_client)
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
     }
 
     /// The strict router accepts POST /completions with a valid request body
@@ -771,16 +774,22 @@ mod tests {
             .with_tool_executor(Arc::new(CollisionTestExecutor));
         let router = build_strict_router(state);
 
-        // Client sends a tool with the same name as the server-side tool
+        // Client sends both a Function tool and a HostedTool with the same name
         let request_body = r#"{
             "model": "gpt-4o",
             "input": "What's the weather?",
-            "tools": [{
-                "type": "function",
-                "name": "get_weather",
-                "description": "Client-side get_weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
-            }]
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Client-side get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+                },
+                {
+                    "type": "hosted_tool",
+                    "name": "get_weather"
+                }
+            ]
         }"#;
 
         let request = Request::builder()
