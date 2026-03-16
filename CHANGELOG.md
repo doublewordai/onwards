@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0](https://github.com/doublewordai/onwards/compare/v0.20.0...v0.21.0) - 2026-03-16
+
+### Added
+
+- opt-in server-side tool calling via HostedTool ([#155](https://github.com/doublewordai/onwards/pull/155))
+
+### Other
+
+- release v0.20.0 ([#147](https://github.com/doublewordai/onwards/pull/147))
+
 ## [0.20.0](https://github.com/doublewordai/onwards/compare/v0.19.2...v0.20.0) - 2026-03-13
 
 ### Added
