@@ -9,8 +9,16 @@ use std::fmt;
 
 /// Per-request context threaded through the tool executor.
 ///
-/// Carries the model name (for per-deployment resolution) and arbitrary
-/// extension data inserted by middleware (e.g. resolved user/group info).
+/// Carries the model name (for per-deployment resolution), the raw HTTP
+/// request headers, and arbitrary extension data inserted by middleware
+/// (e.g. resolved user/group info).
+///
+/// # Headers
+///
+/// The `headers` field contains the HTTP headers from the incoming request
+/// (e.g. `Authorization`, custom tenant headers). This allows `ToolExecutor`
+/// implementations to inspect auth tokens or routing headers when resolving
+/// tools or executing them.
 ///
 /// # Extensions
 ///
@@ -28,6 +36,8 @@ use std::fmt;
 pub struct RequestContext {
     /// The model alias from the request body (if available).
     pub model: Option<String>,
+    /// The HTTP headers from the incoming request.
+    pub headers: axum::http::HeaderMap,
     /// Arbitrary typed data inserted by middleware layers.
     pub extensions: axum::http::Extensions,
 }
@@ -39,6 +49,11 @@ impl RequestContext {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub fn with_headers(mut self, headers: axum::http::HeaderMap) -> Self {
+        self.headers = headers;
         self
     }
 
