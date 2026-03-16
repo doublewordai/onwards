@@ -459,6 +459,18 @@ pub enum Tool {
         #[serde(skip_serializing_if = "Option::is_none")]
         display_height: Option<u32>,
     },
+
+    /// Server-hosted tool — the client opts in by name; the server resolves
+    /// the full schema (description, parameters, URL) from its tool registry.
+    ///
+    /// ```json
+    /// {"type": "hosted_tool", "name": "web_search"}
+    /// ```
+    #[serde(rename = "hosted_tool")]
+    HostedTool {
+        /// Name of the server-side tool to enable for this request.
+        name: String,
+    },
 }
 
 /// Tool choice specification

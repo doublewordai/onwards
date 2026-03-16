@@ -1056,7 +1056,9 @@ mod tests {
             output_tokens: 20,
             total_tokens: 50,
             input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-            output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: 0,
+            },
         });
 
         let response =
@@ -1102,7 +1104,11 @@ mod tests {
 
         let total: ChatUsage = accumulated.expect("should have accumulated usage");
 
-        assert_eq!(total.prompt_tokens, 100 + 80 + 60, "prompt tokens should be summed");
+        assert_eq!(
+            total.prompt_tokens,
+            100 + 80 + 60,
+            "prompt tokens should be summed"
+        );
         assert_eq!(
             total.completion_tokens,
             50 + 40 + 30,
@@ -1168,8 +1174,7 @@ mod tests {
         );
         let ctx = RequestContext::new();
 
-        let server_tool_names: HashSet<String> =
-            ["server_tool".to_string()].into_iter().collect();
+        let server_tool_names: HashSet<String> = ["server_tool".to_string()].into_iter().collect();
 
         // A tool call matching a server tool should be routed to the executor.
         let server_call = PendingToolCall {

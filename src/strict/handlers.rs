@@ -34,7 +34,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, error, info, trace, warn};
 
 /// Result of forwarding a request to an upstream provider.
@@ -365,7 +365,7 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
 async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     headers: HeaderMap,
-    request: ResponsesRequest,
+    mut request: ResponsesRequest,
     extensions: axum::http::Extensions,
 ) -> Response {
     let adapter =
@@ -375,34 +375,49 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     let mut ctx = RequestContext::new().with_model(&request.model);
     ctx.extensions = extensions;
 
-    // Resolve server-side tools for this request context.
-    let server_tools = state.tool_executor.tools(&ctx).await;
-    let server_tool_names: HashSet<String> =
-        server_tools.iter().map(|t| t.name.clone()).collect();
+    // Resolve *available* server-side tools for this request context.
+    let available_server_tools = state.tool_executor.tools(&ctx).await;
+    let available_server_tool_map: HashMap<String, &crate::traits::ToolSchema> =
+        available_server_tools
+            .iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
 
     debug!(
-        server_tool_count = server_tools.len(),
-        "Resolved server-side tools"
+        available_server_tool_count = available_server_tools.len(),
+        "Resolved available server-side tools"
     );
 
-    // Convert the Responses request to a Chat Completions request
-    let mut chat_request = match adapter.to_chat_request(&request).await {
-        Ok(req) => req,
-        Err(e) => {
-            error!(error = %e, "Failed to convert responses request to chat completions");
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                &format!("Failed to process request: {}", e),
-            );
+    // Determine which server tools the client has opted into via HostedTool entries.
+    let mut requested_server_tools: Vec<&crate::traits::ToolSchema> = Vec::new();
+    if let Some(ref client_tools) = request.tools {
+        // Collect HostedTool requests and validate them against available tools.
+        for tool in client_tools {
+            if let super::schemas::responses::Tool::HostedTool { name } = tool {
+                match available_server_tool_map.get(name.as_str()) {
+                    Some(schema) => requested_server_tools.push(schema),
+                    None => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            &format!(
+                                "Unknown hosted tool: '{}'. Available tools: [{}]",
+                                name,
+                                available_server_tools
+                                    .iter()
+                                    .map(|t| t.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        );
+                    }
+                }
+            }
         }
-    };
 
-    // Merge server-side tool schemas into the chat request tools.
-    if !server_tools.is_empty() {
-        // Check for duplicate tool names between client and server tools
-        if let Some(ref client_tools) = request.tools {
-            let client_tool_names: HashSet<String> = client_tools
+        // Check for name collisions between client Function tools and requested hosted tools.
+        if !requested_server_tools.is_empty() {
+            let client_fn_names: HashSet<String> = client_tools
                 .iter()
                 .filter_map(|t| match t {
                     super::schemas::responses::Tool::Function { name, .. } => Some(name.clone()),
@@ -410,10 +425,10 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                 })
                 .collect();
 
-            let collisions: Vec<&str> = server_tool_names
+            let collisions: Vec<&str> = requested_server_tools
                 .iter()
-                .filter(|name| client_tool_names.contains(*name))
-                .map(|s| s.as_str())
+                .filter(|t| client_fn_names.contains(&t.name))
+                .map(|t| t.name.as_str())
                 .collect();
 
             if !collisions.is_empty() {
@@ -428,7 +443,42 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
         }
 
-        merge_server_tools(&mut chat_request, &server_tools);
+        // Strip HostedTool entries from the request tools (they'll be replaced
+        // with full schemas via merge_server_tools below).
+        request.tools = Some(
+            client_tools
+                .iter()
+                .filter(|t| !matches!(t, super::schemas::responses::Tool::HostedTool { .. }))
+                .cloned()
+                .collect(),
+        );
+    }
+
+    let server_tool_names: HashSet<String> = requested_server_tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+
+    // Convert the Responses request to a Chat Completions request
+    let mut chat_request = match adapter.to_chat_request(&request).await {
+        Ok(req) => req,
+        Err(e) => {
+            error!(error = %e, "Failed to convert responses request to chat completions");
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                &format!("Failed to process request: {}", e),
+            );
+        }
+    };
+
+    // Merge only the requested server-side tool schemas into the chat request.
+    if !requested_server_tools.is_empty() {
+        let schemas: Vec<crate::traits::ToolSchema> = requested_server_tools
+            .iter()
+            .map(|t| (*t).clone())
+            .collect();
+        merge_server_tools(&mut chat_request, &schemas);
     }
 
     // Check if streaming is requested
@@ -573,7 +623,9 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                     output_tokens: u.completion_tokens,
                     total_tokens: u.total_tokens,
                     input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                    output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+                    output_tokens_details: OutputTokensDetails {
+                        reasoning_tokens: 0,
+                    },
                 });
                 let responses_response = adapter.to_responses_response_with_usage(
                     &chat_response,
@@ -628,7 +680,9 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             output_tokens: u.completion_tokens,
             total_tokens: u.total_tokens,
             input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-            output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: 0,
+            },
         });
         let responses_response = adapter.to_responses_response_with_usage(
             &chat_response,
@@ -4658,7 +4712,10 @@ mod tests {
     #[tokio::test]
     async fn test_completions_rejects_missing_model() {
         let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
@@ -4726,20 +4783,27 @@ mod tests {
         }"#;
 
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Standard fields present
@@ -4786,11 +4850,15 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Client-requested model reflected back, not the internal provider model
@@ -4816,14 +4884,19 @@ mod tests {
         let mut mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
         mock_client.set_header("content-length", mock_response.len().to_string());
 
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
@@ -4837,12 +4910,17 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .expect("content-length header should be present");
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Content-Length must match the sanitized body (stripped of extra fields)
         assert_eq!(content_length, body.len());
-        assert!(content_length < mock_response.len(), "sanitized body should be smaller");
+        assert!(
+            content_length < mock_response.len(),
+            "sanitized body should be smaller"
+        );
 
         // Sanitized body has model rewritten and extra fields removed
         assert_eq!(body_json["model"], "gpt-3.5-turbo-instruct");
@@ -4877,8 +4955,7 @@ mod tests {
 
         // The prompt array is forwarded to the upstream (it can handle it)
         let requests = mock_client.get_requests();
-        let request_json: serde_json::Value =
-            serde_json::from_slice(&requests[0].body).unwrap();
+        let request_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert!(request_json["prompt"].is_array());
     }
 
@@ -4892,7 +4969,10 @@ mod tests {
                 "data: [DONE]\n\n".to_string(),
             ],
         );
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
@@ -4907,7 +4987,9 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Standard completions chunk fields present
@@ -4964,7 +5046,9 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Client-requested model reflected back, not the internal provider version
@@ -4977,20 +5061,27 @@ mod tests {
     async fn test_completions_untrusted_error_sanitized() {
         let mock_error = r#"{"error":{"message":"Provider internal error: OOM on GPU 3","code":"oom","provider":"custom-llm"}}"#;
         let mock_client = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, mock_error);
-        let state = AppState::with_client(completions_test_targets("gpt-3.5-turbo-instruct"), mock_client);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Provider-specific error details not leaked
@@ -5043,13 +5134,17 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Trusted provider: original error passed through verbatim
@@ -5108,13 +5203,17 @@ mod tests {
             .method("POST")
             .uri("/completions")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#))
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hi"}"#,
+            ))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         // Model rewritten even for trusted provider
