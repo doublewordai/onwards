@@ -149,8 +149,14 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Responses request validated"
     );
 
+    // Extract bearer token for routing rule evaluation
+    let bearer_token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+
     // Check if we should use the adapter for this target
-    let use_adapter = should_use_adapter(&state, &request.model);
+    let use_adapter = should_use_adapter(&state, &request.model, bearer_token);
 
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
@@ -321,12 +327,17 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Check if the adapter should be used for this model
+/// Check if the adapter should be used for this model, evaluating routing rules
+/// with the authenticated key's labels to determine the actual redirect target.
+///
+/// Mirrors the standard routing path (src/handlers.rs): routing rules are evaluated
+/// only on the original pool, and at most one redirect is followed. Rules are NOT
+/// re-evaluated on the redirect target.
 fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
     state: &AppState<T>,
     model: &str,
+    bearer_token: Option<&str>,
 ) -> bool {
-    // Get the pool for this model
     let pool = match state.targets.targets.get(model) {
         Some(pool) => pool.clone(),
         None => {
@@ -335,21 +346,47 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Get the first target to check its config
-    let target = match pool.first_target() {
-        Some(target) => target,
-        None => {
-            debug!(model = %model, "Pool is empty, cannot determine adapter setting");
-            return false;
-        }
-    };
+    // If the pool has providers, check the first one's adapter config directly
+    if let Some(target) = pool.first_target() {
+        return target
+            .open_responses
+            .as_ref()
+            .map(|config| config.adapter)
+            .unwrap_or(false);
+    }
 
-    // Check if open_responses.adapter is true
-    target
-        .open_responses
-        .as_ref()
-        .map(|config| config.adapter)
-        .unwrap_or(false)
+    // Pool has no providers — evaluate routing rules with key labels to find the
+    // redirect target (same first-match semantics as the normal request path).
+    let labels = bearer_token
+        .and_then(|token| state.targets.key_labels.get(token).map(|r| r.value().clone()))
+        .unwrap_or_default();
+
+    match pool.evaluate_routing_rules(&labels) {
+        Some(crate::target::RoutingAction::Redirect { target }) => {
+            debug!(
+                model = %model,
+                redirect_target = %target,
+                "Following routing rule redirect for adapter check"
+            );
+            // Check adapter on redirect target only — no further rule evaluation
+            state
+                .targets
+                .targets
+                .get(target.as_str())
+                .and_then(|p| p.first_target().cloned())
+                .and_then(|t| t.open_responses)
+                .map(|config| config.adapter)
+                .unwrap_or(false)
+        }
+        Some(crate::target::RoutingAction::Deny) => {
+            debug!(model = %model, "Routing rule denied, defaulting to passthrough");
+            false
+        }
+        None => {
+            debug!(model = %model, "Pool is empty with no matching routing rules, cannot determine adapter setting");
+            false
+        }
+    }
 }
 
 /// Handle a request using the Open Responses adapter
