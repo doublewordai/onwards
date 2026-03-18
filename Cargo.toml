@@ -55,6 +55,8 @@ axum-prometheus = "0.10.0"
 metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
+hex = "0.4.3"
+sha2 = "0.10.9"
 
 [dev-dependencies]
 axum-test = "18.0.0"
