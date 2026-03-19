@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.2](https://github.com/doublewordai/onwards/compare/v0.21.1...v0.21.2) - 2026-03-19
+
+### Fixed
+
+- handle fusillade-triggered SSE in strict handlers ([#158](https://github.com/doublewordai/onwards/pull/158))
+
 ## [0.21.1](https://github.com/doublewordai/onwards/compare/v0.21.0...v0.21.1) - 2026-03-16
 
 ### Fixed
