@@ -47,6 +47,15 @@ struct ForwardResult {
     internal_error: bool,
 }
 
+fn is_sse_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .map(|value| value.eq_ignore_ascii_case("text/event-stream"))
+        .unwrap_or(false)
+}
+
 /// Handler for GET /v1/models
 ///
 /// Returns the list of available models from the configured targets.
@@ -105,7 +114,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .map(|value| value.contains("text/event-stream"))
+            .map(is_sse_content_type)
             .unwrap_or(false);
 
         if response_is_sse && !is_streaming {
@@ -827,7 +836,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !content_type.contains("text/event-stream") {
+    if !is_sse_content_type(content_type) {
         warn!(
             content_type = content_type,
             "Expected SSE stream but got different content type"
