@@ -549,9 +549,19 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         merge_server_tools(&mut chat_request, &schemas);
     }
 
-    // Check if streaming is requested
-    if request.stream == Some(true) {
-        debug!("Using streaming adapter mode");
+    // Check if streaming is requested — either explicitly by the client or
+    // because a downstream body transform (e.g. fusillade's X-Fusillade-Stream)
+    // will enable it on the forwarded /chat/completions request.
+    let fusillade_stream = headers
+        .get("x-fusillade-stream")
+        .and_then(|v| v.to_str().ok())
+        == Some("true");
+    if request.stream == Some(true) || fusillade_stream {
+        debug!(
+            explicit_stream = request.stream == Some(true),
+            fusillade_stream = fusillade_stream,
+            "Using streaming adapter mode"
+        );
         return handle_streaming_adapter_request(
             state,
             headers,
