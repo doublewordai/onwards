@@ -120,6 +120,8 @@ pub struct CompletionChoice {
 }
 
 /// Streaming chunk from POST /v1/completions with stream=true
+///
+/// When `stream_options.include_usage` is set, the final chunk includes a `usage` object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChunk {
     pub id: String,
@@ -127,6 +129,8 @@ pub struct CompletionChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<super::chat_completions::Usage>,
 }
 
 /// A single choice within a streaming completion chunk
