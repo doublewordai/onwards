@@ -197,6 +197,11 @@ pub struct AppState<T: HttpClient> {
     pub targets: target::Targets,
     pub body_transform_fn: Option<BodyTransformFn>,
     pub response_transform_fn: Option<ResponseTransformFn>,
+    /// Header name that signals the request should be treated as streaming.
+    /// When set, the responses adapter checks this header to decide whether to
+    /// use the streaming path before forwarding (since the body transform runs
+    /// too late for that decision). Defaults to `None` (header check disabled).
+    pub streaming_header: Option<String>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub response_store: Arc<dyn ResponseStore>,
 }
@@ -214,6 +219,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
+            .field("streaming_header", &self.streaming_header)
             .field("tool_executor", &"<dyn ToolExecutor>")
             .field("response_store", &"<dyn ResponseStore>")
             .finish()
@@ -235,6 +241,7 @@ impl AppState<HyperClient> {
             targets,
             body_transform_fn: None,
             response_transform_fn: None,
+            streaming_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -254,6 +261,7 @@ impl AppState<HyperClient> {
             targets,
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
+            streaming_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -268,6 +276,7 @@ impl<T: HttpClient> AppState<T> {
             targets,
             body_transform_fn: None,
             response_transform_fn: None,
+            streaming_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -284,9 +293,17 @@ impl<T: HttpClient> AppState<T> {
             targets,
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
+            streaming_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
+    }
+
+    /// Set the header name that signals a request should use the streaming path.
+    /// Used by the responses adapter to decide streaming vs non-streaming before forwarding.
+    pub fn with_streaming_header(mut self, header: impl Into<String>) -> Self {
+        self.streaming_header = Some(header.into());
+        self
     }
 
     /// Set the response transformation function (builder pattern)

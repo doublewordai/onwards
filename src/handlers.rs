@@ -1781,6 +1781,7 @@ mod tests {
             http_client: mock_client,
             body_transform_fn: None,
             response_transform_fn: None,
+            streaming_header: None,
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
         };
