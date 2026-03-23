@@ -550,16 +550,18 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     }
 
     // Check if streaming is requested — either explicitly by the client or
-    // because a downstream body transform (e.g. fusillade's X-Fusillade-Stream)
-    // will enable it on the forwarded /chat/completions request.
-    let fusillade_stream = headers
-        .get("x-fusillade-stream")
+    // because a downstream body transform will enable it on the forwarded
+    // /chat/completions request (signalled via the configured streaming header).
+    let header_stream = state
+        .streaming_header
+        .as_ref()
+        .and_then(|name| headers.get(name.as_str()))
         .and_then(|v| v.to_str().ok())
         == Some("true");
-    if request.stream == Some(true) || fusillade_stream {
+    if request.stream == Some(true) || header_stream {
         debug!(
             explicit_stream = request.stream == Some(true),
-            fusillade_stream = fusillade_stream,
+            header_stream = header_stream,
             "Using streaming adapter mode"
         );
         return handle_streaming_adapter_request(
@@ -2987,7 +2989,8 @@ mod tests {
                 "data: [DONE]\n\n".to_string(),
             ],
         );
-        let state = AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
+        let state = AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn)
+            .with_streaming_header("x-fusillade-stream");
         let router = crate::strict::build_strict_router(state);
 
         let request = Request::builder()
