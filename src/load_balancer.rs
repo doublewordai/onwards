@@ -104,6 +104,7 @@ pub struct TtfbTracker {
 
 /// Multiplier for TTFB-relative decay. A measurement expires after
 /// observed_ttfb * DECAY_MULTIPLIER has elapsed.
+// TODO: is this sensible?  Is it better not to decay, but just to invalidate after 1 window?
 const DECAY_MULTIPLIER: u64 = 5;
 
 impl TtfbTracker {
