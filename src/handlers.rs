@@ -100,7 +100,8 @@ where
             if self.time_to_first_frame.is_none() {
                 let ttfb = self.upstream_request_start.elapsed();
                 self.time_to_first_frame = Some(ttfb);
-                println!("upstream_ttfb_ms={} target={}", ttfb.as_millis(), self.target_name);
+                metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => self.target_name.clone())
+                    .record(ttfb.as_secs_f64());
             }
         }
         result
