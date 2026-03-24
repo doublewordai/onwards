@@ -83,6 +83,7 @@ struct TrackedStream<S> {
     upstream_request_start: std::time::Instant,
     time_to_first_frame: Option<std::time::Duration>,
     target_name: String,
+    status: u16,
 }
 
 impl<S, E> futures_util::Stream for TrackedStream<S>
@@ -100,8 +101,12 @@ where
             if self.time_to_first_frame.is_none() {
                 let ttfb = self.upstream_request_start.elapsed();
                 self.time_to_first_frame = Some(ttfb);
-                metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => self.target_name.clone())
-                    .record(ttfb.as_secs_f64());
+                // Skip TTFB metric for non-2xx responses since they may be intentionally short (e.g. 400 Bad Request)
+                // and we don't want to skew measurements driving routing with error responses.
+                if (200..300).contains(&self.status) {
+                    metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => self.target_name.clone())
+                        .record(ttfb.as_secs_f64());
+                }
             }
         }
         result
@@ -971,6 +976,7 @@ pub async fn target_message_handler<T: HttpClient>(
             upstream_request_start,
             time_to_first_frame: None,
             target_name: model_name.clone(),
+            status,
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
