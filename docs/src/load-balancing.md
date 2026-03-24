@@ -27,6 +27,7 @@ Onwards supports load balancing across multiple providers for a single alias, wi
 
 - **`weighted_random`** (default): Distributes traffic randomly based on weights. A provider with `weight: 3` receives ~3x the traffic of `weight: 1`.
 - **`priority`**: Always routes to the first provider. Falls through to subsequent providers only when fallback is triggered.
+- **`fastest_ttfb`**: Routes to the provider with the lowest observed time to first body frame. Measurements decay linearly over 60 seconds — once expired, a provider returns to the default (zero), encouraging re-exploration. On cold start, all providers appear equally fast, so initial requests are distributed across all providers until real data is available. Ties are broken by weighted random selection.
 
 ## Fallback
 
@@ -56,7 +57,7 @@ Settings that apply to the entire alias:
 | `rate_limit` | Rate limit for all requests to this alias |
 | `concurrency_limit` | Max concurrent requests to this alias |
 | `response_headers` | Headers added to all responses |
-| `strategy` | `weighted_random` or `priority` |
+| `strategy` | `weighted_random`, `priority`, or `fastest_ttfb` |
 | `fallback` | Retry configuration (see above) |
 | `providers` | Array of provider configurations |
 
@@ -88,6 +89,23 @@ Settings specific to each provider:
       "providers": [
         { "url": "https://primary.example.com", "onwards_key": "sk-primary" },
         { "url": "https://backup.example.com", "onwards_key": "sk-backup" }
+      ]
+    }
+  }
+}
+```
+
+### Fastest provider routing
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "strategy": "fastest_ttfb",
+      "fallback": { "enabled": true, "on_status": [5], "on_rate_limit": true },
+      "providers": [
+        { "url": "https://provider-a.example.com", "onwards_key": "sk-a" },
+        { "url": "https://provider-b.example.com", "onwards_key": "sk-b" }
       ]
     }
   }
