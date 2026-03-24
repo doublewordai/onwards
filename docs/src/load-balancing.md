@@ -27,7 +27,7 @@ Onwards supports load balancing across multiple providers for a single alias, wi
 
 - **`weighted_random`** (default): Distributes traffic randomly based on weights. A provider with `weight: 3` receives ~3x the traffic of `weight: 1`.
 - **`priority`**: Always routes to the first provider. Falls through to subsequent providers only when fallback is triggered.
-- **`fastest_ttfb`**: Routes to the provider with the lowest observed time to first body frame. Measurements decay linearly over 60 seconds — once expired, a provider returns to the default (zero), encouraging re-exploration. On cold start, all providers appear equally fast, so initial requests are distributed across all providers until real data is available. Ties are broken by weighted random selection.
+- **`fastest_ttfb`**: Routes to the provider with the lowest observed time to first body frame. Measurements decay linearly over a window proportional to the observed TTFB itself (5x the measured value) — a 100ms measurement expires in ~500ms, a 5s measurement in ~25s. Once expired, a provider returns to the default (zero), encouraging re-exploration. On cold start, all providers appear equally fast, so initial requests are distributed across all providers until real data is available. Ties are broken by weighted random selection.
 
 ## Fallback
 

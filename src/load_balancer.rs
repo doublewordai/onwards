@@ -81,13 +81,17 @@ impl Provider {
     }
 }
 
-/// Tracks observed time-to-first-body-frame per provider with time-based decay.
+/// Tracks observed time-to-first-body-frame per provider with TTFB-relative decay.
 ///
 /// Each slot stores the most recent TTFB and when it was recorded.
-/// On read, values decay linearly toward zero over the decay window.
+/// On read, values decay linearly toward zero over a window proportional to
+/// the observed TTFB itself (TTFB * DECAY_MULTIPLIER). This means a 100ms
+/// measurement expires in ~500ms, while a 5s measurement expires in ~25s.
+/// The intuition: if the observed TTFB was N seconds, after N seconds have
+/// passed the provider's queue has flushed and the measurement is stale.
+/// The multiplier adds headroom for natural variance.
 /// Once fully expired, the provider appears fastest (TTFB = 0), which
-/// encourages re-exploration — preventing a single bad measurement from
-/// permanently blocking a provider that receives no further traffic.
+/// encourages re-exploration.
 #[derive(Debug, Clone)]
 pub struct TtfbTracker {
     /// TTFB in microseconds per provider
@@ -98,8 +102,9 @@ pub struct TtfbTracker {
     epoch: std::time::Instant,
 }
 
-/// Duration after which a TTFB measurement fully decays to zero
-const DECAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Multiplier for TTFB-relative decay. A measurement expires after
+/// observed_ttfb * DECAY_MULTIPLIER has elapsed.
+const DECAY_MULTIPLIER: u64 = 5;
 
 impl TtfbTracker {
     /// Create a new tracker with `count` slots, all uninitialized (effective TTFB = 0)
@@ -144,9 +149,11 @@ impl TtfbTracker {
 
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let elapsed_ms = now_ms.saturating_sub(recorded_at);
-        let window_ms = DECAY_WINDOW.as_millis() as u64;
+        // Decay window is proportional to the observed TTFB itself.
+        // ttfb is in microseconds, convert to milliseconds for comparison.
+        let window_ms = (ttfb / 1000) * DECAY_MULTIPLIER;
 
-        if elapsed_ms >= window_ms {
+        if window_ms == 0 || elapsed_ms >= window_ms {
             return 0;
         }
 
@@ -345,7 +352,7 @@ impl ProviderPool {
     }
 
     /// Select using fastest TTFB: pick the provider with the lowest observed
-    /// time to first body frame, breaking ties with weighted random selection.
+    /// time to first byte, breaking ties with weighted random selection.
     /// Skips providers at their concurrency limit.
     fn select_fastest_ttfb(
         &self,

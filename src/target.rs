@@ -109,7 +109,7 @@ pub enum LoadBalanceStrategy {
     WeightedRandom,
     /// Priority-based selection - always use the first available provider in order
     Priority,
-    /// Select the provider with the lowest observed time to first body frame
+    /// Select the provider with the lowest observed time to first byte
     FastestTtfb,
 }
 

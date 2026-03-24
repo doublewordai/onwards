@@ -72,7 +72,7 @@ impl Drop for InflightGuard {
 }
 
 /// A response body stream that carries per-request context through the streaming
-/// lifecycle. Tracks the target model name, measures time to first body frame,
+/// lifecycle. Tracks the target model name, measures time to first byte,
 /// and keeps [`ConcurrencyGuard`] and [`InflightGuard`] alive until the stream
 /// is fully consumed or dropped — ensuring counters are decremented when the
 /// body finishes, not when the handler returns.
