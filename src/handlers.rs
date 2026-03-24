@@ -80,6 +80,8 @@ struct GuardedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
+    upstream_request_start: std::time::Instant,
+    time_to_first_frame: Option<std::time::Duration>,
 }
 
 impl<S, E> futures_util::Stream for GuardedStream<S>
@@ -92,7 +94,15 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+        let result = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(_))) = &result {
+            if self.time_to_first_frame.is_none() {
+                let ttfb = self.upstream_request_start.elapsed();
+                self.time_to_first_frame = Some(ttfb);
+                println!("upstream_ttfb_ms={}", ttfb.as_millis());
+            }
+        }
+        result
     }
 }
 
@@ -653,6 +663,7 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
+        let upstream_request_start = std::time::Instant::now();
         let request_result = async {
             if let Some(timeout_secs) = target.request_timeout_secs {
                 let timeout_duration = std::time::Duration::from_secs(timeout_secs);
@@ -955,6 +966,8 @@ pub async fn target_message_handler<T: HttpClient>(
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
+            upstream_request_start,
+            time_to_first_frame: None,
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
