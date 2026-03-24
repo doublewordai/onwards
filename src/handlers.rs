@@ -82,8 +82,7 @@ struct TrackedStream<S> {
     _inflight_guard: InflightGuard,
     upstream_request_start: std::time::Instant,
     time_to_first_frame: Option<std::time::Duration>,
-    target_name: String,
-    status: u16,
+    on_first_frame: Option<Box<dyn FnOnce(std::time::Duration) + Send>>,
 }
 
 impl<S, E> futures_util::Stream for TrackedStream<S>
@@ -101,11 +100,8 @@ where
             if self.time_to_first_frame.is_none() {
                 let ttfb = self.upstream_request_start.elapsed();
                 self.time_to_first_frame = Some(ttfb);
-                // Skip TTFB metric for non-2xx responses since they may be intentionally short (e.g. 400 Bad Request)
-                // and we don't want to skew measurements driving routing with error responses.
-                if (200..300).contains(&self.status) {
-                    metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => self.target_name.clone())
-                        .record(ttfb.as_secs_f64());
+                if let Some(callback) = self.on_first_frame.take() {
+                    callback(ttfb);
                 }
             }
         }
@@ -485,7 +481,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    for (provider_index, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -975,8 +971,17 @@ pub async fn target_message_handler<T: HttpClient>(
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
             upstream_request_start,
             time_to_first_frame: None,
-            target_name: model_name.clone(),
-            status,
+            on_first_frame: {
+                let tracker = pool.ttfb_tracker().clone();
+                let target_name = model_name.clone();
+                Some(Box::new(move |ttfb| {
+                    if (200..300).contains(&status) {
+                        metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => target_name)
+                            .record(ttfb.as_secs_f64());
+                        tracker.record(provider_index, ttfb);
+                    }
+                }))
+            },
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
