@@ -370,6 +370,11 @@ impl ProviderPool {
             }
 
             let ttfb = self.ttfb_tracker.get(idx);
+            metrics::gauge!(
+                "onwards_routing_ttfb_seconds",
+                "provider" => format!("{}:{}", idx, provider.target.url),
+            )
+            .set(ttfb as f64 / 1_000_000.0);
 
             if ttfb < best_ttfb {
                 best_ttfb = ttfb;
