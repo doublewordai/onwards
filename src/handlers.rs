@@ -974,9 +974,10 @@ pub async fn target_message_handler<T: HttpClient>(
             on_first_frame: {
                 let tracker = pool.ttfb_tracker().clone();
                 let target_name = model_name.clone();
+                let provider_label = format!("{}:{}", provider_index, target.url);
                 Some(Box::new(move |ttfb| {
                     if (200..300).contains(&status) {
-                        metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => target_name)
+                        metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => target_name, "provider" => provider_label)
                             .record(ttfb.as_secs_f64());
                         tracker.record(provider_index, ttfb);
                     }
