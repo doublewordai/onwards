@@ -71,20 +71,21 @@ impl Drop for InflightGuard {
     }
 }
 
-/// A stream wrapper that keeps a [`ConcurrencyGuard`] and [`InflightGuard`] alive
-/// until the stream is fully consumed or dropped. This ensures the active connection
-/// count and inflight gauge are decremented when the response body finishes, not
-/// when the handler returns — critical for streaming responses where the body
-/// outlives the handler.
-struct GuardedStream<S> {
+/// A response body stream that carries per-request context through the streaming
+/// lifecycle. Tracks the target model name, measures time to first body frame,
+/// and keeps [`ConcurrencyGuard`] and [`InflightGuard`] alive until the stream
+/// is fully consumed or dropped — ensuring counters are decremented when the
+/// body finishes, not when the handler returns.
+struct TrackedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
     upstream_request_start: std::time::Instant,
     time_to_first_frame: Option<std::time::Duration>,
+    target_name: String,
 }
 
-impl<S, E> futures_util::Stream for GuardedStream<S>
+impl<S, E> futures_util::Stream for TrackedStream<S>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
 {
@@ -99,7 +100,7 @@ where
             if self.time_to_first_frame.is_none() {
                 let ttfb = self.upstream_request_start.elapsed();
                 self.time_to_first_frame = Some(ttfb);
-                println!("upstream_ttfb_ms={}", ttfb.as_millis());
+                println!("upstream_ttfb_ms={} target={}", ttfb.as_millis(), self.target_name);
             }
         }
         result
@@ -236,7 +237,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     async move {
 
-    // Track inflight requests for observability. The guard is moved into GuardedStream
+    // Track inflight requests for observability. The guard is moved into TrackedStream
     // on the success path so the gauge stays incremented for the full lifetime of
     // streaming response bodies.
     metrics::gauge!("onwards_requests_inflight").increment(1.0);
@@ -962,12 +963,13 @@ pub async fn target_message_handler<T: HttpClient>(
         // are decremented when the body stream completes, not when the handler returns.
         // Critical for streaming responses where the body outlives the handler.
         let (parts, body) = response.into_parts();
-        let guarded = GuardedStream {
+        let guarded = TrackedStream {
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
             upstream_request_start,
             time_to_first_frame: None,
+            target_name: model_name.clone(),
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
