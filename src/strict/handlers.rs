@@ -129,7 +129,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_chat_response(response, resolved_model).await
+            sanitize_streaming_chat_response(response, resolved_model, trusted).await
         } else {
             sanitize_chat_response(response, resolved_model).await
         }
@@ -242,7 +242,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let response_is_sse = response_is_sse(&response);
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_responses_response(response, resolved_model).await
+            sanitize_streaming_responses_response(response, resolved_model, trusted).await
         } else {
             sanitize_responses_response(response, resolved_model).await
         }
@@ -346,7 +346,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let response_is_sse = response_is_sse(&response);
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_completions_response(response, resolved_model).await
+            sanitize_streaming_completions_response(response, resolved_model, trusted).await
         } else {
             sanitize_completions_response(response, resolved_model).await
         }
@@ -1303,6 +1303,7 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
 async fn sanitize_streaming_chat_response(
     mut response: Response,
     original_model: String,
+    trusted: bool,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
@@ -1349,6 +1350,18 @@ async fn sanitize_streaming_chat_response(
                                 }
                             }
                             Err(e) => {
+                                // Check if this is a provider error object embedded
+                                // in the SSE stream (e.g. input too long, invalid model).
+                                // Forward it as a clean SSE event so callers can
+                                // distinguish it from a network/parse error.
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -1462,6 +1475,7 @@ async fn sanitize_completions_response(mut response: Response, original_model: S
 async fn sanitize_streaming_completions_response(
     mut response: Response,
     original_model: String,
+    trusted: bool,
 ) -> Response {
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
@@ -1494,6 +1508,14 @@ async fn sanitize_streaming_completions_response(
                                 }
                             }
                             Err(e) => {
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
                                 error!(
                                     error = %e,
                                     raw = %data_part.chars().take(200).collect::<String>(),
@@ -1677,6 +1699,7 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
 async fn sanitize_streaming_responses_response(
     mut response: Response,
     original_model: String,
+    trusted: bool,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
@@ -1727,6 +1750,14 @@ async fn sanitize_streaming_responses_response(
                                 }
                             }
                             Err(e) => {
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -1775,6 +1806,52 @@ async fn sanitize_streaming_responses_response(
     response
 }
 
+/// Check if an SSE data payload is a provider error object and return it
+/// formatted as an SSE data line if so.
+///
+/// Some providers return HTTP 200 but embed an error object in the SSE stream
+/// instead of a valid chunk. For example:
+///
+/// ```text
+/// data: {"error": {"message": "...", "type": "BadRequestError", "code": 400}}
+/// ```
+///
+/// When detected, the error is forwarded as a clean SSE event so that
+/// downstream consumers (e.g. fusillade) can inspect the reassembled body
+/// and classify it as a non-retriable failure, rather than seeing a broken
+/// stream and treating it as a retriable network error.
+///
+/// `data_part` is the JSON string after stripping the `data: ` prefix.
+/// When `trusted` is false, the error message is replaced with a generic
+/// one to avoid leaking provider internals (consistent with how non-streaming
+/// error responses are sanitized in strict mode).
+fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(data_part).ok()?;
+    let error_obj = value.get("error")?;
+
+    if trusted {
+        let sanitized = serde_json::to_string(&value).ok()?;
+        Some(format!("data: {sanitized}"))
+    } else {
+        // For untrusted providers, replace with a generic error to avoid
+        // leaking provider internals. Reuses the same mapping as
+        // `standard_error_response` for consistency.
+        let code = error_obj
+            .get("code")
+            .and_then(|c| c.as_u64())
+            .unwrap_or(502) as u16;
+        let (error_type, message) = sanitized_error_for_status(code);
+        let sanitized = json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        });
+        Some(format!("data: {sanitized}"))
+    }
+}
+
 /// Sanitize error responses from third parties
 ///
 /// In strict mode, we never pass through third-party error messages.
@@ -1804,10 +1881,11 @@ async fn sanitize_error_response(mut response: Response) -> Response {
     standard_error_response(status)
 }
 
-/// Generate standard error response based on HTTP status code
-/// Never includes third-party error details
-fn standard_error_response(status: StatusCode) -> Response {
-    let (error_type, message) = match status.as_u16() {
+/// Map an HTTP status code to a generic (error_type, message) pair.
+/// Used by both `standard_error_response` and `try_format_sse_error` to
+/// sanitize errors from untrusted providers without leaking internals.
+fn sanitized_error_for_status(status: u16) -> (&'static str, &'static str) {
+    match status {
         400 => ("invalid_request_error", "Invalid request"),
         401 => ("authentication_error", "Authentication failed"),
         403 => ("permission_error", "Permission denied"),
@@ -1817,8 +1895,13 @@ fn standard_error_response(status: StatusCode) -> Response {
         502 => ("api_error", "Bad gateway"),
         503 => ("api_error", "Service unavailable"),
         _ => ("api_error", "An error occurred"),
-    };
+    }
+}
 
+/// Generate standard error response based on HTTP status code
+/// Never includes third-party error details
+fn standard_error_response(status: StatusCode) -> Response {
+    let (error_type, message) = sanitized_error_for_status(status.as_u16());
     error_response(status, error_type, message)
 }
 
@@ -5581,5 +5664,83 @@ mod tests {
         assert_ne!(body_json["model"], "gpt-3.5-turbo-instruct-actual");
         // Extra fields stripped even for trusted provider
         assert!(body_json.get("provider_metadata").is_none());
+    }
+
+    #[test]
+    fn test_try_format_sse_error_trusted_forwards_verbatim() {
+        let data_part = r#"{"error": {"message": "Input too long", "type": "BadRequestError", "code": 400}}"#;
+        let result = try_format_sse_error(data_part, true);
+        assert!(result.is_some());
+        let line = result.unwrap();
+        assert!(line.starts_with("data: "));
+        // Trusted: original message preserved
+        assert!(line.contains("Input too long"));
+    }
+
+    #[test]
+    fn test_try_format_sse_error_untrusted_sanitizes() {
+        let data_part = r#"{"error": {"message": "OOM on GPU 3", "type": "BadRequestError", "code": 400}}"#;
+        let result = try_format_sse_error(data_part, false);
+        assert!(result.is_some());
+        let line = result.unwrap();
+        // Untrusted: provider message must NOT leak
+        assert!(!line.contains("OOM on GPU 3"));
+        // Generic message used instead
+        assert!(line.contains("Invalid request"));
+    }
+
+    #[test]
+    fn test_try_format_sse_error_ignores_valid_chunk() {
+        let data_part = r#"{"id": "chatcmpl-123", "object": "chat.completion.chunk"}"#;
+        assert!(try_format_sse_error(data_part, true).is_none());
+    }
+
+    #[test]
+    fn test_try_format_sse_error_ignores_non_json() {
+        assert!(try_format_sse_error("[DONE]", true).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_forwards_trusted_error_in_sse() {
+        let error_body = "data: {\"error\": {\"message\": \"Input too long\", \"type\": \"BadRequestError\", \"code\": 400}}\n\n";
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(error_body))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_chat_response(response, "test-model".to_string(), true).await;
+        // HTTP status stays 200 — error is in the SSE body
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("Input too long"));
+    }
+
+    #[tokio::test]
+    async fn test_streaming_chat_sanitizes_untrusted_error_in_sse() {
+        let error_body = "data: {\"error\": {\"message\": \"OOM on GPU 3\", \"type\": \"server_error\", \"code\": 400}}\n\n";
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(error_body))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_chat_response(response, "test-model".to_string(), false).await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        // Provider internals must not leak
+        assert!(!body_str.contains("OOM on GPU 3"));
+        // But error structure is preserved for callers to detect
+        assert!(body_str.contains("\"error\""));
     }
 }
