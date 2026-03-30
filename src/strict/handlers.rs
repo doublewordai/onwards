@@ -389,7 +389,13 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
     // Pool has no providers — evaluate routing rules with key labels to find the
     // redirect target (same first-match semantics as the normal request path).
     let labels = bearer_token
-        .and_then(|token| state.targets.key_labels.get(token).map(|r| r.value().clone()))
+        .and_then(|token| {
+            state
+                .targets
+                .key_labels
+                .get(token)
+                .map(|r| r.value().clone())
+        })
         .unwrap_or_default();
 
     match pool.evaluate_routing_rules(&labels) {
@@ -1300,6 +1306,12 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
 /// Processes each SSE chunk line-by-line, deserializes through our strict schema,
 /// rewrites the model field, and re-serializes. Ignores comment lines and other
 /// non-data SSE fields to prevent metadata leakage.
+///
+/// Also detects provider error objects embedded in the SSE stream (e.g. when a
+/// provider returns HTTP 200 but sends `{"error": ...}` instead of a valid
+/// chunk). These are forwarded as clean SSE events — sanitized for untrusted
+/// providers — so that downstream consumers like fusillade can detect them in the
+/// reassembled body rather than seeing a broken stream.
 async fn sanitize_streaming_chat_response(
     mut response: Response,
     original_model: String,
@@ -1472,6 +1484,9 @@ async fn sanitize_completions_response(mut response: Response, original_model: S
 ///
 /// Processes each SSE chunk line-by-line, deserializes through `CompletionChunk`,
 /// rewrites the model field, and re-serializes.
+///
+/// Also forwards provider error objects embedded in the SSE stream as clean
+/// events (see [`sanitize_streaming_chat_response`] for details).
 async fn sanitize_streaming_completions_response(
     mut response: Response,
     original_model: String,
@@ -1696,6 +1711,9 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
 /// Similar to chat streaming sanitization - deserializes each SSE chunk through
 /// the strict ResponsesResponse schema (drops extra fields), rewrites model field,
 /// and re-serializes.
+///
+/// Also forwards provider error objects embedded in the SSE stream as clean
+/// events (see [`sanitize_streaming_chat_response`] for details).
 async fn sanitize_streaming_responses_response(
     mut response: Response,
     original_model: String,
@@ -1836,15 +1854,22 @@ fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
         // For untrusted providers, replace with a generic error to avoid
         // leaking provider internals. Reuses the same mapping as
         // `standard_error_response` for consistency.
-        let code = error_obj
-            .get("code")
-            .and_then(|c| c.as_u64())
-            .unwrap_or(502) as u16;
+        let code = match error_obj.get("code").and_then(|c| c.as_u64()) {
+            Some(c) => c as u16,
+            None => {
+                warn!(
+                    code = ?error_obj.get("code"),
+                    "Provider error object has non-numeric or missing code, defaulting to 500"
+                );
+                500
+            }
+        };
         let (error_type, message) = sanitized_error_for_status(code);
         let sanitized = json!({
             "error": {
                 "message": message,
                 "type": error_type,
+                "param": null,
                 "code": code,
             }
         });
@@ -2247,7 +2272,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_chat_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation() {
+    async fn test_strict_chat_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation()
+     {
         let targets = Arc::new(DashMap::new());
         targets.insert(
             "gpt-4".to_string(),
@@ -3006,7 +3032,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_responses_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation() {
+    async fn test_strict_responses_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation()
+     {
         let targets = Arc::new(DashMap::new());
         targets.insert(
             "gpt-4o".to_string(),
@@ -5424,7 +5451,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_completions_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation() {
+    async fn test_strict_completions_uses_streaming_sanitizer_when_body_transform_enables_streaming_after_validation()
+     {
         let transform_fn: crate::BodyTransformFn = Arc::new(|path, headers, body_bytes| {
             if path != "/completions" {
                 return None;
@@ -5668,7 +5696,8 @@ mod tests {
 
     #[test]
     fn test_try_format_sse_error_trusted_forwards_verbatim() {
-        let data_part = r#"{"error": {"message": "Input too long", "type": "BadRequestError", "code": 400}}"#;
+        let data_part =
+            r#"{"error": {"message": "Input too long", "type": "BadRequestError", "code": 400}}"#;
         let result = try_format_sse_error(data_part, true);
         assert!(result.is_some());
         let line = result.unwrap();
@@ -5679,7 +5708,8 @@ mod tests {
 
     #[test]
     fn test_try_format_sse_error_untrusted_sanitizes() {
-        let data_part = r#"{"error": {"message": "OOM on GPU 3", "type": "BadRequestError", "code": 400}}"#;
+        let data_part =
+            r#"{"error": {"message": "OOM on GPU 3", "type": "BadRequestError", "code": 400}}"#;
         let result = try_format_sse_error(data_part, false);
         assert!(result.is_some());
         let line = result.unwrap();
