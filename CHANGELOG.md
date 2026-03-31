@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1](https://github.com/doublewordai/onwards/compare/v0.22.0...v0.22.1) - 2026-03-31
+
+### Fixed
+
+- Retrieve upstream errors inside sse streams (despite 200 headers) and sanitize then forward them, rather than terminate the stream ([#165](https://github.com/doublewordai/onwards/pull/165))
+
 ## [0.22.0](https://github.com/doublewordai/onwards/compare/v0.21.2...v0.22.0) - 2026-03-23
 
 ### Added
