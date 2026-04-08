@@ -121,6 +121,18 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 
+    /// Reasoning text (OpenRouter format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
+    /// Reasoning content text (vLLM / DeepSeek format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+
+    /// Reasoning details array (OpenRouter format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
+
     /// Additional fields
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
@@ -305,6 +317,15 @@ pub struct ChunkDelta {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChunkToolCall>>,
+    /// Reasoning text (OpenRouter format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Reasoning content text (vLLM / DeepSeek format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    /// Reasoning details array (OpenRouter format)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 /// Tool call in a streaming chunk
@@ -408,6 +429,9 @@ mod tests {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 },
                 finish_reason: Some("stop".to_string()),
@@ -426,5 +450,123 @@ mod tests {
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("chatcmpl-123"));
+    }
+
+    #[test]
+    fn test_nonstreaming_response_with_reasoning_roundtrips() {
+        let json = r#"{
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "The answer is 4.",
+                    "reasoning": "Let me think step by step...",
+                    "reasoning_details": [{"type": "text", "text": "step 1"}]
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let response: ChatCompletionResponse = serde_json::from_str(json).unwrap();
+        let msg = &response.choices[0].message;
+        assert_eq!(
+            msg.reasoning.as_deref(),
+            Some("Let me think step by step...")
+        );
+        assert!(msg.reasoning_details.is_some());
+        assert_eq!(msg.reasoning_details.as_ref().unwrap().len(), 1);
+
+        // Round-trip: serialize and deserialize again
+        let serialized = serde_json::to_string(&response).unwrap();
+        let round_tripped: ChatCompletionResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.choices[0].message.reasoning, msg.reasoning);
+    }
+
+    #[test]
+    fn test_streaming_chunk_with_reasoning_roundtrips() {
+        let json = r#"{
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning": "thinking...",
+                    "reasoning_details": [{"type": "text", "text": "step"}]
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.reasoning.as_deref(), Some("thinking..."));
+        assert!(delta.reasoning_details.is_some());
+
+        let serialized = serde_json::to_string(&chunk).unwrap();
+        let round_tripped: ChatCompletionChunk = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.choices[0].delta.reasoning, delta.reasoning);
+    }
+
+    #[test]
+    fn test_streaming_chunk_with_reasoning_content_vllm_roundtrips() {
+        let json = r#"{
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "deepseek-r1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "reasoning_content": "let me reason about this..."
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("let me reason about this...")
+        );
+        assert!(delta.reasoning.is_none());
+
+        let serialized = serde_json::to_string(&chunk).unwrap();
+        assert!(serialized.contains("reasoning_content"));
+        assert!(!serialized.contains("\"reasoning\""));
+    }
+
+    #[test]
+    fn test_chunk_without_reasoning_no_regression() {
+        let json = r#"{
+            "id": "chatcmpl-abc",
+            "object": "chat.completion.chunk",
+            "created": 1700000000,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "Hello!"
+                },
+                "finish_reason": null
+            }]
+        }"#;
+
+        let chunk: ChatCompletionChunk = serde_json::from_str(json).unwrap();
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.content.as_deref(), Some("Hello!"));
+        assert!(delta.reasoning.is_none());
+        assert!(delta.reasoning_content.is_none());
+        assert!(delta.reasoning_details.is_none());
+
+        // Reasoning fields should not appear in serialized output
+        let serialized = serde_json::to_string(&chunk).unwrap();
+        assert!(!serialized.contains("reasoning"));
     }
 }

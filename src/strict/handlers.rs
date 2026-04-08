@@ -991,6 +991,9 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                             .collect(),
                     ),
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 };
 
