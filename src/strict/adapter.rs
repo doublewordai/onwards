@@ -82,6 +82,9 @@ impl OpenResponsesAdapter {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 },
             );
@@ -357,6 +360,9 @@ impl OpenResponsesAdapter {
                         name: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
                         extra: None,
                     });
                 }
@@ -367,6 +373,9 @@ impl OpenResponsesAdapter {
                         name: None,
                         tool_calls: None,
                         tool_call_id: Some(call_id.clone()),
+                        reasoning: None,
+                        reasoning_content: None,
+                        reasoning_details: None,
                         extra: None,
                     });
                 }
@@ -449,6 +458,9 @@ fn input_to_messages(input: &Input) -> Result<Vec<ChatMessage>, AdapterError> {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
             extra: None,
         }]),
         Input::Items(items) => items_to_messages(items),
@@ -468,6 +480,9 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 });
             }
@@ -502,6 +517,9 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
                     name: None,
                     tool_calls: Some(vec![tool_call]),
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 });
             }
@@ -512,6 +530,9 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
                     name: None,
                     tool_calls: None,
                     tool_call_id: Some(output.call_id.clone()),
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 });
             }
@@ -789,6 +810,9 @@ mod tests {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
             extra: None,
         };
 
@@ -816,6 +840,9 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
             extra: None,
         };
 
@@ -871,6 +898,9 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
                 extra: None,
             },
             finish_reason: Some("stop".to_string()),
@@ -890,6 +920,9 @@ mod tests {
                 name: None,
                 tool_calls: Some(vec![]),
                 tool_call_id: None,
+                reasoning: None,
+                reasoning_content: None,
+                reasoning_details: None,
                 extra: None,
             },
             finish_reason: Some("tool_calls".to_string()),
@@ -1000,6 +1033,9 @@ mod tests {
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning: None,
+                    reasoning_content: None,
+                    reasoning_details: None,
                     extra: None,
                 },
                 finish_reason: Some(finish_reason.to_string()),
