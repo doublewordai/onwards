@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0](https://github.com/doublewordai/onwards/compare/v0.22.1...v0.23.0) - 2026-04-08
+
+### Fixed
+
+- preserve reasoning fields in strict mode chat completions ([#170](https://github.com/doublewordai/onwards/pull/170))
+
 ## [0.22.1](https://github.com/doublewordai/onwards/compare/v0.22.0...v0.22.1) - 2026-03-31
 
 ### Fixed
