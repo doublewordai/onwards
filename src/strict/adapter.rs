@@ -13,9 +13,10 @@ use super::schemas::chat_completions::{
 };
 use super::schemas::responses::{
     ContentPart, FunctionCallItem, Input, InputTokensDetails, Item, ItemStatus,
-    MessageContent as ResponseMessageContent, MessageItem, OutputTokensDetails, ResponseStatus,
-    ResponseUsage, ResponsesRequest, ResponsesResponse, TextConfig, TextFormat,
-    Tool as ResponseTool, ToolChoice as ResponseToolChoice, TruncationStrategy,
+    MessageContent as ResponseMessageContent, MessageItem, OutputTokensDetails, ReasoningContent,
+    ReasoningItem, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
+    SummaryContent, TextConfig, TextFormat, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
+    TruncationStrategy,
 };
 use crate::traits::{RequestContext, ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::collections::HashSet;
@@ -610,6 +611,52 @@ fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<I
         Some("length") => Some(ItemStatus::Incomplete),
         _ => Some(ItemStatus::Completed),
     };
+
+    // Extract reasoning text and create a Reasoning item if present
+    let mut reasoning_text = String::new();
+
+    // Prefer reasoning_content (vLLM/DeepSeek), then reasoning (OpenRouter)
+    if let Some(ref rc) = message.reasoning_content
+        && !rc.is_empty()
+    {
+        reasoning_text.push_str(rc);
+    }
+    if reasoning_text.is_empty()
+        && let Some(ref r) = message.reasoning
+        && !r.is_empty()
+    {
+        reasoning_text.push_str(r);
+    }
+
+    // Extract text from reasoning_details array (OpenRouter format: [{"type":"text","text":"..."}])
+    if reasoning_text.is_empty()
+        && let Some(ref details) = message.reasoning_details
+    {
+        for detail in details {
+            if let Some(text) = detail.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                if !reasoning_text.is_empty() {
+                    reasoning_text.push('\n');
+                }
+                reasoning_text.push_str(text);
+            }
+        }
+    }
+
+    if !reasoning_text.is_empty() {
+        items.push(Item::Reasoning(ReasoningItem {
+            id: Some(generate_item_id()),
+            content: Some(vec![ReasoningContent::Text {
+                text: reasoning_text.clone(),
+            }]),
+            encrypted_content: None,
+            summary: Some(vec![SummaryContent::Text {
+                text: reasoning_text,
+            }]),
+            status,
+        }));
+    }
 
     // Add the message item
     if let Some(ref content) = message.content {
@@ -1241,5 +1288,106 @@ mod tests {
             matches!(result, ToolCallResult::Unhandled(_)),
             "non-server tool call should be Unhandled"
         );
+    }
+
+    #[test]
+    fn test_message_to_items_with_reasoning_field() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("The answer is 42.".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: Some("Let me think step by step...".to_string()),
+            reasoning_content: None,
+            reasoning_details: None,
+            extra: None,
+        };
+
+        let items = message_to_items(&message, Some("stop"));
+        assert_eq!(items.len(), 2);
+        assert!(
+            matches!(items[0], Item::Reasoning(_)),
+            "First item should be Reasoning"
+        );
+        assert!(
+            matches!(items[1], Item::Message(_)),
+            "Second item should be Message"
+        );
+        if let Item::Reasoning(ref r) = items[0] {
+            let summary = r.summary.as_ref().unwrap();
+            let SummaryContent::Text { text } = &summary[0];
+            assert_eq!(text, "Let me think step by step...");
+        }
+    }
+
+    #[test]
+    fn test_message_to_items_with_reasoning_content_field() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("Result".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_content: Some("vLLM reasoning here".to_string()),
+            reasoning_details: None,
+            extra: None,
+        };
+
+        let items = message_to_items(&message, Some("stop"));
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], Item::Reasoning(_)));
+        if let Item::Reasoning(ref r) = items[0] {
+            let summary = r.summary.as_ref().unwrap();
+            let SummaryContent::Text { text } = &summary[0];
+            assert_eq!(text, "vLLM reasoning here");
+        }
+    }
+
+    #[test]
+    fn test_message_to_items_with_reasoning_details() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("Done".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: Some(vec![
+                serde_json::json!({"type": "text", "text": "step 1"}),
+                serde_json::json!({"type": "text", "text": "step 2"}),
+            ]),
+            extra: None,
+        };
+
+        let items = message_to_items(&message, Some("stop"));
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], Item::Reasoning(_)));
+        if let Item::Reasoning(ref r) = items[0] {
+            let summary = r.summary.as_ref().unwrap();
+            let SummaryContent::Text { text } = &summary[0];
+            assert_eq!(text, "step 1\nstep 2");
+        }
+    }
+
+    #[test]
+    fn test_message_to_items_no_reasoning_unchanged() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("Hello!".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            extra: None,
+        };
+
+        let items = message_to_items(&message, Some("stop"));
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], Item::Message(_)));
     }
 }
