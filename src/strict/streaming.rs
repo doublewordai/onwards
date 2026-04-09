@@ -18,8 +18,9 @@
 
 use super::schemas::chat_completions::{ChatCompletionChunk, ChunkChoice};
 use super::schemas::responses::{
-    ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent, MessageItem, ResponseStatus,
-    ResponseUsage, ResponsesRequest, ResponsesResponse, TextConfig, TextFormat, TruncationStrategy,
+    ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent,
+    ReasoningItem, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
+    SummaryContent, TextConfig, TextFormat, TruncationStrategy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +53,8 @@ pub struct StreamingState {
     msg_item_for_choice: HashMap<usize, usize>,
     /// Maps (choice_index, tc_index) → items-vec index for function call items
     fn_call_item_for: HashMap<(usize, usize), usize>,
+    /// Maps choice_index → items-vec index for reasoning items
+    reasoning_item_for_choice: HashMap<usize, usize>,
 }
 
 /// The inner content of a streaming output item
@@ -68,6 +71,10 @@ enum StreamingItemKind {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    Reasoning {
+        summary_text: String,
+        summary_part_started: bool,
     },
 }
 
@@ -117,6 +124,7 @@ impl StreamingState {
             request: request.clone(),
             msg_item_for_choice: HashMap::new(),
             fn_call_item_for: HashMap::new(),
+            reasoning_item_for_choice: HashMap::new(),
         }
     }
 
@@ -215,6 +223,7 @@ impl StreamingState {
         self.completed_items.append(&mut self.items);
         self.msg_item_for_choice.clear();
         self.fn_call_item_for.clear();
+        self.reasoning_item_for_choice.clear();
     }
 
     /// Process a single choice from a chunk
@@ -223,18 +232,67 @@ impl StreamingState {
         let choice_index = choice.index as usize;
         let delta = &choice.delta;
 
+        // --- Reasoning item ---
+        let reasoning_merged = super::merge_reasoning_text(
+            delta.reasoning.as_ref(),
+            delta.reasoning_content.as_ref(),
+            delta.reasoning_details.as_ref(),
+        );
+        let reasoning_delta: Option<&str> = if reasoning_merged.is_empty() {
+            None
+        } else {
+            Some(reasoning_merged.as_str())
+        };
+
+        if let Some(reasoning_text) = reasoning_delta {
+            let r_idx = if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
+                idx
+            } else {
+                let idx = self.items.len();
+                let item = StreamingItem {
+                    id: format!("item_{}", self.item_index_offset + idx),
+                    status: ItemStatus::InProgress,
+                    kind: StreamingItemKind::Reasoning {
+                        summary_text: String::new(),
+                        summary_part_started: false,
+                    },
+                };
+                self.items.push(item);
+                self.reasoning_item_for_choice.insert(choice_index, idx);
+                events.push(self.create_item_added_event(idx));
+                idx
+            };
+
+            let mut emit_summary_part_added = false;
+            if let StreamingItemKind::Reasoning {
+                summary_text,
+                summary_part_started,
+            } = &mut self.items[r_idx].kind
+            {
+                if !*summary_part_started {
+                    *summary_part_started = true;
+                    emit_summary_part_added = true;
+                }
+                summary_text.push_str(reasoning_text);
+            }
+
+            if emit_summary_part_added {
+                events.push(self.create_reasoning_summary_part_added_event(r_idx));
+            }
+            events.push(self.create_reasoning_summary_text_delta_event(r_idx, reasoning_text));
+        }
+
         // --- Message item (text content / role) ---
         let mut emit_content_part_added = false;
         let mut emit_text_delta: Option<String> = None;
 
-        let has_role = delta.role.is_some();
         let has_content = delta
             .content
             .as_ref()
             .map(|s| !s.is_empty())
             .unwrap_or(false);
 
-        if has_role || has_content {
+        if has_content {
             // Find or create the message item for this choice
             let msg_idx = if let Some(&idx) = self.msg_item_for_choice.get(&choice_index) {
                 idx
@@ -349,6 +407,9 @@ impl StreamingState {
     /// Finalize all items associated with a choice and emit done events
     fn finalize_for_choice(&mut self, choice_index: usize) -> Vec<StreamingEvent> {
         let mut indices: Vec<usize> = Vec::new();
+        if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
+            indices.push(idx);
+        }
         if let Some(&idx) = self.msg_item_for_choice.get(&choice_index) {
             indices.push(idx);
         }
@@ -395,6 +456,19 @@ impl StreamingState {
                     self.create_item_done_event(index),
                 ]
             }
+            StreamingItemKind::Reasoning {
+                summary_part_started,
+                ..
+            } => {
+                let had_part = *summary_part_started;
+                let mut events = Vec::new();
+                if had_part {
+                    events.push(self.create_reasoning_summary_text_done_event(index));
+                    events.push(self.create_reasoning_summary_part_done_event(index));
+                }
+                events.push(self.create_item_done_event(index));
+                events
+            }
         }
     }
 
@@ -437,6 +511,13 @@ impl StreamingState {
                     status: Some(ItemStatus::InProgress),
                 })
             }
+            StreamingItemKind::Reasoning { .. } => Item::Reasoning(ReasoningItem {
+                id: Some(item.id.clone()),
+                content: None,
+                encrypted_content: None,
+                summary: Some(vec![]),
+                status: Some(ItemStatus::InProgress),
+            }),
         };
         StreamingEvent {
             event_type: "response.output_item.added".to_string(),
@@ -451,7 +532,7 @@ impl StreamingState {
     fn create_content_part_added_event(&mut self, index: usize) -> StreamingEvent {
         let content_index = match &self.items[index].kind {
             StreamingItemKind::Message { content_index, .. } => *content_index,
-            StreamingItemKind::FunctionCall { .. } => 0,
+            StreamingItemKind::FunctionCall { .. } | StreamingItemKind::Reasoning { .. } => 0,
         };
         StreamingEvent {
             event_type: "response.content_part.added".to_string(),
@@ -472,7 +553,7 @@ impl StreamingState {
     fn create_text_delta_event(&mut self, index: usize, delta: &str) -> StreamingEvent {
         let content_index = match &self.items[index].kind {
             StreamingItemKind::Message { content_index, .. } => *content_index,
-            StreamingItemKind::FunctionCall { .. } => 0,
+            StreamingItemKind::FunctionCall { .. } | StreamingItemKind::Reasoning { .. } => 0,
         };
         StreamingEvent {
             event_type: "response.output_text.delta".to_string(),
@@ -494,7 +575,9 @@ impl StreamingState {
                 content_index,
                 ..
             } => (content_text.clone(), *content_index),
-            StreamingItemKind::FunctionCall { .. } => (String::new(), 0),
+            StreamingItemKind::FunctionCall { .. } | StreamingItemKind::Reasoning { .. } => {
+                (String::new(), 0)
+            }
         };
         StreamingEvent {
             event_type: "response.content_part.done".to_string(),
@@ -543,12 +626,89 @@ impl StreamingState {
                 arguments: arguments.clone(),
                 status: Some(ItemStatus::Completed),
             }),
+            StreamingItemKind::Reasoning { summary_text, .. } => Item::Reasoning(ReasoningItem {
+                id: Some(item.id.clone()),
+                content: Some(vec![ReasoningContent::Text {
+                    text: summary_text.clone(),
+                }]),
+                encrypted_content: None,
+                summary: Some(vec![SummaryContent::Text {
+                    text: summary_text.clone(),
+                }]),
+                status: Some(ItemStatus::Completed),
+            }),
         };
         StreamingEvent {
             event_type: "response.output_item.done".to_string(),
             data: StreamingEventData::OutputItemDone {
                 output_index,
                 item: output_item,
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_reasoning_summary_part_added_event(&mut self, index: usize) -> StreamingEvent {
+        StreamingEvent {
+            event_type: "response.reasoning_summary_part.added".to_string(),
+            data: StreamingEventData::ReasoningSummaryPartAdded {
+                item_id: self.items[index].id.clone(),
+                output_index: (self.item_index_offset + index) as u32,
+                summary_index: 0,
+                part: SummaryContent::Text {
+                    text: String::new(),
+                },
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_reasoning_summary_text_delta_event(
+        &mut self,
+        index: usize,
+        delta: &str,
+    ) -> StreamingEvent {
+        StreamingEvent {
+            event_type: "response.reasoning_summary_text.delta".to_string(),
+            data: StreamingEventData::ReasoningSummaryTextDelta {
+                item_id: self.items[index].id.clone(),
+                output_index: (self.item_index_offset + index) as u32,
+                summary_index: 0,
+                delta: delta.to_string(),
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_reasoning_summary_text_done_event(&mut self, index: usize) -> StreamingEvent {
+        let text = match &self.items[index].kind {
+            StreamingItemKind::Reasoning { summary_text, .. } => summary_text.clone(),
+            _ => String::new(),
+        };
+        StreamingEvent {
+            event_type: "response.reasoning_summary_text.done".to_string(),
+            data: StreamingEventData::ReasoningSummaryTextDone {
+                item_id: self.items[index].id.clone(),
+                output_index: (self.item_index_offset + index) as u32,
+                summary_index: 0,
+                text,
+            },
+            sequence_number: self.next_sequence(),
+        }
+    }
+
+    fn create_reasoning_summary_part_done_event(&mut self, index: usize) -> StreamingEvent {
+        let text = match &self.items[index].kind {
+            StreamingItemKind::Reasoning { summary_text, .. } => summary_text.clone(),
+            _ => String::new(),
+        };
+        StreamingEvent {
+            event_type: "response.reasoning_summary_part.done".to_string(),
+            data: StreamingEventData::ReasoningSummaryPartDone {
+                item_id: self.items[index].id.clone(),
+                output_index: (self.item_index_offset + index) as u32,
+                summary_index: 0,
+                part: SummaryContent::Text { text },
             },
             sequence_number: self.next_sequence(),
         }
@@ -573,7 +733,9 @@ impl StreamingState {
     fn create_fn_call_arguments_done_event(&mut self, index: usize) -> StreamingEvent {
         let arguments = match &self.items[index].kind {
             StreamingItemKind::FunctionCall { arguments, .. } => arguments.clone(),
-            StreamingItemKind::Message { .. } => String::new(),
+            StreamingItemKind::Message { .. } | StreamingItemKind::Reasoning { .. } => {
+                String::new()
+            }
         };
         StreamingEvent {
             event_type: "response.function_call_arguments.done".to_string(),
@@ -696,6 +858,19 @@ impl StreamingState {
                     arguments: arguments.clone(),
                     status: Some(item.status),
                 }),
+                StreamingItemKind::Reasoning { summary_text, .. } => {
+                    Item::Reasoning(ReasoningItem {
+                        id: Some(item.id.clone()),
+                        content: Some(vec![ReasoningContent::Text {
+                            text: summary_text.clone(),
+                        }]),
+                        encrypted_content: None,
+                        summary: Some(vec![SummaryContent::Text {
+                            text: summary_text.clone(),
+                        }]),
+                        status: Some(item.status),
+                    })
+                }
             })
             .collect();
 
@@ -767,6 +942,30 @@ pub enum StreamingEventData {
         item_id: String,
         output_index: u32,
         arguments: String,
+    },
+    ReasoningSummaryPartAdded {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        part: SummaryContent,
+    },
+    ReasoningSummaryTextDelta {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        delta: String,
+    },
+    ReasoningSummaryTextDone {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        text: String,
+    },
+    ReasoningSummaryPartDone {
+        item_id: String,
+        output_index: u32,
+        summary_index: u32,
+        part: SummaryContent,
     },
     ResponseCompleted {
         response: ResponsesResponse,
@@ -847,31 +1046,35 @@ mod tests {
     fn test_streaming_state_initial_events() {
         let mut state = StreamingState::new(&test_request("gpt-4"));
 
+        // Role-only delta should only emit response.created (message item
+        // is deferred until content arrives to avoid empty items)
         let chunk = create_test_chunk("chunk_1", None, Some("assistant"), None);
         let events = state.process_chunk(&chunk);
-
-        // Should emit response.created and output_item.added
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "response.created");
-        assert_eq!(events[1].event_type, "response.output_item.added");
+
+        // Content delta creates the message item
+        let chunk2 = create_test_chunk("chunk_2", Some("Hi"), None, None);
+        let events2 = state.process_chunk(&chunk2);
+        assert_eq!(events2[0].event_type, "response.output_item.added");
     }
 
     #[test]
     fn test_streaming_state_content_events() {
         let mut state = StreamingState::new(&test_request("gpt-4"));
 
-        // First chunk with role
+        // First chunk with role only — deferred, no message item yet
         let chunk1 = create_test_chunk("chunk_1", None, Some("assistant"), None);
         state.process_chunk(&chunk1);
 
-        // Content chunk
+        // Content chunk creates message item + content
         let chunk2 = create_test_chunk("chunk_2", Some("Hello"), None, None);
         let events = state.process_chunk(&chunk2);
 
-        // Should emit content_part.added and output_text.delta
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "response.content_part.added");
-        assert_eq!(events[1].event_type, "response.output_text.delta");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "response.output_item.added");
+        assert_eq!(events[1].event_type, "response.content_part.added");
+        assert_eq!(events[2].event_type, "response.output_text.delta");
     }
 
     #[test]
@@ -1223,5 +1426,215 @@ mod tests {
         } else {
             panic!("Expected ResponseCompleted");
         }
+    }
+
+    /// Helper: create a chunk with reasoning deltas
+    fn create_reasoning_chunk(
+        id: &str,
+        reasoning: Option<&str>,
+        reasoning_content: Option<&str>,
+        content: Option<&str>,
+        role: Option<&str>,
+        finish_reason: Option<&str>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 1234567890,
+            model: "deepseek-r1".to_string(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: ChunkDelta {
+                    role: role.map(String::from),
+                    content: content.map(String::from),
+                    tool_calls: None,
+                    reasoning: reasoning.map(String::from),
+                    reasoning_content: reasoning_content.map(String::from),
+                    reasoning_details: None,
+                },
+                finish_reason: finish_reason.map(String::from),
+                logprobs: None,
+            }],
+            usage: None,
+            system_fingerprint: None,
+            service_tier: None,
+        }
+    }
+
+    #[test]
+    fn test_reasoning_only_stream_produces_reasoning_item() {
+        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+
+        // Stream reasoning deltas
+        let events1 = state.process_chunk(&create_reasoning_chunk(
+            "c1",
+            Some("Let me think"),
+            None,
+            None,
+            Some("assistant"),
+            None,
+        ));
+
+        // Should get: response.created, output_item.added, reasoning_summary_part.added, reasoning_summary_text.delta
+        assert!(events1.iter().any(|e| e.event_type == "response.created"));
+        assert!(
+            events1
+                .iter()
+                .any(|e| e.event_type == "response.output_item.added")
+        );
+        assert!(
+            events1
+                .iter()
+                .any(|e| e.event_type == "response.reasoning_summary_part.added")
+        );
+        assert!(
+            events1
+                .iter()
+                .any(|e| e.event_type == "response.reasoning_summary_text.delta")
+        );
+
+        // More reasoning
+        let events2 = state.process_chunk(&create_reasoning_chunk(
+            "c2",
+            Some(" step by step"),
+            None,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(events2.len(), 1);
+        assert_eq!(
+            events2[0].event_type,
+            "response.reasoning_summary_text.delta"
+        );
+
+        // Finish
+        state.process_chunk(&create_reasoning_chunk(
+            "c3",
+            None,
+            None,
+            None,
+            None,
+            Some("stop"),
+        ));
+
+        let final_events = state.finalize();
+        let completed = final_events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        if let StreamingEventData::ResponseCompleted { response } = &completed.data {
+            assert_eq!(response.output.len(), 1);
+            assert!(matches!(response.output[0], Item::Reasoning(_)));
+            if let Item::Reasoning(ref r) = response.output[0] {
+                let summary = r.summary.as_ref().unwrap();
+                assert_eq!(summary.len(), 1);
+                let SummaryContent::Text { text } = &summary[0];
+                assert_eq!(text, "Let me think step by step");
+            }
+        } else {
+            panic!("Expected ResponseCompleted");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_plus_content_stream() {
+        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+
+        // Reasoning phase (using reasoning_content field for vLLM)
+        state.process_chunk(&create_reasoning_chunk(
+            "c1",
+            None,
+            Some("thinking..."),
+            None,
+            Some("assistant"),
+            None,
+        ));
+
+        // Content phase
+        state.process_chunk(&create_reasoning_chunk(
+            "c2",
+            None,
+            None,
+            Some("The answer is 42."),
+            None,
+            None,
+        ));
+
+        // Finish
+        state.process_chunk(&create_reasoning_chunk(
+            "c3",
+            None,
+            None,
+            None,
+            None,
+            Some("stop"),
+        ));
+
+        let final_events = state.finalize();
+        let completed = final_events
+            .iter()
+            .find(|e| e.event_type == "response.completed")
+            .unwrap();
+        if let StreamingEventData::ResponseCompleted { response } = &completed.data {
+            // Reasoning item should come before message item
+            assert_eq!(response.output.len(), 2);
+            assert!(
+                matches!(response.output[0], Item::Reasoning(_)),
+                "First item should be Reasoning"
+            );
+            assert!(
+                matches!(response.output[1], Item::Message(_)),
+                "Second item should be Message"
+            );
+        } else {
+            panic!("Expected ResponseCompleted");
+        }
+    }
+
+    #[test]
+    fn test_reasoning_stream_event_sequence() {
+        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+
+        // First reasoning chunk
+        let events = state.process_chunk(&create_reasoning_chunk(
+            "c1",
+            Some("step 1"),
+            None,
+            None,
+            Some("assistant"),
+            None,
+        ));
+
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            event_types,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_text.delta",
+            ]
+        );
+
+        // Finish
+        let done_events = state.process_chunk(&create_reasoning_chunk(
+            "c2",
+            None,
+            None,
+            None,
+            None,
+            Some("stop"),
+        ));
+
+        let done_types: Vec<&str> = done_events.iter().map(|e| e.event_type.as_str()).collect();
+        assert_eq!(
+            done_types,
+            vec![
+                "response.reasoning_summary_text.done",
+                "response.reasoning_summary_part.done",
+                "response.output_item.done",
+            ]
+        );
     }
 }

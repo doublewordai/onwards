@@ -24,6 +24,40 @@ pub mod handlers;
 pub mod schemas;
 pub mod streaming;
 
+/// Merge reasoning text from the various provider-specific fields, deduplicating
+/// identical content. Order: `reasoning_content` → `reasoning` → `reasoning_details`.
+pub(crate) fn merge_reasoning_text(
+    reasoning: Option<&String>,
+    reasoning_content: Option<&String>,
+    reasoning_details: Option<&Vec<serde_json::Value>>,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+
+    if let Some(rc) = reasoning_content
+        && !rc.is_empty()
+    {
+        parts.push(rc);
+    }
+    if let Some(r) = reasoning
+        && !r.is_empty()
+        && !parts.contains(&r.as_str())
+    {
+        parts.push(r);
+    }
+    if let Some(details) = reasoning_details {
+        for detail in details {
+            if let Some(text) = detail.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+                && !parts.contains(&text)
+            {
+                parts.push(text);
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
 use crate::AppState;
 use crate::client::HttpClient;
 use axum::Router;
