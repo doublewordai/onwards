@@ -612,33 +612,12 @@ fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<I
         _ => Some(ItemStatus::Completed),
     };
 
-    // Extract reasoning text and create a Reasoning item if present.
-    // Merge all available sources, deduplicating identical text since providers
-    // often send the same content under multiple field names.
-    let mut reasoning_parts: Vec<&str> = Vec::new();
-
-    if let Some(ref rc) = message.reasoning_content
-        && !rc.is_empty()
-    {
-        reasoning_parts.push(rc);
-    }
-    if let Some(ref r) = message.reasoning
-        && !r.is_empty()
-        && !reasoning_parts.contains(&r.as_str())
-    {
-        reasoning_parts.push(r);
-    }
-    if let Some(ref details) = message.reasoning_details {
-        for detail in details {
-            if let Some(text) = detail.get("text").and_then(|v| v.as_str())
-                && !text.is_empty()
-                && !reasoning_parts.contains(&text)
-            {
-                reasoning_parts.push(text);
-            }
-        }
-    }
-    let reasoning_text = reasoning_parts.join("\n");
+    // Extract reasoning text from all provider-specific fields, deduplicating identical content.
+    let reasoning_text = super::merge_reasoning_text(
+        message.reasoning.as_ref(),
+        message.reasoning_content.as_ref(),
+        message.reasoning_details.as_ref(),
+    );
 
     if !reasoning_text.is_empty() {
         items.push(Item::Reasoning(ReasoningItem {

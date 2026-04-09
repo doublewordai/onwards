@@ -233,38 +233,18 @@ impl StreamingState {
         let delta = &choice.delta;
 
         // --- Reasoning item ---
-        // Merge all available reasoning sources, deduplicating identical text.
-        let reasoning_delta: Option<String> = {
-            let mut parts: Vec<&str> = Vec::new();
-            if let Some(ref r) = delta.reasoning
-                && !r.is_empty()
-            {
-                parts.push(r.as_str());
-            }
-            if let Some(ref rc) = delta.reasoning_content
-                && !rc.is_empty()
-                && !parts.contains(&rc.as_str())
-            {
-                parts.push(rc.as_str());
-            }
-            if let Some(ref details) = delta.reasoning_details {
-                for d in details {
-                    if let Some(t) = d.get("text").and_then(|v| v.as_str())
-                        && !t.is_empty()
-                        && !parts.contains(&t)
-                    {
-                        parts.push(t);
-                    }
-                }
-            }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(parts.join("\n"))
-            }
+        let reasoning_merged = super::merge_reasoning_text(
+            delta.reasoning.as_ref(),
+            delta.reasoning_content.as_ref(),
+            delta.reasoning_details.as_ref(),
+        );
+        let reasoning_delta: Option<&str> = if reasoning_merged.is_empty() {
+            None
+        } else {
+            Some(reasoning_merged.as_str())
         };
 
-        if let Some(ref reasoning_text) = reasoning_delta {
+        if let Some(reasoning_text) = reasoning_delta {
             let r_idx = if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
                 idx
             } else {
@@ -306,14 +286,13 @@ impl StreamingState {
         let mut emit_content_part_added = false;
         let mut emit_text_delta: Option<String> = None;
 
-        let has_role = delta.role.is_some();
         let has_content = delta
             .content
             .as_ref()
             .map(|s| !s.is_empty())
             .unwrap_or(false);
 
-        if has_content || (has_role && reasoning_delta.is_none()) {
+        if has_content {
             // Find or create the message item for this choice
             let msg_idx = if let Some(&idx) = self.msg_item_for_choice.get(&choice_index) {
                 idx
@@ -1067,31 +1046,35 @@ mod tests {
     fn test_streaming_state_initial_events() {
         let mut state = StreamingState::new(&test_request("gpt-4"));
 
+        // Role-only delta should only emit response.created (message item
+        // is deferred until content arrives to avoid empty items)
         let chunk = create_test_chunk("chunk_1", None, Some("assistant"), None);
         let events = state.process_chunk(&chunk);
-
-        // Should emit response.created and output_item.added
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "response.created");
-        assert_eq!(events[1].event_type, "response.output_item.added");
+
+        // Content delta creates the message item
+        let chunk2 = create_test_chunk("chunk_2", Some("Hi"), None, None);
+        let events2 = state.process_chunk(&chunk2);
+        assert_eq!(events2[0].event_type, "response.output_item.added");
     }
 
     #[test]
     fn test_streaming_state_content_events() {
         let mut state = StreamingState::new(&test_request("gpt-4"));
 
-        // First chunk with role
+        // First chunk with role only — deferred, no message item yet
         let chunk1 = create_test_chunk("chunk_1", None, Some("assistant"), None);
         state.process_chunk(&chunk1);
 
-        // Content chunk
+        // Content chunk creates message item + content
         let chunk2 = create_test_chunk("chunk_2", Some("Hello"), None, None);
         let events = state.process_chunk(&chunk2);
 
-        // Should emit content_part.added and output_text.delta
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].event_type, "response.content_part.added");
-        assert_eq!(events[1].event_type, "response.output_text.delta");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].event_type, "response.output_item.added");
+        assert_eq!(events[1].event_type, "response.content_part.added");
+        assert_eq!(events[2].event_type, "response.output_text.delta");
     }
 
     #[test]
