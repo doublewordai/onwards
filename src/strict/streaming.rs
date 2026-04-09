@@ -233,25 +233,34 @@ impl StreamingState {
         let delta = &choice.delta;
 
         // --- Reasoning item ---
-        // Prefer the flat string fields (used by all known streaming providers),
-        // then fall back to extracting text from reasoning_details for completeness.
-        let reasoning_delta: Option<String> = delta
-            .reasoning
-            .as_deref()
-            .or(delta.reasoning_content.as_deref())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| {
-                delta.reasoning_details.as_ref().and_then(|details| {
-                    let text: String = details
-                        .iter()
-                        .filter_map(|d| d.get("text").and_then(|v| v.as_str()))
-                        .filter(|t| !t.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if text.is_empty() { None } else { Some(text) }
-                })
-            });
+        // Merge all available reasoning sources from the delta.
+        let reasoning_delta: Option<String> = {
+            let mut parts = Vec::new();
+            if let Some(ref r) = delta.reasoning {
+                if !r.is_empty() {
+                    parts.push(r.as_str());
+                }
+            }
+            if let Some(ref rc) = delta.reasoning_content {
+                if !rc.is_empty() {
+                    parts.push(rc.as_str());
+                }
+            }
+            if let Some(ref details) = delta.reasoning_details {
+                for d in details {
+                    if let Some(t) = d.get("text").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            parts.push(t);
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        };
 
         if let Some(ref reasoning_text) = reasoning_delta {
             let r_idx = if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
