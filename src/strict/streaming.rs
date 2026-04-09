@@ -233,13 +233,27 @@ impl StreamingState {
         let delta = &choice.delta;
 
         // --- Reasoning item ---
-        let reasoning_delta = delta
+        // Prefer the flat string fields (used by all known streaming providers),
+        // then fall back to extracting text from reasoning_details for completeness.
+        let reasoning_delta: Option<String> = delta
             .reasoning
             .as_deref()
             .or(delta.reasoning_content.as_deref())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                delta.reasoning_details.as_ref().and_then(|details| {
+                    let text: String = details
+                        .iter()
+                        .filter_map(|d| d.get("text").and_then(|v| v.as_str()))
+                        .filter(|t| !t.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() { None } else { Some(text) }
+                })
+            });
 
-        if let Some(reasoning_text) = reasoning_delta {
+        if let Some(ref reasoning_text) = reasoning_delta {
             let r_idx = if let Some(&idx) = self.reasoning_item_for_choice.get(&choice_index) {
                 idx
             } else {
