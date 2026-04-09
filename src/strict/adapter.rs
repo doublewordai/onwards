@@ -613,37 +613,32 @@ fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<I
     };
 
     // Extract reasoning text and create a Reasoning item if present.
-    // Merge all available sources — these are usually provider-specific aliases
-    // for the same content, but if a provider sends multiple we keep them all.
-    let mut reasoning_text = String::new();
+    // Merge all available sources, deduplicating identical text since providers
+    // often send the same content under multiple field names.
+    let mut reasoning_parts: Vec<&str> = Vec::new();
 
     if let Some(ref rc) = message.reasoning_content
         && !rc.is_empty()
     {
-        reasoning_text.push_str(rc);
+        reasoning_parts.push(rc);
     }
     if let Some(ref r) = message.reasoning
         && !r.is_empty()
+        && !reasoning_parts.contains(&r.as_str())
     {
-        if !reasoning_text.is_empty() {
-            reasoning_text.push('\n');
-        }
-        reasoning_text.push_str(r);
+        reasoning_parts.push(r);
     }
-
-    // Extract text from reasoning_details array (OpenRouter format: [{"type":"text","text":"..."}])
     if let Some(ref details) = message.reasoning_details {
         for detail in details {
             if let Some(text) = detail.get("text").and_then(|v| v.as_str())
                 && !text.is_empty()
+                && !reasoning_parts.contains(&text)
             {
-                if !reasoning_text.is_empty() {
-                    reasoning_text.push('\n');
-                }
-                reasoning_text.push_str(text);
+                reasoning_parts.push(text);
             }
         }
     }
+    let reasoning_text = reasoning_parts.join("\n");
 
     if !reasoning_text.is_empty() {
         items.push(Item::Reasoning(ReasoningItem {

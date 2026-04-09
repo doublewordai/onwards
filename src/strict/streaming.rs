@@ -233,25 +233,27 @@ impl StreamingState {
         let delta = &choice.delta;
 
         // --- Reasoning item ---
-        // Merge all available reasoning sources from the delta.
+        // Merge all available reasoning sources, deduplicating identical text.
         let reasoning_delta: Option<String> = {
-            let mut parts = Vec::new();
-            if let Some(ref r) = delta.reasoning {
-                if !r.is_empty() {
-                    parts.push(r.as_str());
-                }
+            let mut parts: Vec<&str> = Vec::new();
+            if let Some(ref r) = delta.reasoning
+                && !r.is_empty()
+            {
+                parts.push(r.as_str());
             }
-            if let Some(ref rc) = delta.reasoning_content {
-                if !rc.is_empty() {
-                    parts.push(rc.as_str());
-                }
+            if let Some(ref rc) = delta.reasoning_content
+                && !rc.is_empty()
+                && !parts.contains(&rc.as_str())
+            {
+                parts.push(rc.as_str());
             }
             if let Some(ref details) = delta.reasoning_details {
                 for d in details {
-                    if let Some(t) = d.get("text").and_then(|v| v.as_str()) {
-                        if !t.is_empty() {
-                            parts.push(t);
-                        }
+                    if let Some(t) = d.get("text").and_then(|v| v.as_str())
+                        && !t.is_empty()
+                        && !parts.contains(&t)
+                    {
+                        parts.push(t);
                     }
                 }
             }
