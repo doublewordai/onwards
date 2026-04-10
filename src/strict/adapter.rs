@@ -12,11 +12,10 @@ use super::schemas::chat_completions::{
     MessageContent, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
 };
 use super::schemas::responses::{
-    ContentPart, FunctionCallItem, Input, InputTokensDetails, Item, ItemStatus,
-    MessageContent as ResponseMessageContent, MessageItem, OutputTokensDetails, ReasoningContent,
-    ReasoningItem, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
-    SummaryContent, TextConfig, TextFormat, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
-    TruncationStrategy,
+    ContentPart, FunctionCallItem, Input, Item, ItemStatus,
+    MessageContent as ResponseMessageContent, MessageItem, ReasoningContent, ReasoningItem,
+    ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig,
+    TextFormat, Tool as ResponseTool, ToolChoice as ResponseToolChoice, TruncationStrategy,
 };
 use crate::traits::{RequestContext, ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::collections::HashSet;
@@ -197,15 +196,10 @@ impl OpenResponsesAdapter {
             top_logprobs: 0,
             temperature: request.temperature.unwrap_or(1.0),
             reasoning: serde_json::to_value(&request.reasoning).unwrap_or(serde_json::Value::Null),
-            usage: chat_response.usage.as_ref().map(|u| ResponseUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            }),
+            usage: chat_response
+                .usage
+                .as_ref()
+                .map(super::chat_usage_to_response_usage),
             max_output_tokens: request.max_output_tokens,
             max_tool_calls: None,
             store: request.store.unwrap_or(false),
@@ -770,7 +764,9 @@ fn generate_item_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schemas::responses::FunctionCallOutputItem;
+    use super::super::schemas::responses::{
+        FunctionCallOutputItem, InputTokensDetails, OutputTokensDetails,
+    };
     use super::*;
     use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
 

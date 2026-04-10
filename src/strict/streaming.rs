@@ -146,17 +146,7 @@ impl StreamingState {
 
         // Store usage if present (typically in final chunk)
         if let Some(ref usage) = chunk.usage {
-            self.usage = Some(ResponseUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                input_tokens_details: super::schemas::responses::InputTokensDetails {
-                    cached_tokens: 0,
-                },
-                output_tokens_details: super::schemas::responses::OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            });
+            self.usage = Some(super::chat_usage_to_response_usage(usage));
         }
 
         // Check for finish_reason to emit done events
