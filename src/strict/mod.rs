@@ -58,6 +58,34 @@ pub(crate) fn merge_reasoning_text(
     parts.join("\n")
 }
 
+/// Convert chat completions `Usage` to Responses API `ResponseUsage`,
+/// extracting `reasoning_tokens` and `cached_tokens` from the raw JSON detail fields.
+pub(crate) fn chat_usage_to_response_usage(
+    u: &schemas::chat_completions::Usage,
+) -> schemas::responses::ResponseUsage {
+    let cached_tokens = u
+        .prompt_tokens_details
+        .as_ref()
+        .and_then(|v| v.get("cached_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    let reasoning_tokens = u
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|v| v.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    schemas::responses::ResponseUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+        input_tokens_details: schemas::responses::InputTokensDetails { cached_tokens },
+        output_tokens_details: schemas::responses::OutputTokensDetails { reasoning_tokens },
+    }
+}
+
 use crate::AppState;
 use crate::client::HttpClient;
 use axum::Router;
