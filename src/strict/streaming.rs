@@ -1093,6 +1093,42 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_state_preserves_usage_token_details() {
+        use super::super::schemas::chat_completions::Usage;
+
+        let mut state = StreamingState::new(&test_request("gpt-4"));
+
+        // Content delta (no usage yet).
+        let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
+        state.process_chunk(&chunk1);
+
+        // Final chunk with usage carrying the detail fields providers send for
+        // prompt caching and thinking models.
+        let mut chunk2 = create_test_chunk("chunk_2", None, None, Some("stop"));
+        chunk2.usage = Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(serde_json::json!({ "cached_tokens": 42 })),
+            completion_tokens_details: Some(serde_json::json!({ "reasoning_tokens": 30 })),
+        });
+        state.process_chunk(&chunk2);
+
+        let usage = state.usage.as_ref().expect("usage should be captured");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(
+            usage.input_tokens_details.cached_tokens, 42,
+            "cached_tokens should flow through to streaming state"
+        );
+        assert_eq!(
+            usage.output_tokens_details.reasoning_tokens, 30,
+            "reasoning_tokens should flow through to streaming state"
+        );
+    }
+
+    #[test]
     fn test_streaming_state_finalize() {
         let mut state = StreamingState::new(&test_request("gpt-4"));
 

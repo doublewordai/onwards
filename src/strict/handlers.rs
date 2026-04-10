@@ -675,8 +675,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                     prompt_tokens: prev.prompt_tokens + usage.prompt_tokens,
                     completion_tokens: prev.completion_tokens + usage.completion_tokens,
                     total_tokens: prev.total_tokens + usage.total_tokens,
-                    prompt_tokens_details: usage.prompt_tokens_details.clone().or(prev.prompt_tokens_details),
-                    completion_tokens_details: usage.completion_tokens_details.clone().or(prev.completion_tokens_details),
+                    prompt_tokens_details: super::merge_usage_details(
+                        prev.prompt_tokens_details,
+                        usage.prompt_tokens_details.clone(),
+                    ),
+                    completion_tokens_details: super::merge_usage_details(
+                        prev.completion_tokens_details,
+                        usage.completion_tokens_details.clone(),
+                    ),
                 },
             });
         }
