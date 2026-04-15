@@ -24,25 +24,14 @@ fn response_status_for_event_type(event_type: &str) -> &'static str {
     }
 }
 
-/// Fill in omitted non-critical fields so provider Responses payloads can still
-/// round-trip through the strict schema without discarding successful generations.
-///
-/// This is intentionally separate from serde defaults on `ResponsesResponse`.
-/// The struct is used as a strict schema in multiple contexts, and broad serde
-/// defaults would silently relax every deserialize path, including internal
-/// loads from the response store. We only want that leniency when sanitizing
-/// third-party provider payloads for client-facing strict mode.
-pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_model: &str) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-
-    // Only coerce payloads that already look like Responses API success bodies.
-    if !object.contains_key("output") {
-        return;
-    }
-
-    ensure_field(object, "id", || Value::String(generated_response_id()));
+fn backfill_responses_response_fields(
+    object: &mut serde_json::Map<String, Value>,
+    fallback_model: &str,
+    fallback_response_id: &str,
+) {
+    ensure_field(object, "id", || {
+        Value::String(fallback_response_id.to_string())
+    });
     ensure_field(object, "object", || Value::String("response".to_string()));
     ensure_field(object, "created_at", || Value::from(0));
     ensure_field(object, "completed_at", || Value::Null);
@@ -87,6 +76,28 @@ pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_mod
     ensure_field(object, "prompt_cache_key", || Value::Null);
 }
 
+/// Fill in omitted non-critical fields so provider Responses payloads can still
+/// round-trip through the strict schema without discarding successful generations.
+///
+/// This is intentionally separate from serde defaults on `ResponsesResponse`.
+/// The struct is used as a strict schema in multiple contexts, and broad serde
+/// defaults would silently relax every deserialize path, including internal
+/// loads from the response store. We only want that leniency when sanitizing
+/// third-party provider payloads for client-facing strict mode.
+pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_model: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    // Only coerce payloads that already look like Responses API success bodies.
+    if !object.contains_key("output") {
+        return;
+    }
+
+    let fallback_response_id = generated_response_id();
+    backfill_responses_response_fields(object, fallback_model, &fallback_response_id);
+}
+
 /// Normalize a Responses streaming event, backfilling a missing nested response
 /// snapshot with schema-valid defaults when the provider omits bookkeeping fields.
 ///
@@ -114,14 +125,6 @@ pub(crate) fn normalize_responses_streaming_event_value(
             .unwrap_or(false);
 
         if let Some(response_object) = response.as_object_mut() {
-            ensure_field(response_object, "id", || {
-                Value::String(fallback_response_id.to_string())
-            });
-        }
-
-        normalize_responses_response_value(response, fallback_model);
-
-        if let Some(response_object) = response.as_object_mut() {
             if missing_status {
                 response_object.insert(
                     "status".to_string(),
@@ -130,54 +133,11 @@ pub(crate) fn normalize_responses_streaming_event_value(
             }
 
             // Streaming snapshots like response.created may legitimately omit output.
-            ensure_field(response_object, "id", || {
-                Value::String(fallback_response_id.to_string())
-            });
-            ensure_field(response_object, "object", || {
-                Value::String("response".to_string())
-            });
-            ensure_field(response_object, "created_at", || Value::from(0));
-            ensure_field(response_object, "completed_at", || Value::Null);
-            ensure_field(response_object, "incomplete_details", || Value::Null);
-            ensure_field(response_object, "model", || {
-                Value::String(fallback_model.to_string())
-            });
-            ensure_field(response_object, "previous_response_id", || Value::Null);
-            ensure_field(response_object, "instructions", || Value::Null);
-            ensure_field(response_object, "output", || Value::Array(Vec::new()));
-            ensure_field(response_object, "error", || Value::Null);
-            ensure_field(response_object, "tools", || Value::Array(Vec::new()));
-            ensure_field(response_object, "tool_choice", || {
-                Value::String("auto".to_string())
-            });
-            ensure_field(response_object, "truncation", || {
-                Value::String("disabled".to_string())
-            });
-            ensure_field(response_object, "parallel_tool_calls", || Value::Bool(true));
-            ensure_field(response_object, "text", || {
-                serde_json::json!({
-                    "format": {
-                        "type": "text"
-                    }
-                })
-            });
-            ensure_field(response_object, "top_p", || Value::from(1.0));
-            ensure_field(response_object, "presence_penalty", || Value::from(0.0));
-            ensure_field(response_object, "frequency_penalty", || Value::from(0.0));
-            ensure_field(response_object, "top_logprobs", || Value::from(0));
-            ensure_field(response_object, "temperature", || Value::from(1.0));
-            ensure_field(response_object, "reasoning", || Value::Null);
-            ensure_field(response_object, "usage", || Value::Null);
-            ensure_field(response_object, "max_output_tokens", || Value::Null);
-            ensure_field(response_object, "max_tool_calls", || Value::Null);
-            ensure_field(response_object, "store", || Value::Bool(false));
-            ensure_field(response_object, "background", || Value::Bool(false));
-            ensure_field(response_object, "service_tier", || {
-                Value::String("default".to_string())
-            });
-            ensure_field(response_object, "metadata", || Value::Null);
-            ensure_field(response_object, "safety_identifier", || Value::Null);
-            ensure_field(response_object, "prompt_cache_key", || Value::Null);
+            backfill_responses_response_fields(
+                response_object,
+                fallback_model,
+                fallback_response_id,
+            );
         }
     }
 }

@@ -1848,10 +1848,10 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
-                        // Parse as a typed ResponsesStreamingEvent — the structured
-                        // envelope shared by all Responses API streaming events.
-                        // This validates that type + sequence_number are present and
-                        // gives us typed access to response.model for rewriting.
+                        // Parse into JSON first so we can normalize sparse provider
+                        // payloads, then coerce into the typed ResponsesStreamingEvent
+                        // envelope to validate type/sequence_number and rewrite the
+                        // nested response model safely.
                         let mut raw_event: serde_json::Value = match serde_json::from_str(data_part)
                         {
                             Ok(event) => event,
