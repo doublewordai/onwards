@@ -4,6 +4,143 @@
 //! See: https://www.openresponses.org/specification
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::utils::ensure_field;
+
+pub(crate) fn generated_response_id() -> String {
+    format!("resp_{}", Uuid::new_v4())
+}
+
+fn response_status_for_event_type(event_type: &str) -> &'static str {
+    match event_type {
+        "response.created" | "response.in_progress" => "in_progress",
+        "response.completed" => "completed",
+        "response.failed" => "failed",
+        "response.incomplete" => "incomplete",
+        "response.cancelled" | "response.canceled" => "cancelled",
+        _ => "completed",
+    }
+}
+
+fn backfill_responses_response_fields(
+    object: &mut serde_json::Map<String, Value>,
+    fallback_model: &str,
+    fallback_response_id: &str,
+) {
+    ensure_field(object, "id", || {
+        Value::String(fallback_response_id.to_string())
+    });
+    ensure_field(object, "object", || Value::String("response".to_string()));
+    ensure_field(object, "created_at", || Value::from(0));
+    ensure_field(object, "completed_at", || Value::Null);
+    ensure_field(object, "status", || Value::String("completed".to_string()));
+    ensure_field(object, "incomplete_details", || Value::Null);
+    ensure_field(object, "model", || {
+        Value::String(fallback_model.to_string())
+    });
+    ensure_field(object, "previous_response_id", || Value::Null);
+    ensure_field(object, "instructions", || Value::Null);
+    ensure_field(object, "output", || Value::Array(Vec::new()));
+    ensure_field(object, "error", || Value::Null);
+    ensure_field(object, "tools", || Value::Array(Vec::new()));
+    ensure_field(object, "tool_choice", || Value::String("auto".to_string()));
+    ensure_field(object, "truncation", || {
+        Value::String("disabled".to_string())
+    });
+    ensure_field(object, "parallel_tool_calls", || Value::Bool(true));
+    ensure_field(object, "text", || {
+        serde_json::json!({
+            "format": {
+                "type": "text"
+            }
+        })
+    });
+    ensure_field(object, "top_p", || Value::from(1.0));
+    ensure_field(object, "presence_penalty", || Value::from(0.0));
+    ensure_field(object, "frequency_penalty", || Value::from(0.0));
+    ensure_field(object, "top_logprobs", || Value::from(0));
+    ensure_field(object, "temperature", || Value::from(1.0));
+    ensure_field(object, "reasoning", || Value::Null);
+    ensure_field(object, "usage", || Value::Null);
+    ensure_field(object, "max_output_tokens", || Value::Null);
+    ensure_field(object, "max_tool_calls", || Value::Null);
+    ensure_field(object, "store", || Value::Bool(false));
+    ensure_field(object, "background", || Value::Bool(false));
+    ensure_field(object, "service_tier", || {
+        Value::String("default".to_string())
+    });
+    ensure_field(object, "metadata", || Value::Null);
+    ensure_field(object, "safety_identifier", || Value::Null);
+    ensure_field(object, "prompt_cache_key", || Value::Null);
+}
+
+/// Fill in omitted non-critical fields so provider Responses payloads can still
+/// round-trip through the strict schema without discarding successful generations.
+///
+/// This is intentionally separate from serde defaults on `ResponsesResponse`.
+/// The struct is used as a strict schema in multiple contexts, and broad serde
+/// defaults would silently relax every deserialize path, including internal
+/// loads from the response store. We only want that leniency when sanitizing
+/// third-party provider payloads for client-facing strict mode.
+pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_model: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    // Only coerce payloads that already look like Responses API success bodies.
+    if !object.contains_key("output") {
+        return;
+    }
+
+    let fallback_response_id = generated_response_id();
+    backfill_responses_response_fields(object, fallback_model, &fallback_response_id);
+}
+
+/// Normalize a Responses streaming event, backfilling a missing nested response
+/// snapshot with schema-valid defaults when the provider omits bookkeeping fields.
+///
+/// Streaming needs a dedicated normalizer because some defaults depend on the
+/// SSE event type itself, notably `status`.
+pub(crate) fn normalize_responses_streaming_event_value(
+    value: &mut Value,
+    fallback_model: &str,
+    fallback_response_id: &str,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    if let Some(response) = object.get_mut("response") {
+        let missing_status = response
+            .as_object()
+            .map(|response_object| !response_object.contains_key("status"))
+            .unwrap_or(false);
+
+        if let Some(response_object) = response.as_object_mut() {
+            if missing_status {
+                response_object.insert(
+                    "status".to_string(),
+                    Value::String(response_status_for_event_type(&event_type).to_string()),
+                );
+            }
+
+            // Streaming snapshots like response.created may legitimately omit output.
+            backfill_responses_response_fields(
+                response_object,
+                fallback_model,
+                fallback_response_id,
+            );
+        }
+    }
+}
 
 /// Request body for POST /v1/responses
 #[derive(Debug, Clone, Serialize, Deserialize)]

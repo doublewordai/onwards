@@ -4,6 +4,120 @@
 //! See: https://platform.openai.com/docs/api-reference/chat
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+use super::utils::ensure_field;
+
+pub(crate) fn generated_chat_completion_id() -> String {
+    format!("chatcmpl-{}", Uuid::new_v4())
+}
+
+fn normalize_chat_message_value(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "role", || Value::String("assistant".to_string()));
+    ensure_field(object, "content", || Value::Null);
+}
+
+fn normalize_chat_choice_value(value: &mut Value, fallback_index: usize) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "index", || Value::from(fallback_index));
+    ensure_field(object, "finish_reason", || Value::Null);
+    ensure_field(object, "logprobs", || Value::Null);
+
+    if let Some(message) = object.get_mut("message") {
+        normalize_chat_message_value(message);
+    }
+}
+
+fn normalize_chat_chunk_choice_value(value: &mut Value, fallback_index: usize) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "index", || Value::from(fallback_index));
+    ensure_field(object, "finish_reason", || Value::Null);
+    ensure_field(object, "logprobs", || Value::Null);
+
+    if !object.contains_key("delta") {
+        object.insert("delta".to_string(), serde_json::json!({}));
+    }
+}
+
+/// Backfill omitted non-critical chat completion response fields during strict
+/// sanitization. This is intentionally kept out of serde defaults so we only
+/// relax third-party provider payloads, not every deserialize path.
+pub(crate) fn normalize_chat_completion_response_value(value: &mut Value, fallback_model: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    // Only coerce payloads that already look like chat completion responses.
+    if !object.contains_key("choices") {
+        return;
+    }
+
+    ensure_field(object, "id", || {
+        Value::String(generated_chat_completion_id())
+    });
+    ensure_field(object, "object", || {
+        Value::String("chat.completion".to_string())
+    });
+    ensure_field(object, "created", || Value::from(0));
+    ensure_field(object, "model", || {
+        Value::String(fallback_model.to_string())
+    });
+    ensure_field(object, "usage", || Value::Null);
+    ensure_field(object, "system_fingerprint", || Value::Null);
+    ensure_field(object, "service_tier", || Value::Null);
+
+    if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+        for (index, choice) in choices.iter_mut().enumerate() {
+            normalize_chat_choice_value(choice, index);
+        }
+    }
+}
+
+/// Backfill omitted non-critical chat completion chunk fields during strict
+/// sanitization. This keeps partial-but-usable streamed chunks from failing.
+pub(crate) fn normalize_chat_completion_chunk_value(
+    value: &mut Value,
+    fallback_model: &str,
+    fallback_id: &str,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    // Only coerce payloads that already look like streamed chat chunks.
+    if !object.contains_key("choices") {
+        return;
+    }
+
+    ensure_field(object, "id", || Value::String(fallback_id.to_string()));
+    ensure_field(object, "object", || {
+        Value::String("chat.completion.chunk".to_string())
+    });
+    ensure_field(object, "created", || Value::from(0));
+    ensure_field(object, "model", || {
+        Value::String(fallback_model.to_string())
+    });
+    ensure_field(object, "usage", || Value::Null);
+    ensure_field(object, "system_fingerprint", || Value::Null);
+    ensure_field(object, "service_tier", || Value::Null);
+
+    if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+        for (index, choice) in choices.iter_mut().enumerate() {
+            normalize_chat_chunk_choice_value(choice, index);
+        }
+    }
+}
 
 /// Request body for POST /v1/chat/completions
 #[derive(Debug, Clone, Serialize, Deserialize)]

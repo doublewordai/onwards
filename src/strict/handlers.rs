@@ -12,13 +12,18 @@
 use super::adapter::{OpenResponsesAdapter, PendingToolCall};
 use super::schemas::chat_completions::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, FunctionCall,
-    FunctionDefinition, Tool as ChatTool, ToolCall, Usage,
+    FunctionDefinition, Tool as ChatTool, ToolCall, Usage, generated_chat_completion_id,
+    normalize_chat_completion_chunk_value, normalize_chat_completion_response_value,
 };
-use super::schemas::completions::{CompletionChunk, CompletionRequest, CompletionResponse};
+use super::schemas::completions::{
+    CompletionChunk, CompletionRequest, CompletionResponse, generated_completion_id,
+    normalize_completion_chunk_value, normalize_completion_response_value,
+};
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use super::schemas::responses::{
     InputTokensDetails, OutputTokensDetails, ResponseUsage, ResponsesRequest, ResponsesResponse,
-    ResponsesStreamingEvent,
+    ResponsesStreamingEvent, generated_response_id, normalize_responses_response_value,
+    normalize_responses_streaming_event_value,
 };
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
@@ -1248,8 +1253,7 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
         }
     };
 
-    // Deserialize through our strict schema (automatically drops extra fields)
-    let mut chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
+    let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
             // Failed to deserialize - provider returned malformed response
@@ -1258,6 +1262,20 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
                 error = %e,
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize chat response from provider, returning standard error"
+            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
+        }
+    };
+
+    normalize_chat_completion_response_value(&mut raw_response, &original_model);
+
+    // Deserialize through our strict schema (automatically drops extra fields)
+    let mut chat_response: ChatCompletionResponse = match serde_json::from_value(raw_response) {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to coerce chat response into strict schema"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
@@ -1326,6 +1344,7 @@ async fn sanitize_streaming_chat_response(
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let stream_fallback_id = generated_chat_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
         match chunk_result {
@@ -1346,7 +1365,36 @@ async fn sanitize_streaming_chat_response(
                         }
 
                         // Deserialize the chunk through our strict schema
-                        match serde_json::from_str::<ChatCompletionChunk>(data_part) {
+                        let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
+                        {
+                            Ok(chunk) => chunk,
+                            Err(e) => {
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
+                                error!(
+                                    error = %e,
+                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    "Failed to parse SSE data line from provider, terminating stream"
+                                );
+                                return Err(std::io::Error::other(
+                                    "Malformed SSE data from provider",
+                                ));
+                            }
+                        };
+
+                        normalize_chat_completion_chunk_value(
+                            &mut raw_chunk,
+                            &original_model,
+                            &stream_fallback_id,
+                        );
+
+                        match serde_json::from_value::<ChatCompletionChunk>(raw_chunk) {
                             Ok(mut chunk_data) => {
                                 // Rewrite model field
                                 chunk_data.model = original_model.clone();
@@ -1365,10 +1413,6 @@ async fn sanitize_streaming_chat_response(
                                 }
                             }
                             Err(e) => {
-                                // Check if this is a provider error object embedded
-                                // in the SSE stream (e.g. input too long, invalid model).
-                                // Forward it as a clean SSE event so callers can
-                                // distinguish it from a network/parse error.
                                 if let Some(error_event) = try_format_sse_error(data_part, trusted) {
                                     error!(
                                         data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -1444,13 +1488,26 @@ async fn sanitize_completions_response(mut response: Response, original_model: S
             }
         };
 
-    let mut completion_response: CompletionResponse = match serde_json::from_slice(&body_bytes) {
+    let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
             error!(
                 error = %e,
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize completions response from provider, returning standard error"
+            );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
+        }
+    };
+
+    normalize_completion_response_value(&mut raw_response, &original_model);
+
+    let mut completion_response: CompletionResponse = match serde_json::from_value(raw_response) {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(
+                error = %e,
+                "Failed to coerce completions response into strict schema"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
@@ -1498,6 +1555,7 @@ async fn sanitize_streaming_completions_response(
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let stream_fallback_id = generated_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
         match chunk_result {
@@ -1512,7 +1570,36 @@ async fn sanitize_streaming_completions_response(
                             continue;
                         }
 
-                        match serde_json::from_str::<CompletionChunk>(data_part) {
+                        let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
+                        {
+                            Ok(chunk) => chunk,
+                            Err(e) => {
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
+                                error!(
+                                    error = %e,
+                                    raw = %data_part.chars().take(200).collect::<String>(),
+                                    "Failed to parse completions chunk, terminating stream"
+                                );
+                                return Err(std::io::Error::other(
+                                    "Malformed SSE data from provider",
+                                ));
+                            }
+                        };
+
+                        normalize_completion_chunk_value(
+                            &mut raw_chunk,
+                            &original_model,
+                            &stream_fallback_id,
+                        );
+
+                        match serde_json::from_value::<CompletionChunk>(raw_chunk) {
                             Ok(mut chunk_data) => {
                                 chunk_data.model = original_model.clone();
                                 match serde_json::to_string(&chunk_data) {
@@ -1662,7 +1749,7 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
             }
         };
 
-    let mut responses_response: ResponsesResponse = match serde_json::from_slice(&body_bytes) {
+    let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
         Err(e) => {
             error!(
@@ -1670,6 +1757,20 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
                 body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
                 "Failed to deserialize responses API response from provider, returning standard error"
             );
+            return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
+        }
+    };
+
+    // Keep this provider-specific backfill in the sanitizer layer instead of
+    // putting serde defaults on `ResponsesResponse`. Struct-level defaults
+    // would relax all deserialize paths, while strict mode only wants to be
+    // forgiving when shaping third-party payloads into our public schema.
+    normalize_responses_response_value(&mut raw_response, &original_model);
+
+    let mut responses_response: ResponsesResponse = match serde_json::from_value(raw_response) {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(error = %e, "Failed to coerce responses API response into strict schema");
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
         }
     };
@@ -1728,6 +1829,7 @@ async fn sanitize_streaming_responses_response(
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let stream_fallback_response_id = generated_response_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
         match chunk_result {
@@ -1746,11 +1848,40 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
-                        // Parse as a typed ResponsesStreamingEvent — the structured
-                        // envelope shared by all Responses API streaming events.
-                        // This validates that type + sequence_number are present and
-                        // gives us typed access to response.model for rewriting.
-                        match serde_json::from_str::<ResponsesStreamingEvent>(data_part) {
+                        // Parse into JSON first so we can normalize sparse provider
+                        // payloads, then coerce into the typed ResponsesStreamingEvent
+                        // envelope to validate type/sequence_number and rewrite the
+                        // nested response model safely.
+                        let mut raw_event: serde_json::Value = match serde_json::from_str(data_part)
+                        {
+                            Ok(event) => event,
+                            Err(e) => {
+                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                                    error!(
+                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                        "Provider returned error object inside SSE stream, forwarding as error event"
+                                    );
+                                    sanitized_lines.push(error_event);
+                                    continue;
+                                }
+                                error!(
+                                    error = %e,
+                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    "Failed to parse responses SSE data line from provider, terminating stream"
+                                );
+                                return Err(std::io::Error::other(
+                                    "Malformed SSE data from provider",
+                                ));
+                            }
+                        };
+
+                        normalize_responses_streaming_event_value(
+                            &mut raw_event,
+                            &original_model,
+                            &stream_fallback_response_id,
+                        );
+
+                        match serde_json::from_value::<ResponsesStreamingEvent>(raw_event) {
                             Ok(mut event) => {
                                 // Rewrite model on response-level events
                                 if let Some(ref mut response) = event.response {
@@ -2163,6 +2294,119 @@ mod tests {
         assert!(!body_str.contains("gpt-4-turbo-2024-04-09"));
     }
 
+    #[tokio::test]
+    async fn test_strict_sanitize_chat_backfills_missing_noncritical_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "choices": [{
+                "message": {
+                    "content": "Hello from downstream"
+                }
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["model"], "gpt-4");
+        assert_eq!(json["object"], "chat.completion");
+        let id = json["id"].as_str().expect("id should be a string");
+        assert!(id.starts_with("chatcmpl-"));
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(
+            json["choices"][0]["message"]["content"],
+            "Hello from downstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_chat_backfills_choice_indexes_from_position() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "choices": [
+                {"message": {"content": "first"}},
+                {"message": {"content": "second"}}
+            ]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][1]["index"], 1);
+    }
+
     /// Test that streaming responses drop extra fields from third parties
     #[tokio::test]
     async fn test_strict_sanitize_streaming_removes_unknown_fields() {
@@ -2272,6 +2516,174 @@ mod tests {
         // Model should be rewritten to client-requested model
         assert!(body_str.contains("\"model\":\"gpt-4\""));
         assert!(!body_str.contains("gpt-4-turbo"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_streaming_chat_backfills_missing_noncritical_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let streaming_chunks = vec![
+            r#"data: {"choices":[{"delta":{"content":"Hello"}}]}
+
+"#
+            .to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"object\":\"chat.completion.chunk\""));
+        assert!(body_str.contains("\"model\":\"gpt-4\""));
+        assert!(body_str.contains("\"index\":0"));
+        assert!(body_str.contains("\"content\":\"Hello\""));
+        assert!(body_str.contains("\"id\":\"chatcmpl-"));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_streaming_chat_backfills_chunk_indexes_from_position() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let streaming_chunks = vec![
+            r#"data: {"choices":[{"delta":{"content":"first"}},{"delta":{"content":"second"}}]}
+
+"#
+            .to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"index\":0"));
+        assert!(body_str.contains("\"index\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_streaming_chat_reuses_fallback_id_across_chunks() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let streaming_chunks = vec![
+            "data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n".to_string(),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+
+        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, streaming_chunks);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        let ids: Vec<String> = body_str
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .filter_map(|json| json.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+
+        assert!(ids.len() >= 2);
+        assert!(ids.iter().all(|id| id == &ids[0]));
     }
 
     #[tokio::test]
@@ -2853,6 +3265,76 @@ mod tests {
         assert!(!body_str.contains("gpt-4o-2024-05-13"));
     }
 
+    /// Test that responses API fills omitted non-critical fields instead of failing strict-mode sanitization.
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_backfills_missing_noncritical_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        // Provider omits bookkeeping fields that are required by our strict schema,
+        // but the actual generation is present in output.
+        let mock_response = r#"{
+            "id": "resp_abc123",
+            "created_at": 1677652288,
+            "model": "provider-model",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Hello from downstream"
+                }]
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","input":"Hello"}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["id"], "resp_abc123");
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["object"], "response");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["tool_choice"], "auto");
+        assert_eq!(json["parallel_tool_calls"], true);
+        assert_eq!(json["usage"], serde_json::Value::Null);
+        assert_eq!(
+            json["output"][0]["content"][0]["text"],
+            "Hello from downstream"
+        );
+    }
+
     /// Test that responses API errors are sanitized
     #[tokio::test]
     async fn test_strict_sanitize_responses_error() {
@@ -3032,6 +3514,207 @@ mod tests {
             response_str.contains("\"delta\":\"Hello\""),
             "delta field should pass through on delta events"
         );
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_streaming_backfills_missing_noncritical_fields() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_stream = concat!(
+            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{",
+            "\"id\":\"resp-123\",\"created_at\":1677652288,\"model\":\"provider-model\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,",
+            "\"item_id\":\"msg_abc\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{",
+            "\"id\":\"resp-123\",\"created_at\":1677652288,\"output\":[{",
+            "\"type\":\"message\",\"role\":\"assistant\",\"content\":[{",
+            "\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","input":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"type\":\"response.created\""));
+        assert!(body_str.contains("\"type\":\"response.completed\""));
+        assert!(body_str.contains("\"model\":\"gpt-4o\""));
+        assert!(body_str.contains("\"id\":\"resp-123\""));
+        assert!(body_str.contains("\"status\":\"in_progress\""));
+        assert!(body_str.contains("\"status\":\"completed\""));
+        assert!(body_str.contains("\"tool_choice\":\"auto\""));
+        assert!(body_str.contains("\"delta\":\"Hello\""));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_streaming_backfills_incomplete_details() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_stream = concat!(
+            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{",
+            "\"id\":\"resp-123\",\"created_at\":1677652288,\"model\":\"provider-model\"}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","input":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"incomplete_details\":null"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_streaming_reuses_fallback_id_across_snapshots() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_stream = concat!(
+            "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{",
+            "\"created_at\":1677652288,\"model\":\"provider-model\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{",
+            "\"created_at\":1677652288,\"output\":[]}}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_stream);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","input":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        let ids: Vec<String> = body_str
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .filter_map(|json| {
+                json.get("response")
+                    .and_then(|response| response.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+
+        assert!(ids.len() >= 2);
+        assert!(ids.iter().all(|id| id == &ids[0]));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_streaming_forwards_error_object() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(
+                "data: {\"error\":{\"message\":\"Input too long\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}\n\n",
+            ))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_responses_response(response, "test-model".to_string(), true).await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+        assert!(body_str.contains("Input too long"));
+        assert!(body_str.contains("\"error\""));
     }
 
     #[tokio::test]
@@ -5263,6 +5946,109 @@ mod tests {
         assert!(!body_str.contains("internal-v2"));
     }
 
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_backfills_missing_noncritical_fields() {
+        let mock_response = r#"{
+            "choices": [{"text": "Hello!", "finish_reason": "stop"}]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["model"], "gpt-3.5-turbo-instruct");
+        assert_eq!(json["object"], "text_completion");
+        let id = json["id"].as_str().expect("id should be a string");
+        assert!(id.starts_with("cmpl-"));
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][0]["text"], "Hello!");
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_backfills_choice_indexes_from_position() {
+        let mock_response = r#"{
+            "choices": [{"text": "first"}, {"text": "second"}]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["choices"][0]["index"], 0);
+        assert_eq!(json["choices"][1]["index"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_does_not_backfill_generated_text() {
+        let mock_response = r#"{
+            "choices": [{"finish_reason": "stop"}]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "api_error");
+    }
+
     /// Content-Length header is corrected after sanitization shrinks the body
     #[tokio::test]
     async fn test_completions_sanitization_updates_content_length_header() {
@@ -5451,6 +6237,160 @@ mod tests {
         // Client-requested model reflected back, not the internal provider version
         assert!(body_str.contains("\"model\":\"gpt-3.5-turbo-instruct\""));
         assert!(!body_str.contains("0914"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_streaming_backfills_missing_noncritical_fields() {
+        let mock_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![
+                "data: {\"choices\":[{\"text\":\"Hello\"}]}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"object\":\"text_completion\""));
+        assert!(body_str.contains("\"model\":\"gpt-3.5-turbo-instruct\""));
+        assert!(body_str.contains("\"index\":0"));
+        assert!(body_str.contains("\"text\":\"Hello\""));
+        assert!(body_str.contains("\"id\":\"cmpl-"));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_streaming_backfills_missing_chunk_text() {
+        let mock_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![
+                "data: {\"choices\":[{\"finish_reason\":null}]}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"text\":\"\""));
+        assert!(body_str.contains("\"index\":0"));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_streaming_backfills_chunk_indexes_from_position() {
+        let mock_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![
+                "data: {\"choices\":[{\"text\":\"first\"},{\"text\":\"second\"}]}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"index\":0"));
+        assert!(body_str.contains("\"index\":1"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_streaming_reuses_fallback_id_across_chunks() {
+        let mock_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![
+                "data: {\"choices\":[{\"text\":\"first\"}]}\n\n".to_string(),
+                "data: {\"choices\":[{\"text\":\"second\"}]}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        let ids: Vec<String> = body_str
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+            .filter_map(|json| json.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+
+        assert!(ids.len() >= 2);
+        assert!(ids.iter().all(|id| id == &ids[0]));
     }
 
     #[tokio::test]

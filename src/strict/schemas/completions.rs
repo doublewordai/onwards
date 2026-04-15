@@ -8,8 +8,98 @@
 //! sanitized (unknown fields stripped, model field rewritten).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
 
 use super::chat_completions::{StopSequence, Usage};
+use super::utils::ensure_field;
+
+pub(crate) fn generated_completion_id() -> String {
+    format!("cmpl-{}", Uuid::new_v4())
+}
+
+fn normalize_completion_response_choice_value(value: &mut Value, fallback_index: usize) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "index", || Value::from(fallback_index));
+    ensure_field(object, "logprobs", || Value::Null);
+    ensure_field(object, "finish_reason", || Value::Null);
+}
+
+fn normalize_completion_chunk_choice_value(value: &mut Value, fallback_index: usize) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "text", || Value::String(String::new()));
+    ensure_field(object, "index", || Value::from(fallback_index));
+    ensure_field(object, "logprobs", || Value::Null);
+    ensure_field(object, "finish_reason", || Value::Null);
+}
+
+/// Backfill omitted non-critical legacy completion response fields during
+/// strict sanitization. Kept out of serde defaults so only provider payloads
+/// are relaxed.
+pub(crate) fn normalize_completion_response_value(value: &mut Value, fallback_model: &str) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if !object.contains_key("choices") {
+        return;
+    }
+
+    ensure_field(object, "id", || Value::String(generated_completion_id()));
+    ensure_field(object, "object", || {
+        Value::String("text_completion".to_string())
+    });
+    ensure_field(object, "created", || Value::from(0));
+    ensure_field(object, "model", || {
+        Value::String(fallback_model.to_string())
+    });
+    ensure_field(object, "usage", || Value::Null);
+    ensure_field(object, "system_fingerprint", || Value::Null);
+
+    if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+        for (index, choice) in choices.iter_mut().enumerate() {
+            normalize_completion_response_choice_value(choice, index);
+        }
+    }
+}
+
+/// Backfill omitted non-critical legacy completion chunk fields during strict
+/// streaming sanitization.
+pub(crate) fn normalize_completion_chunk_value(
+    value: &mut Value,
+    fallback_model: &str,
+    fallback_id: &str,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    if !object.contains_key("choices") {
+        return;
+    }
+
+    ensure_field(object, "id", || Value::String(fallback_id.to_string()));
+    ensure_field(object, "object", || {
+        Value::String("text_completion".to_string())
+    });
+    ensure_field(object, "created", || Value::from(0));
+    ensure_field(object, "model", || {
+        Value::String(fallback_model.to_string())
+    });
+    ensure_field(object, "usage", || Value::Null);
+
+    if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
+        for (index, choice) in choices.iter_mut().enumerate() {
+            normalize_completion_chunk_choice_value(choice, index);
+        }
+    }
+}
 
 /// Prompt input — matches the OpenAI spec `oneOf`: string | string[] | integer[] | integer[][]
 #[derive(Debug, Clone, Serialize, Deserialize)]
