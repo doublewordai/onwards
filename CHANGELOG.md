@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2](https://github.com/doublewordai/onwards/compare/v0.24.1...v0.24.2) - 2026-04-15
+
+### Fixed
+
+- preserve reasoning_tokens and cached_tokens in usage conversion ([#174](https://github.com/doublewordai/onwards/pull/174))
+
 ## [0.24.1](https://github.com/doublewordai/onwards/compare/v0.24.0...v0.24.1) - 2026-04-15
 
 ### Added
