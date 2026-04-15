@@ -146,17 +146,7 @@ impl StreamingState {
 
         // Store usage if present (typically in final chunk)
         if let Some(ref usage) = chunk.usage {
-            self.usage = Some(ResponseUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                input_tokens_details: super::schemas::responses::InputTokensDetails {
-                    cached_tokens: 0,
-                },
-                output_tokens_details: super::schemas::responses::OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            });
+            self.usage = Some(super::chat_usage_to_response_usage(usage));
         }
 
         // Check for finish_reason to emit done events
@@ -1099,6 +1089,42 @@ mod tests {
             events
                 .iter()
                 .any(|e| e.event_type == "response.output_item.done")
+        );
+    }
+
+    #[test]
+    fn test_streaming_state_preserves_usage_token_details() {
+        use super::super::schemas::chat_completions::Usage;
+
+        let mut state = StreamingState::new(&test_request("gpt-4"));
+
+        // Content delta (no usage yet).
+        let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
+        state.process_chunk(&chunk1);
+
+        // Final chunk with usage carrying the detail fields providers send for
+        // prompt caching and thinking models.
+        let mut chunk2 = create_test_chunk("chunk_2", None, None, Some("stop"));
+        chunk2.usage = Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(serde_json::json!({ "cached_tokens": 42 })),
+            completion_tokens_details: Some(serde_json::json!({ "reasoning_tokens": 30 })),
+        });
+        state.process_chunk(&chunk2);
+
+        let usage = state.usage.as_ref().expect("usage should be captured");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(
+            usage.input_tokens_details.cached_tokens, 42,
+            "cached_tokens should flow through to streaming state"
+        );
+        assert_eq!(
+            usage.output_tokens_details.reasoning_tokens, 30,
+            "reasoning_tokens should flow through to streaming state"
         );
     }
 

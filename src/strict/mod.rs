@@ -58,6 +58,73 @@ pub(crate) fn merge_reasoning_text(
     parts.join("\n")
 }
 
+/// Convert chat completions `Usage` to Responses API `ResponseUsage`,
+/// extracting `reasoning_tokens` and `cached_tokens` from the raw JSON detail fields.
+/// Values are clamped to `u32::MAX` to guard against wraparound on untrusted input.
+pub(crate) fn chat_usage_to_response_usage(
+    u: &schemas::chat_completions::Usage,
+) -> schemas::responses::ResponseUsage {
+    fn extract(details: Option<&serde_json::Value>, key: &str) -> u32 {
+        details
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(u32::MAX as u64) as u32
+    }
+
+    let cached_tokens = extract(u.prompt_tokens_details.as_ref(), "cached_tokens");
+    let reasoning_tokens = extract(u.completion_tokens_details.as_ref(), "reasoning_tokens");
+
+    schemas::responses::ResponseUsage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+        input_tokens_details: schemas::responses::InputTokensDetails { cached_tokens },
+        output_tokens_details: schemas::responses::OutputTokensDetails { reasoning_tokens },
+    }
+}
+
+/// Merge two optional usage detail JSON objects, summing matching numeric fields.
+///
+/// Used to accumulate `prompt_tokens_details` / `completion_tokens_details` across
+/// tool-loop iterations so that per-field counts (`cached_tokens`, `reasoning_tokens`,
+/// etc.) stay consistent with the summed top-level totals.
+///
+/// Behavior:
+/// - If only one side has a value, it is returned as-is.
+/// - If both are JSON objects, the result is an object containing the union of keys,
+///   with matching numeric (`u64`) fields summed. Non-numeric fields prefer the
+///   newer value.
+/// - If either side is not an object, the newer value wins (can't meaningfully merge).
+pub(crate) fn merge_usage_details(
+    prev: Option<serde_json::Value>,
+    next: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    match (prev, next) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(prev), Some(next)) => {
+            let (Some(mut merged), Some(next_obj)) =
+                (prev.as_object().cloned(), next.as_object())
+            else {
+                return Some(next);
+            };
+            for (key, next_val) in next_obj {
+                match merged.get(key) {
+                    Some(existing) if existing.is_u64() && next_val.is_u64() => {
+                        let sum = existing.as_u64().unwrap_or(0) + next_val.as_u64().unwrap_or(0);
+                        merged.insert(key.clone(), sum.into());
+                    }
+                    _ => {
+                        merged.insert(key.clone(), next_val.clone());
+                    }
+                }
+            }
+            Some(serde_json::Value::Object(merged))
+        }
+    }
+}
+
 use crate::AppState;
 use crate::client::HttpClient;
 use axum::Router;
@@ -847,5 +914,102 @@ mod tests {
                 .contains("get_weather"),
             "Error should mention the colliding tool name"
         );
+    }
+
+    #[test]
+    fn test_chat_usage_to_response_usage_extracts_details() {
+        let usage = schemas::chat_completions::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(serde_json::json!({
+                "cached_tokens": 42,
+                "audio_tokens": 0,
+            })),
+            completion_tokens_details: Some(serde_json::json!({
+                "reasoning_tokens": 30,
+                "accepted_prediction_tokens": 0,
+            })),
+        };
+
+        let converted = chat_usage_to_response_usage(&usage);
+        assert_eq!(converted.input_tokens, 100);
+        assert_eq!(converted.output_tokens, 50);
+        assert_eq!(converted.total_tokens, 150);
+        assert_eq!(converted.input_tokens_details.cached_tokens, 42);
+        assert_eq!(converted.output_tokens_details.reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn test_chat_usage_to_response_usage_missing_details() {
+        let usage = schemas::chat_completions::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        };
+
+        let converted = chat_usage_to_response_usage(&usage);
+        assert_eq!(converted.input_tokens_details.cached_tokens, 0);
+        assert_eq!(converted.output_tokens_details.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn test_chat_usage_to_response_usage_clamps_oversized_values() {
+        let usage = schemas::chat_completions::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_tokens_details: Some(serde_json::json!({
+                "cached_tokens": u64::MAX,
+            })),
+            completion_tokens_details: Some(serde_json::json!({
+                "reasoning_tokens": (u32::MAX as u64) + 1,
+            })),
+        };
+
+        let converted = chat_usage_to_response_usage(&usage);
+        // Clamped to u32::MAX instead of silently wrapping.
+        assert_eq!(converted.input_tokens_details.cached_tokens, u32::MAX);
+        assert_eq!(converted.output_tokens_details.reasoning_tokens, u32::MAX);
+    }
+
+    #[test]
+    fn test_merge_usage_details_sums_numeric_fields() {
+        let prev = Some(serde_json::json!({
+            "cached_tokens": 10,
+            "audio_tokens": 2,
+        }));
+        let next = Some(serde_json::json!({
+            "cached_tokens": 15,
+            "audio_tokens": 3,
+        }));
+
+        let merged = merge_usage_details(prev, next).unwrap();
+        assert_eq!(merged["cached_tokens"], 25);
+        assert_eq!(merged["audio_tokens"], 5);
+    }
+
+    #[test]
+    fn test_merge_usage_details_union_of_keys() {
+        let prev = Some(serde_json::json!({ "cached_tokens": 10 }));
+        let next = Some(serde_json::json!({ "audio_tokens": 3 }));
+
+        let merged = merge_usage_details(prev, next).unwrap();
+        assert_eq!(merged["cached_tokens"], 10);
+        assert_eq!(merged["audio_tokens"], 3);
+    }
+
+    #[test]
+    fn test_merge_usage_details_handles_none() {
+        assert!(merge_usage_details(None, None).is_none());
+
+        let v = serde_json::json!({ "cached_tokens": 10 });
+        assert_eq!(
+            merge_usage_details(None, Some(v.clone())).unwrap(),
+            v.clone()
+        );
+        assert_eq!(merge_usage_details(Some(v.clone()), None).unwrap(), v);
     }
 }

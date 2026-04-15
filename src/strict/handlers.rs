@@ -21,9 +21,8 @@ use super::schemas::completions::{
 };
 use super::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use super::schemas::responses::{
-    InputTokensDetails, OutputTokensDetails, ResponseUsage, ResponsesRequest, ResponsesResponse,
-    ResponsesStreamingEvent, generated_response_id, normalize_responses_response_value,
-    normalize_responses_streaming_event_value,
+    ResponsesRequest, ResponsesResponse, ResponsesStreamingEvent, generated_response_id,
+    normalize_responses_response_value, normalize_responses_streaming_event_value,
 };
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
@@ -683,8 +682,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                     prompt_tokens: prev.prompt_tokens + usage.prompt_tokens,
                     completion_tokens: prev.completion_tokens + usage.completion_tokens,
                     total_tokens: prev.total_tokens + usage.total_tokens,
-                    prompt_tokens_details: None,
-                    completion_tokens_details: None,
+                    prompt_tokens_details: super::merge_usage_details(
+                        prev.prompt_tokens_details,
+                        usage.prompt_tokens_details.clone(),
+                    ),
+                    completion_tokens_details: super::merge_usage_details(
+                        prev.completion_tokens_details,
+                        usage.completion_tokens_details.clone(),
+                    ),
                 },
             });
         }
@@ -709,15 +714,9 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             if adapter.has_unhandled_tools(&results) {
                 debug!("Some tools are unhandled, returning to client");
                 // Return to client with requires_action status, using aggregate usage
-                let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
-                    input_tokens: u.prompt_tokens,
-                    output_tokens: u.completion_tokens,
-                    total_tokens: u.total_tokens,
-                    input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                    output_tokens_details: OutputTokensDetails {
-                        reasoning_tokens: 0,
-                    },
-                });
+                let aggregate_response_usage = accumulated_usage
+                    .as_ref()
+                    .map(super::chat_usage_to_response_usage);
                 let responses_response = adapter.to_responses_response_with_usage(
                     &chat_response,
                     &request,
@@ -766,15 +765,9 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         }
 
         // No tool action required or max iterations reached - return final response
-        let aggregate_response_usage = accumulated_usage.as_ref().map(|u| ResponseUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-            total_tokens: u.total_tokens,
-            input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-            output_tokens_details: OutputTokensDetails {
-                reasoning_tokens: 0,
-            },
-        });
+        let aggregate_response_usage = accumulated_usage
+            .as_ref()
+            .map(super::chat_usage_to_response_usage);
         let responses_response = adapter.to_responses_response_with_usage(
             &chat_response,
             &request,

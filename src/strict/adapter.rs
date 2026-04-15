@@ -12,11 +12,10 @@ use super::schemas::chat_completions::{
     MessageContent, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
 };
 use super::schemas::responses::{
-    ContentPart, FunctionCallItem, Input, InputTokensDetails, Item, ItemStatus,
-    MessageContent as ResponseMessageContent, MessageItem, OutputTokensDetails, ReasoningContent,
-    ReasoningItem, ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse,
-    SummaryContent, TextConfig, TextFormat, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
-    TruncationStrategy,
+    ContentPart, FunctionCallItem, Input, Item, ItemStatus,
+    MessageContent as ResponseMessageContent, MessageItem, ReasoningContent, ReasoningItem,
+    ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig,
+    TextFormat, Tool as ResponseTool, ToolChoice as ResponseToolChoice, TruncationStrategy,
 };
 use crate::traits::{RequestContext, ResponseStore, StoreError, ToolError, ToolExecutor};
 use std::collections::HashSet;
@@ -197,15 +196,10 @@ impl OpenResponsesAdapter {
             top_logprobs: 0,
             temperature: request.temperature.unwrap_or(1.0),
             reasoning: serde_json::to_value(&request.reasoning).unwrap_or(serde_json::Value::Null),
-            usage: chat_response.usage.as_ref().map(|u| ResponseUsage {
-                input_tokens: u.prompt_tokens,
-                output_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
-            }),
+            usage: chat_response
+                .usage
+                .as_ref()
+                .map(super::chat_usage_to_response_usage),
             max_output_tokens: request.max_output_tokens,
             max_tool_calls: None,
             store: request.store.unwrap_or(false),
@@ -770,7 +764,9 @@ fn generate_item_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::schemas::responses::FunctionCallOutputItem;
+    use super::super::schemas::responses::{
+        FunctionCallOutputItem, InputTokensDetails, OutputTokensDetails,
+    };
     use super::*;
     use crate::traits::{NoOpResponseStore, NoOpToolExecutor};
 
@@ -1131,21 +1127,26 @@ mod tests {
     #[test]
     fn test_token_accumulation_across_iterations() {
         // Simulate accumulating tokens from three loop iterations and verify
-        // the aggregate matches the sum.
+        // the aggregate matches the sum. Mirrors the production merge logic
+        // in handlers.rs so per-iteration detail counts (reasoning_tokens,
+        // cached_tokens) also stay consistent with the summed totals.
         use super::super::schemas::chat_completions::Usage as ChatUsage;
 
-        // Iteration token counts: (prompt, completion)
-        let iterations: &[(u32, u32)] = &[(100, 50), (80, 40), (60, 30)];
+        // (prompt, completion, cached, reasoning)
+        let iterations: &[(u32, u32, u64, u64)] =
+            &[(100, 50, 10, 20), (80, 40, 5, 15), (60, 30, 3, 10)];
 
         let mut accumulated: Option<ChatUsage> = None;
 
-        for &(prompt, completion) in iterations {
+        for &(prompt, completion, cached, reasoning) in iterations {
             let iter_usage = ChatUsage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: prompt + completion,
-                prompt_tokens_details: None,
-                completion_tokens_details: None,
+                prompt_tokens_details: Some(serde_json::json!({ "cached_tokens": cached })),
+                completion_tokens_details: Some(
+                    serde_json::json!({ "reasoning_tokens": reasoning }),
+                ),
             };
 
             accumulated = Some(match accumulated.take() {
@@ -1154,28 +1155,70 @@ mod tests {
                     prompt_tokens: prev.prompt_tokens + iter_usage.prompt_tokens,
                     completion_tokens: prev.completion_tokens + iter_usage.completion_tokens,
                     total_tokens: prev.total_tokens + iter_usage.total_tokens,
-                    prompt_tokens_details: None,
-                    completion_tokens_details: None,
+                    prompt_tokens_details: super::super::merge_usage_details(
+                        prev.prompt_tokens_details,
+                        iter_usage.prompt_tokens_details,
+                    ),
+                    completion_tokens_details: super::super::merge_usage_details(
+                        prev.completion_tokens_details,
+                        iter_usage.completion_tokens_details,
+                    ),
                 },
             });
         }
 
         let total: ChatUsage = accumulated.expect("should have accumulated usage");
 
+        assert_eq!(total.prompt_tokens, 100 + 80 + 60);
+        assert_eq!(total.completion_tokens, 50 + 40 + 30);
+        assert_eq!(total.total_tokens, (100 + 50) + (80 + 40) + (60 + 30));
+
+        // Detail counts should also have been summed across iterations
+        // instead of keeping only the latest iteration's values.
+        let converted = super::super::chat_usage_to_response_usage(&total);
         assert_eq!(
-            total.prompt_tokens,
-            100 + 80 + 60,
-            "prompt tokens should be summed"
+            converted.input_tokens_details.cached_tokens,
+            10 + 5 + 3,
+            "cached_tokens should be summed across iterations"
         );
         assert_eq!(
-            total.completion_tokens,
-            50 + 40 + 30,
-            "completion tokens should be summed"
+            converted.output_tokens_details.reasoning_tokens,
+            20 + 15 + 10,
+            "reasoning_tokens should be summed across iterations"
+        );
+    }
+
+    #[test]
+    fn test_to_responses_response_preserves_cached_and_reasoning_tokens() {
+        let adapter = create_test_adapter();
+        let request = make_responses_request();
+
+        // Chat response whose usage carries the populated detail fields that
+        // real providers send for prompt caching and thinking models.
+        let mut chat_response = make_chat_response_with_usage(100, 50, "stop");
+        chat_response.usage = Some(super::super::schemas::chat_completions::Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            prompt_tokens_details: Some(serde_json::json!({ "cached_tokens": 42 })),
+            completion_tokens_details: Some(serde_json::json!({ "reasoning_tokens": 30 })),
+        });
+
+        // The default `to_responses_response` path reads `chat_response.usage`
+        // via `chat_usage_to_response_usage`.
+        let response = adapter.to_responses_response(&chat_response, &request);
+
+        let usage = response.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
+        assert_eq!(
+            usage.input_tokens_details.cached_tokens, 42,
+            "cached_tokens should be extracted from prompt_tokens_details"
         );
         assert_eq!(
-            total.total_tokens,
-            (100 + 50) + (80 + 40) + (60 + 30),
-            "total tokens should be summed"
+            usage.output_tokens_details.reasoning_tokens, 30,
+            "reasoning_tokens should be extracted from completion_tokens_details"
         );
     }
 
