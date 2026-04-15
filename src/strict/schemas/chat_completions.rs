@@ -4,14 +4,10 @@
 //! See: https://platform.openai.com/docs/api-reference/chat
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
-fn ensure_field(object: &mut Map<String, Value>, key: &str, default: impl FnOnce() -> Value) {
-    if !object.contains_key(key) {
-        object.insert(key.to_string(), default());
-    }
-}
+use super::utils::ensure_field;
 
 pub(crate) fn generated_chat_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4())

@@ -8,22 +8,27 @@
 //! sanitized (unknown fields stripped, model field rewritten).
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::chat_completions::{StopSequence, Usage};
-
-fn ensure_field(object: &mut Map<String, Value>, key: &str, default: impl FnOnce() -> Value) {
-    if !object.contains_key(key) {
-        object.insert(key.to_string(), default());
-    }
-}
+use super::utils::ensure_field;
 
 pub(crate) fn generated_completion_id() -> String {
     format!("cmpl-{}", Uuid::new_v4())
 }
 
-fn normalize_completion_choice_value(value: &mut Value, fallback_index: usize) {
+fn normalize_completion_response_choice_value(value: &mut Value, fallback_index: usize) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    ensure_field(object, "index", || Value::from(fallback_index));
+    ensure_field(object, "logprobs", || Value::Null);
+    ensure_field(object, "finish_reason", || Value::Null);
+}
+
+fn normalize_completion_chunk_choice_value(value: &mut Value, fallback_index: usize) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -59,7 +64,7 @@ pub(crate) fn normalize_completion_response_value(value: &mut Value, fallback_mo
 
     if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
         for (index, choice) in choices.iter_mut().enumerate() {
-            normalize_completion_choice_value(choice, index);
+            normalize_completion_response_choice_value(choice, index);
         }
     }
 }
@@ -91,7 +96,7 @@ pub(crate) fn normalize_completion_chunk_value(
 
     if let Some(choices) = object.get_mut("choices").and_then(Value::as_array_mut) {
         for (index, choice) in choices.iter_mut().enumerate() {
-            normalize_completion_choice_value(choice, index);
+            normalize_completion_chunk_choice_value(choice, index);
         }
     }
 }

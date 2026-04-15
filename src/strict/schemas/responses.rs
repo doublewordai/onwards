@@ -4,14 +4,10 @@
 //! See: https://www.openresponses.org/specification
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 use uuid::Uuid;
 
-fn ensure_field(object: &mut Map<String, Value>, key: &str, default: impl FnOnce() -> Value) {
-    if !object.contains_key(key) {
-        object.insert(key.to_string(), default());
-    }
-}
+use super::utils::ensure_field;
 
 pub(crate) fn generated_response_id() -> String {
     format!("resp_{}", Uuid::new_v4())

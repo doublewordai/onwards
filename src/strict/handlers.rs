@@ -6016,6 +6016,39 @@ mod tests {
         assert_eq!(json["choices"][1]["index"], 1);
     }
 
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_does_not_backfill_generated_text() {
+        let mock_response = r#"{
+            "choices": [{"finish_reason": "stop"}]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello"}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["error"]["type"], "api_error");
+    }
+
     /// Content-Length header is corrected after sanitization shrinks the body
     #[tokio::test]
     async fn test_completions_sanitization_updates_content_length_header() {
@@ -6243,6 +6276,43 @@ mod tests {
         assert!(body_str.contains("\"index\":0"));
         assert!(body_str.contains("\"text\":\"Hello\""));
         assert!(body_str.contains("\"id\":\"cmpl-"));
+        assert!(body_str.contains("[DONE]"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_sanitize_completions_streaming_backfills_missing_chunk_text() {
+        let mock_client = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![
+                "data: {\"choices\":[{\"finish_reason\":null}]}\n\n".to_string(),
+                "data: [DONE]\n\n".to_string(),
+            ],
+        );
+        let state = AppState::with_client(
+            completions_test_targets("gpt-3.5-turbo-instruct"),
+            mock_client,
+        );
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Hello","stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(body_str.contains("\"text\":\"\""));
+        assert!(body_str.contains("\"index\":0"));
         assert!(body_str.contains("[DONE]"));
     }
 
