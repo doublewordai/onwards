@@ -14,6 +14,7 @@ use crate::target::{
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A pool of providers that share an alias, with load balancing support
@@ -40,6 +41,8 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
+    /// Tracks observed TTFB per provider for the FastestTtfb strategy
+    ttfb_tracker: TtfbTracker,
 }
 
 /// A single provider within a pool
@@ -78,9 +81,92 @@ impl Provider {
     }
 }
 
+/// Tracks observed time-to-first-body-frame per provider with TTFB-relative decay.
+///
+/// Each slot stores the most recent TTFB and when it was recorded.
+/// On read, values decay linearly toward zero over a window proportional to
+/// the observed TTFB itself (TTFB * DECAY_MULTIPLIER). This means a 100ms
+/// measurement expires in ~500ms, while a 5s measurement expires in ~25s.
+/// The intuition: if the observed TTFB was N seconds, after N seconds have
+/// passed the provider's queue has flushed and the measurement is stale.
+/// The multiplier adds headroom for natural variance.
+/// Once fully expired, the provider appears fastest (TTFB = 0), which
+/// encourages re-exploration.
+#[derive(Debug, Clone)]
+pub struct TtfbTracker {
+    /// TTFB in microseconds per provider
+    ttfb_slots: Arc<Vec<AtomicU64>>,
+    /// Timestamp (milliseconds since tracker creation) when each slot was last recorded
+    recorded_at_slots: Arc<Vec<AtomicU64>>,
+    /// Reference instant for computing relative timestamps
+    epoch: std::time::Instant,
+}
+
+/// Multiplier for TTFB-relative decay. A measurement expires after
+/// observed_ttfb * DECAY_MULTIPLIER has elapsed.
+// TODO: is this sensible?  Is it better not to decay, but just to invalidate after 1 window?
+const DECAY_MULTIPLIER: u64 = 5;
+
+impl TtfbTracker {
+    /// Create a new tracker with `count` slots, all uninitialized (effective TTFB = 0)
+    pub fn new(count: usize) -> Self {
+        let ttfb_slots: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
+        let recorded_at_slots: Vec<AtomicU64> = (0..count).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            ttfb_slots: Arc::new(ttfb_slots),
+            recorded_at_slots: Arc::new(recorded_at_slots),
+            epoch: std::time::Instant::now(),
+        }
+    }
+
+    /// Record an observed TTFB for a provider
+    pub fn record(&self, provider_index: usize, ttfb: std::time::Duration) {
+        if let Some(slot) = self.ttfb_slots.get(provider_index) {
+            slot.store(ttfb.as_micros() as u64, Ordering::Release);
+        }
+        if let Some(slot) = self.recorded_at_slots.get(provider_index) {
+            slot.store(self.epoch.elapsed().as_millis() as u64, Ordering::Release);
+        }
+    }
+
+    /// Read the decayed TTFB for a provider.
+    /// Returns 0 for uninitialized or fully expired measurements.
+    pub fn get(&self, provider_index: usize) -> u64 {
+        let ttfb = self
+            .ttfb_slots
+            .get(provider_index)
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(0);
+
+        if ttfb == 0 {
+            return 0;
+        }
+
+        let recorded_at = self
+            .recorded_at_slots
+            .get(provider_index)
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(0);
+
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        let elapsed_ms = now_ms.saturating_sub(recorded_at);
+        // Decay window is proportional to the observed TTFB itself.
+        // ttfb is in microseconds, convert to milliseconds for comparison.
+        let window_ms = (ttfb / 1000) * DECAY_MULTIPLIER;
+
+        if window_ms == 0 || elapsed_ms >= window_ms {
+            return 0;
+        }
+
+        // Linear decay: ttfb * (1 - elapsed / window)
+        ttfb * (window_ms - elapsed_ms) / window_ms
+    }
+}
+
 impl ProviderPool {
     /// Create a new provider pool from a list of providers
     pub fn new(providers: Vec<Provider>) -> Self {
+        let ttfb_tracker = TtfbTracker::new(providers.len());
         Self {
             providers,
             keys: None,
@@ -90,6 +176,7 @@ impl ProviderPool {
             strategy: LoadBalanceStrategy::default(),
             trusted: false,
             routing_rules: Vec::new(),
+            ttfb_tracker,
         }
     }
 
@@ -104,6 +191,7 @@ impl ProviderPool {
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
+        let ttfb_tracker = TtfbTracker::new(providers.len());
         Self {
             providers,
             keys,
@@ -113,6 +201,7 @@ impl ProviderPool {
             strategy,
             trusted,
             routing_rules,
+            ttfb_tracker,
         }
     }
 
@@ -173,6 +262,7 @@ impl ProviderPool {
         match self.strategy {
             LoadBalanceStrategy::Priority => self.select_priority(exclude),
             LoadBalanceStrategy::WeightedRandom => self.select_least_connections(exclude),
+            LoadBalanceStrategy::FastestTtfb => self.select_fastest_ttfb(exclude),
         }
     }
 
@@ -262,6 +352,77 @@ impl ProviderPool {
         }
     }
 
+    /// Select using fastest TTFB: pick the provider with the lowest observed
+    /// time to first byte, breaking ties with weighted random selection.
+    /// Skips providers at their concurrency limit.
+    fn select_fastest_ttfb(
+        &self,
+        exclude: &HashSet<usize>,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        let mut best_ttfb = u64::MAX;
+        let mut candidates: Vec<usize> = Vec::new();
+
+        for (idx, provider) in self.providers.iter().enumerate() {
+            if exclude.contains(&idx) {
+                continue;
+            }
+            if provider.limiter.at_capacity() {
+                continue;
+            }
+
+            let ttfb = self.ttfb_tracker.get(idx);
+            metrics::gauge!(
+                "onwards_routing_ttfb_seconds",
+                "provider" => format!("{}:{}", idx, provider.target.url),
+            )
+            .set(ttfb as f64 / 1_000_000.0);
+
+            if ttfb < best_ttfb {
+                best_ttfb = ttfb;
+                candidates.clear();
+                candidates.push(idx);
+            } else if ttfb == best_ttfb {
+                candidates.push(idx);
+            }
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Weighted random tiebreak among tied candidates
+        let selected = if candidates.len() == 1 {
+            candidates[0]
+        } else {
+            let mut rng = rand::rng();
+            let total_weight: u32 = candidates
+                .iter()
+                .map(|&idx| self.providers[idx].weight)
+                .sum();
+            let r: u32 = rng.random_range(0..total_weight);
+            let mut cumulative = 0;
+            let mut picked = candidates[0];
+            for &idx in &candidates {
+                cumulative += self.providers[idx].weight;
+                if r < cumulative {
+                    picked = idx;
+                    break;
+                }
+            }
+            picked
+        };
+
+        let provider = &self.providers[selected];
+        match provider.limiter.try_acquire() {
+            Some(guard) => Some((selected, &provider.target, guard)),
+            None => {
+                let mut new_exclude = exclude.clone();
+                new_exclude.insert(selected);
+                self.select_fastest_ttfb(&new_exclude)
+            }
+        }
+    }
+
     /// Get all providers in the pool (for listing models, etc.)
     pub fn providers(&self) -> &[Provider] {
         &self.providers
@@ -329,6 +490,11 @@ impl ProviderPool {
     /// Check if this pool is marked as trusted
     pub fn is_trusted(&self) -> bool {
         self.trusted
+    }
+
+    /// Get the TTFB tracker for this pool
+    pub fn ttfb_tracker(&self) -> &TtfbTracker {
+        &self.ttfb_tracker
     }
 
     /// Get the routing rules for this pool
@@ -412,6 +578,7 @@ impl<'a> Iterator for SelectIter<'a> {
         let should_exclude = match self.pool.strategy {
             LoadBalanceStrategy::Priority => true,
             LoadBalanceStrategy::WeightedRandom => !self.with_replacement,
+            LoadBalanceStrategy::FastestTtfb => !self.with_replacement,
         };
         if should_exclude {
             self.excluded.insert(result.0);

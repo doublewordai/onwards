@@ -71,18 +71,21 @@ impl Drop for InflightGuard {
     }
 }
 
-/// A stream wrapper that keeps a [`ConcurrencyGuard`] and [`InflightGuard`] alive
-/// until the stream is fully consumed or dropped. This ensures the active connection
-/// count and inflight gauge are decremented when the response body finishes, not
-/// when the handler returns — critical for streaming responses where the body
-/// outlives the handler.
-struct GuardedStream<S> {
+/// A response body stream that carries per-request context through the streaming
+/// lifecycle. Tracks the target model name, measures time to first byte,
+/// and keeps [`ConcurrencyGuard`] and [`InflightGuard`] alive until the stream
+/// is fully consumed or dropped — ensuring counters are decremented when the
+/// body finishes, not when the handler returns.
+struct TrackedStream<S> {
     inner: S,
     _guard: ConcurrencyGuard,
     _inflight_guard: InflightGuard,
+    upstream_request_start: std::time::Instant,
+    time_to_first_frame: Option<std::time::Duration>,
+    on_first_frame: Option<Box<dyn FnOnce(std::time::Duration) + Send>>,
 }
 
-impl<S, E> futures_util::Stream for GuardedStream<S>
+impl<S, E> futures_util::Stream for TrackedStream<S>
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, E>> + Unpin,
 {
@@ -92,7 +95,17 @@ where
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+        let result = std::pin::Pin::new(&mut self.inner).poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(_))) = &result {
+            if self.time_to_first_frame.is_none() {
+                let ttfb = self.upstream_request_start.elapsed();
+                self.time_to_first_frame = Some(ttfb);
+                if let Some(callback) = self.on_first_frame.take() {
+                    callback(ttfb);
+                }
+            }
+        }
+        result
     }
 }
 
@@ -226,7 +239,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     async move {
 
-    // Track inflight requests for observability. The guard is moved into GuardedStream
+    // Track inflight requests for observability. The guard is moved into TrackedStream
     // on the success path so the gauge stays incremented for the full lifetime of
     // streaming response bodies.
     metrics::gauge!("onwards_requests_inflight").increment(1.0);
@@ -468,7 +481,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    for (provider_index, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -653,6 +666,7 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
+        let upstream_request_start = std::time::Instant::now();
         let request_result = async {
             if let Some(timeout_secs) = target.request_timeout_secs {
                 let timeout_duration = std::time::Duration::from_secs(timeout_secs);
@@ -951,10 +965,24 @@ pub async fn target_message_handler<T: HttpClient>(
         // are decremented when the body stream completes, not when the handler returns.
         // Critical for streaming responses where the body outlives the handler.
         let (parts, body) = response.into_parts();
-        let guarded = GuardedStream {
+        let guarded = TrackedStream {
             inner: body.into_data_stream(),
             _guard: connection_guard,
             _inflight_guard: inflight_guard.take().expect("inflight_guard taken once on success path"),
+            upstream_request_start,
+            time_to_first_frame: None,
+            on_first_frame: {
+                let tracker = pool.ttfb_tracker().clone();
+                let target_name = model_name.clone();
+                let provider_label = format!("{}:{}", provider_index, target.url);
+                Some(Box::new(move |ttfb| {
+                    if (200..300).contains(&status) {
+                        metrics::histogram!("onwards_upstream_ttfb_seconds", "target" => target_name, "provider" => provider_label)
+                            .record(ttfb.as_secs_f64());
+                        tracker.record(provider_index, ttfb);
+                    }
+                }))
+            },
         };
         let response = Response::from_parts(parts, axum::body::Body::from_stream(guarded));
 
