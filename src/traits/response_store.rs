@@ -1,7 +1,9 @@
-//! Response storage trait for stateful conversations
+//! Response storage trait for stateful conversations and response lifecycle tracking.
 //!
-//! Implement this trait to enable `previous_response_id` support in the Open Responses adapter.
-//! The adapter will use this store to persist responses and retrieve context for follow-up requests.
+//! Implement this trait to enable:
+//! - `previous_response_id` support in the Open Responses adapter
+//! - Response lifecycle tracking (create → complete/fail) for `GET /v1/responses/{id}`
+//! - `background` mode where responses are created before proxying and polled later
 
 use async_trait::async_trait;
 use std::fmt;
@@ -29,58 +31,77 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Trait for storing and retrieving response context.
+/// Trait for response lifecycle management and stateful conversations.
 ///
-/// Implement this to enable `previous_response_id` support in the Open Responses adapter.
-/// When a client sends a request with `previous_response_id`, the adapter will use this
-/// store to retrieve the conversation context.
+/// Implement this to enable:
+/// - **Lifecycle tracking**: `create_pending` before proxying, `complete`/`fail` after.
+///   This makes every response retrievable via `GET /v1/responses/{id}`.
+/// - **Conversation state**: `get_context` retrieves previous response context for
+///   `previous_response_id` support.
+/// - **Legacy storage**: `store` persists a completed response (used by the adapter
+///   after constructing the final response).
 ///
-/// # Example
-///
-/// ```ignore
-/// use onwards::traits::{ResponseStore, StoreError};
-/// use async_trait::async_trait;
-/// use std::collections::HashMap;
-/// use std::sync::RwLock;
-///
-/// struct InMemoryStore {
-///     responses: RwLock<HashMap<String, serde_json::Value>>,
-/// }
-///
-/// #[async_trait]
-/// impl ResponseStore for InMemoryStore {
-///     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError> {
-///         let id = uuid::Uuid::new_v4().to_string();
-///         self.responses.write().unwrap().insert(id.clone(), response.clone());
-///         Ok(id)
-///     }
-///
-///     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-///         Ok(self.responses.read().unwrap().get(response_id).cloned())
-///     }
-/// }
-/// ```
+/// All methods have default no-op implementations, so existing `ResponseStore`
+/// implementations continue to compile without changes.
 #[async_trait]
 pub trait ResponseStore: Send + Sync {
-    /// Store a response and return its ID for future reference.
+    /// Pre-request: create a response record before proxying to the provider.
     ///
-    /// # Arguments
-    /// * `response` - The complete response object to store
+    /// Called by the responses handler before forwarding the request. The returned
+    /// ID becomes the canonical response ID (e.g. `resp_<uuid>`).
     ///
-    /// # Returns
-    /// * `Ok(String)` - The unique ID assigned to this response
-    /// * `Err(StoreError)` - If storage failed
+    /// The record should be in a "processing" or equivalent state so that
+    /// `GET /v1/responses/{id}` returns `status: in_progress` while the request
+    /// is in flight.
+    async fn create_pending(
+        &self,
+        request: &serde_json::Value,
+        model: &str,
+        endpoint: &str,
+    ) -> Result<String, StoreError> {
+        let _ = (request, model, endpoint);
+        Ok(format!("resp_{}", uuid_simple()))
+    }
+
+    /// Post-request: mark the response as completed with the response body.
+    async fn complete(
+        &self,
+        response_id: &str,
+        response: &serde_json::Value,
+        status_code: u16,
+    ) -> Result<(), StoreError> {
+        let _ = (response_id, response, status_code);
+        Ok(())
+    }
+
+    /// Post-request: mark the response as failed.
+    async fn fail(
+        &self,
+        response_id: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        let _ = (response_id, error);
+        Ok(())
+    }
+
+    /// Retrieve a response by ID (for `GET /v1/responses/{id}`).
+    async fn get(
+        &self,
+        response_id: &str,
+    ) -> Result<Option<serde_json::Value>, StoreError> {
+        let _ = response_id;
+        Ok(None)
+    }
+
+    /// Store a completed response and return its ID for future reference.
+    ///
+    /// Used by the adapter after constructing the final `ResponsesResponse`.
     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError>;
 
     /// Retrieve the context (items/messages) for a previous response.
     ///
-    /// # Arguments
-    /// * `response_id` - The ID returned from a previous `store()` call
-    ///
-    /// # Returns
-    /// * `Ok(Some(Value))` - The stored context if found
-    /// * `Ok(None)` - If no response exists with this ID
-    /// * `Err(StoreError)` - If retrieval failed
+    /// Used to resolve `previous_response_id` — the adapter extracts output items
+    /// from the stored response and prepends them as conversation context.
     async fn get_context(&self, response_id: &str)
     -> Result<Option<serde_json::Value>, StoreError>;
 }
