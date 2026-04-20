@@ -350,6 +350,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_responses_handler_calls_response_store_lifecycle() {
+        use crate::traits::response_store::tests::TrackingResponseStore;
+
+        // Create a test app state with a tracking response store
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id": "chatcmpl-abc123",
+            "object": "chat.completion",
+            "created": 1700000000,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 5,
+                "completion_tokens": 3,
+                "total_tokens": 8
+            }
+        }"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let tracking_store = Arc::new(TrackingResponseStore::default());
+
+        let state = AppState::with_client(targets, mock_client)
+            .with_response_store(tracking_store.clone() as Arc<dyn crate::ResponseStore>);
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model": "gpt-4o", "input": "Hi"}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Verify lifecycle: create_pending was called once
+        assert_eq!(
+            tracking_store.pending_count(),
+            1,
+            "create_pending should be called once"
+        );
+
+        // Verify lifecycle: complete was called once
+        assert_eq!(
+            tracking_store.completed_count(),
+            1,
+            "complete should be called once on success"
+        );
+
+        // Verify the response ID matches what the store assigned
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let response_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let response_id = response_json["id"].as_str().unwrap();
+        assert!(response_id.starts_with("resp_"));
+        assert_eq!(
+            Some(response_id.to_string()),
+            tracking_store.last_pending_id(),
+            "Response ID should match the store-assigned ID"
+        );
+        assert_eq!(
+            Some(response_id.to_string()),
+            tracking_store.last_completed_id(),
+            "Completed ID should match the response ID"
+        );
+
+        // No failures
+        assert_eq!(tracking_store.failed_count(), 0);
+    }
+
+    #[tokio::test]
     async fn test_adapter_with_instructions() {
         let (state, mock_client) = create_adapter_test_app_state();
         let router = build_strict_router(state);

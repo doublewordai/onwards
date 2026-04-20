@@ -145,7 +145,7 @@ fn uuid_simple() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -161,5 +161,132 @@ mod tests {
         let response = serde_json::json!({"test": "value"});
         let id = store.store(&response).await.unwrap();
         assert!(id.starts_with("noop_"));
+    }
+
+    #[tokio::test]
+    async fn test_noop_create_pending_returns_resp_prefix() {
+        let store = NoOpResponseStore;
+        let request = serde_json::json!({"model": "gpt-4o", "input": "hello"});
+        let id = store
+            .create_pending(&request, "gpt-4o", "/v1/responses")
+            .await
+            .unwrap();
+        assert!(
+            id.starts_with("resp_"),
+            "create_pending should return resp_ prefixed ID, got: {id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_noop_complete_is_noop() {
+        let store = NoOpResponseStore;
+        let result = store
+            .complete("resp_123", &serde_json::json!({"status": "completed"}), 200)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_noop_fail_is_noop() {
+        let store = NoOpResponseStore;
+        let result = store.fail("resp_123", "some error").await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_noop_get_returns_none() {
+        let store = NoOpResponseStore;
+        let result = store.get("resp_123").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    /// A test store that tracks lifecycle calls for verifying handler integration.
+    /// Exported for use in integration tests across the crate.
+    #[derive(Default)]
+    pub struct TrackingResponseStore {
+        inner: std::sync::Mutex<TrackingState>,
+    }
+
+    #[derive(Default)]
+    struct TrackingState {
+        pending: Vec<(String, String, String)>, // (id, model, endpoint)
+        completed: Vec<(String, u16)>,          // (id, status_code)
+        failed: Vec<(String, String)>,          // (id, error)
+        stored: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl ResponseStore for TrackingResponseStore {
+        async fn create_pending(
+            &self,
+            _request: &serde_json::Value,
+            model: &str,
+            endpoint: &str,
+        ) -> Result<String, StoreError> {
+            let id = format!("resp_{}", uuid_simple());
+            self.inner.lock().unwrap().pending.push((
+                id.clone(),
+                model.to_string(),
+                endpoint.to_string(),
+            ));
+            Ok(id)
+        }
+
+        async fn complete(
+            &self,
+            response_id: &str,
+            _response: &serde_json::Value,
+            status_code: u16,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .completed
+                .push((response_id.to_string(), status_code));
+            Ok(())
+        }
+
+        async fn fail(&self, response_id: &str, error: &str) -> Result<(), StoreError> {
+            self.inner
+                .lock()
+                .unwrap()
+                .failed
+                .push((response_id.to_string(), error.to_string()));
+            Ok(())
+        }
+
+        async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError> {
+            self.inner.lock().unwrap().stored.push(response.clone());
+            Ok(format!("noop_{}", uuid_simple()))
+        }
+
+        async fn get_context(
+            &self,
+            _response_id: &str,
+        ) -> Result<Option<serde_json::Value>, StoreError> {
+            Ok(None)
+        }
+    }
+
+    impl TrackingResponseStore {
+        pub fn pending_count(&self) -> usize {
+            self.inner.lock().unwrap().pending.len()
+        }
+
+        pub fn completed_count(&self) -> usize {
+            self.inner.lock().unwrap().completed.len()
+        }
+
+        pub fn failed_count(&self) -> usize {
+            self.inner.lock().unwrap().failed.len()
+        }
+
+        pub fn last_pending_id(&self) -> Option<String> {
+            self.inner.lock().unwrap().pending.last().map(|p| p.0.clone())
+        }
+
+        pub fn last_completed_id(&self) -> Option<String> {
+            self.inner.lock().unwrap().completed.last().map(|c| c.0.clone())
+        }
     }
 }
