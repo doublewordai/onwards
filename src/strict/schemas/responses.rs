@@ -215,6 +215,17 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextConfig>,
 
+    /// Whether to run the response in background mode.
+    /// When true, the response is returned immediately with status `queued`
+    /// and the client polls `GET /v1/responses/{id}` for completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+
+    /// Processing tier: "auto", "default", "priority", "flex", "scale".
+    /// Controls routing and pricing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+
     /// Additional fields not explicitly modeled
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
@@ -804,6 +815,8 @@ pub struct ResponsesStreamingEvent {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStatus {
+    /// Response is queued for processing (background mode)
+    Queued,
     /// Response is being generated
     InProgress,
     /// Response completed successfully

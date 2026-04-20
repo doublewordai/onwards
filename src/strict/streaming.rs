@@ -998,6 +998,8 @@ mod tests {
             user: None,
             reasoning: None,
             text: None,
+            background: None,
+            service_tier: None,
             extra: None,
         }
     }
