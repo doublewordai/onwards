@@ -27,9 +27,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Returns the tracer provider if OTLP export was enabled. The caller must
 /// hold this and call `provider.shutdown()` before exit to flush pending spans.
 pub fn init_telemetry() -> anyhow::Result<Option<SdkTracerProvider>> {
-    let env_filter = EnvFilter::new(
-        std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
-    );
+    let env_filter =
+        EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
 
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
         let (tracer, provider) = create_otlp_tracer()?;
@@ -48,14 +47,15 @@ pub fn init_telemetry() -> anyhow::Result<Option<SdkTracerProvider>> {
             .with(tracing_subscriber::fmt::layer().compact())
             .try_init()?;
 
-        info!("Telemetry initialized (OTLP export disabled — set OTEL_EXPORTER_OTLP_ENDPOINT to enable)");
+        info!(
+            "Telemetry initialized (OTLP export disabled — set OTEL_EXPORTER_OTLP_ENDPOINT to enable)"
+        );
         Ok(None)
     }
 }
 
 fn create_otlp_tracer() -> anyhow::Result<(opentelemetry_sdk::trace::Tracer, SdkTracerProvider)> {
-    let service_name =
-        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "onwards".to_string());
+    let service_name = std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "onwards".to_string());
 
     let base = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://localhost:4318".to_string());

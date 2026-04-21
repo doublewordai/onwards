@@ -45,10 +45,7 @@ impl std::error::Error for StoreError {}
 #[async_trait]
 pub trait ResponseStore: Send + Sync {
     /// Retrieve a response by ID (for `GET /v1/responses/{id}`).
-    async fn get(
-        &self,
-        response_id: &str,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         let _ = response_id;
         Ok(None)
     }
