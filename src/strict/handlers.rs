@@ -191,44 +191,13 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
 
-    // Create a pending response record before proxying
-    let request_value = match serde_json::to_value(&request) {
-        Ok(v) => v,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize request for store");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
-    let response_id = match state
-        .response_store
-        .create_pending(&request_value, &request.model, "/v1/responses")
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            error!(error = %e, "Failed to create pending response");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to create response record",
-            );
-        }
-    };
-
-    debug!(response_id = %response_id, "Created pending response");
-
     // Check if we should use the adapter for this target
     let use_adapter = should_use_adapter(&state, &request.model, bearer_token);
 
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request, extensions, response_id).await;
+        return handle_adapter_request(state, headers, request, extensions).await;
     }
 
     // Passthrough mode: forward request as-is
@@ -292,28 +261,6 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     } else {
         sanitize_error_response(response).await
     };
-
-    // Update response store based on outcome
-    if final_response.status().is_success() {
-        // For passthrough, we complete with the raw response — we can't easily
-        // extract the body without consuming it, so we store the response_id mapping only.
-        // The provider's response already contains its own ID; downstream consumers
-        // (GET /v1/responses/{id}) will use the fusillade row.
-        if let Err(e) = state.response_store.complete(
-            &response_id,
-            &serde_json::json!({"passthrough": true}),
-            final_response.status().as_u16(),
-        ).await {
-            warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
-        }
-    } else {
-        if let Err(e) = state.response_store.fail(
-            &response_id,
-            &format!("Upstream returned {}", final_response.status()),
-        ).await {
-            warn!(error = %e, response_id = %response_id, "Failed to mark response as failed");
-        }
-    }
 
     final_response
 }
@@ -505,7 +452,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     mut request: ResponsesRequest,
     extensions: axum::http::Extensions,
-    response_id: String,
 ) -> Response {
     let adapter =
         OpenResponsesAdapter::new(state.response_store.clone(), state.tool_executor.clone());
@@ -642,7 +588,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             chat_request,
             server_tool_names,
             ctx,
-            response_id,
         )
         .await;
     }
@@ -696,13 +641,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
         // Check if the response is successful
         if !response.status().is_success() {
-            // Mark as failed in the response store
-            if let Err(e) = state.response_store.fail(
-                &response_id,
-                &format!("Upstream returned {}", response.status()),
-            ).await {
-                warn!(error = %e, response_id = %response_id, "Failed to mark response as failed");
-            }
             // Pass through error responses
             return response;
         }
@@ -843,9 +781,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             aggregate_response_usage,
         );
 
-        // Patch the response ID to use our store-assigned ID
-        responses_response.id = response_id.clone();
-
         info!(
             response_id = %responses_response.id,
             status = ?responses_response.status,
@@ -853,17 +788,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             iterations = iteration,
             "Adapter conversion complete"
         );
-
-        // Mark as completed in the response store
-        if let Ok(response_value) = serde_json::to_value(&responses_response) {
-            if let Err(e) = state.response_store.complete(
-                &response_id,
-                &response_value,
-                parts.status.as_u16(),
-            ).await {
-                warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
-            }
-        }
 
         // Return the converted response
         let response_bytes = match serde_json::to_vec(&responses_response) {
@@ -906,7 +830,6 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     mut chat_request: ChatCompletionRequest,
     server_tool_names: HashSet<String>,
     ctx: RequestContext,
-    _response_id: String,
 ) -> Response {
     // Ensure stream is enabled on the chat request
     chat_request.stream = Some(true);

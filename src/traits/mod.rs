@@ -6,7 +6,7 @@
 //! - **ResponseStore**: Persistent storage for `previous_response_id` support
 //! - **ToolExecutor**: Server-side tool execution during agent loops
 
-pub(crate) mod response_store;
+mod response_store;
 mod tool_executor;
 
 pub use response_store::{NoOpResponseStore, ResponseStore, StoreError};
