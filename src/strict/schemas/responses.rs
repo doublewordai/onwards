@@ -221,7 +221,7 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
 
-    /// Processing tier: "auto", "default", "priority", "flex", "scale".
+    /// Processing tier: "auto", "default", "priority", "flex".
     /// Controls routing and pricing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
