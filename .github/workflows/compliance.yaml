@@ -30,7 +30,11 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
-        run: git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
+        # Pinned before WebSocket/compact tests were added (PR #71).
+        # Update this once onwards supports WebSocket transport.
+        run: |
+          git clone https://github.com/openresponses/openresponses /tmp/openresponses
+          cd /tmp/openresponses && git checkout fa29df5
 
       - name: Install openresponses dependencies
         run: cd /tmp/openresponses && bun install

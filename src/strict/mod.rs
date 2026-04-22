@@ -104,8 +104,7 @@ pub(crate) fn merge_usage_details(
         (None, None) => None,
         (Some(v), None) | (None, Some(v)) => Some(v),
         (Some(prev), Some(next)) => {
-            let (Some(mut merged), Some(next_obj)) =
-                (prev.as_object().cloned(), next.as_object())
+            let (Some(mut merged), Some(next_obj)) = (prev.as_object().cloned(), next.as_object())
             else {
                 return Some(next);
             };

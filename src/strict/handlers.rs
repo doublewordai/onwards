@@ -150,6 +150,9 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 /// Validates the request against the Open Responses schema. If the target has
 /// `open_responses.adapter: true`, the request is processed through the adapter.
 /// Otherwise, it's forwarded to the upstream as-is.
+///
+/// In both modes, the response store is called to track the request lifecycle:
+/// `create_pending` before proxying, `complete`/`fail` after.
 pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
@@ -177,6 +180,8 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         model = %request.model,
         has_previous_response_id = request.previous_response_id.is_some(),
         stream = ?request.stream,
+        background = ?request.background,
+        service_tier = ?request.service_tier,
         "Responses request validated"
     );
 
@@ -237,7 +242,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/responses", body_bytes).await;
+    } = forward_request(state.clone(), headers, "/responses", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers

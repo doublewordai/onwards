@@ -94,6 +94,7 @@ impl ProviderPool {
     }
 
     /// Create a new provider pool with pool-level configuration
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         providers: Vec<Provider>,
         keys: Option<KeySet>,
@@ -370,14 +371,17 @@ impl ProviderPool {
                     && old_p.target.onwards_key == new_provider.target.onwards_key
                     && old_p.target.onwards_model == new_provider.target.onwards_model
             }) {
-                new_provider.limiter.adopt_active_counter(&old_provider.limiter);
+                new_provider
+                    .limiter
+                    .adopt_active_counter(&old_provider.limiter);
             }
         }
 
         // Preserve pool-level concurrency counter if both old and new have one
-        if let (Some(new_limiter), Some(old_limiter)) =
-            (&mut self.pool_concurrency_limiter, &old.pool_concurrency_limiter)
-        {
+        if let (Some(new_limiter), Some(old_limiter)) = (
+            &mut self.pool_concurrency_limiter,
+            &old.pool_concurrency_limiter,
+        ) {
             new_limiter.adopt_active_counter(old_limiter);
         }
     }
@@ -1216,8 +1220,14 @@ mod tests {
 
         let old_active_0 = old_pool.providers()[0].active_connections();
         let old_active_1 = old_pool.providers()[1].active_connections();
-        assert!(old_active_0 > 0, "Should have active connections on provider 0");
-        assert!(old_active_1 > 0, "Should have active connections on provider 1");
+        assert!(
+            old_active_0 > 0,
+            "Should have active connections on provider 0"
+        );
+        assert!(
+            old_active_1 > 0,
+            "Should have active connections on provider 1"
+        );
 
         // Create a new pool (simulating a config reload) and adopt state
         let new_providers = vec![
@@ -1244,9 +1254,10 @@ mod tests {
 
     #[test]
     fn test_adopt_provider_state_new_provider_starts_at_zero() {
-        let old_providers = vec![
-            Provider::new(create_test_target("https://api1.example.com"), 1),
-        ];
+        let old_providers = vec![Provider::new(
+            create_test_target("https://api1.example.com"),
+            1,
+        )];
         let old_pool = ProviderPool::new(old_providers);
 
         // Accumulate connections on old pool
@@ -1281,9 +1292,10 @@ mod tests {
             .collect();
 
         // New pool removes api2
-        let new_providers = vec![
-            Provider::new(create_test_target("https://api1.example.com"), 1),
-        ];
+        let new_providers = vec![Provider::new(
+            create_test_target("https://api1.example.com"),
+            1,
+        )];
         let mut new_pool = ProviderPool::new(new_providers);
         new_pool.adopt_provider_state(&old_pool);
 
@@ -1297,7 +1309,10 @@ mod tests {
         use crate::target::ConcurrencyLimiter;
 
         let old_pool = ProviderPool::with_config(
-            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            vec![Provider::new(
+                create_test_target("https://api1.example.com"),
+                1,
+            )],
             None,
             None,
             Some(ConcurrencyLimiter::with_limit(100)),
@@ -1313,7 +1328,10 @@ mod tests {
         assert_eq!(old_pool.pool_concurrency_limiter().unwrap().active(), 2);
 
         let mut new_pool = ProviderPool::with_config(
-            vec![Provider::new(create_test_target("https://api1.example.com"), 1)],
+            vec![Provider::new(
+                create_test_target("https://api1.example.com"),
+                1,
+            )],
             None,
             None,
             Some(ConcurrencyLimiter::with_limit(200)), // new limit
@@ -1328,6 +1346,9 @@ mod tests {
         // Should have adopted the active count
         assert_eq!(new_pool.pool_concurrency_limiter().unwrap().active(), 2);
         // But the new limit should apply
-        assert_eq!(new_pool.pool_concurrency_limiter().unwrap().limit(), Some(200));
+        assert_eq!(
+            new_pool.pool_concurrency_limiter().unwrap().limit(),
+            Some(200)
+        );
     }
 }

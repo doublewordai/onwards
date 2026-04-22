@@ -42,10 +42,7 @@ struct HeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for HeaderInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        if let (Ok(name), Ok(val)) = (
-            key.parse::<HeaderName>(),
-            HeaderValue::from_str(&value),
-        ) {
+        if let (Ok(name), Ok(val)) = (key.parse::<HeaderName>(), HeaderValue::from_str(&value)) {
             self.0.insert(name, val);
         }
     }
@@ -334,8 +331,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
-    if !pool.routing_rules().is_empty() {
-        if let Some(token) = bearer_token {
+    if !pool.routing_rules().is_empty()
+        && let Some(token) = bearer_token
+    {
             let labels = state
                 .targets
                 .key_labels
@@ -377,7 +375,6 @@ pub async fn target_message_handler<T: HttpClient>(
                     }
                 }
             }
-        }
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
