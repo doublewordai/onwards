@@ -1,9 +1,7 @@
-//! Response storage trait for stateful conversations and response lifecycle tracking.
+//! Response storage trait for stateful conversations
 //!
-//! Implement this trait to enable:
-//! - `previous_response_id` support in the Open Responses adapter
-//! - Response lifecycle tracking (create → complete/fail) for `GET /v1/responses/{id}`
-//! - `background` mode where responses are created before proxying and polled later
+//! Implement this trait to enable `previous_response_id` support in the Open Responses adapter.
+//! The adapter will use this store to persist responses and retrieve context for follow-up requests.
 
 use async_trait::async_trait;
 use std::fmt;
@@ -31,34 +29,58 @@ impl fmt::Display for StoreError {
 
 impl std::error::Error for StoreError {}
 
-/// Trait for response storage and retrieval.
+/// Trait for storing and retrieving response context.
 ///
-/// Implement this to enable:
-/// - **Conversation state**: `get_context` retrieves previous response context for
-///   `previous_response_id` support in the adapter.
-/// - **Response retrieval**: `get` retrieves a response by ID for `GET /v1/responses/{id}`.
-/// - **Adapter storage**: `store` persists a completed response (used by the adapter
-///   after constructing the final response).
+/// Implement this to enable `previous_response_id` support in the Open Responses adapter.
+/// When a client sends a request with `previous_response_id`, the adapter will use this
+/// store to retrieve the conversation context.
 ///
-/// Request lifecycle management (creating pending records, completing/failing them)
-/// is handled externally (e.g. by dwctl middleware and outlet handlers), not by this trait.
+/// # Example
+///
+/// ```ignore
+/// use onwards::traits::{ResponseStore, StoreError};
+/// use async_trait::async_trait;
+/// use std::collections::HashMap;
+/// use std::sync::RwLock;
+///
+/// struct InMemoryStore {
+///     responses: RwLock<HashMap<String, serde_json::Value>>,
+/// }
+///
+/// #[async_trait]
+/// impl ResponseStore for InMemoryStore {
+///     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError> {
+///         let id = uuid::Uuid::new_v4().to_string();
+///         self.responses.write().unwrap().insert(id.clone(), response.clone());
+///         Ok(id)
+///     }
+///
+///     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
+///         Ok(self.responses.read().unwrap().get(response_id).cloned())
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait ResponseStore: Send + Sync {
-    /// Retrieve a response by ID (for `GET /v1/responses/{id}`).
-    async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        let _ = response_id;
-        Ok(None)
-    }
-
-    /// Store a completed response and return its ID for future reference.
+    /// Store a response and return its ID for future reference.
     ///
-    /// Used by the adapter after constructing the final `ResponsesResponse`.
+    /// # Arguments
+    /// * `response` - The complete response object to store
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The unique ID assigned to this response
+    /// * `Err(StoreError)` - If storage failed
     async fn store(&self, response: &serde_json::Value) -> Result<String, StoreError>;
 
     /// Retrieve the context (items/messages) for a previous response.
     ///
-    /// Used to resolve `previous_response_id` — the adapter extracts output items
-    /// from the stored response and prepends them as conversation context.
+    /// # Arguments
+    /// * `response_id` - The ID returned from a previous `store()` call
+    ///
+    /// # Returns
+    /// * `Ok(Some(Value))` - The stored context if found
+    /// * `Ok(None)` - If no response exists with this ID
+    /// * `Err(StoreError)` - If retrieval failed
     async fn get_context(&self, response_id: &str)
     -> Result<Option<serde_json::Value>, StoreError>;
 }
@@ -118,12 +140,5 @@ mod tests {
         let response = serde_json::json!({"test": "value"});
         let id = store.store(&response).await.unwrap();
         assert!(id.starts_with("noop_"));
-    }
-
-    #[tokio::test]
-    async fn test_noop_get_returns_none() {
-        let store = NoOpResponseStore;
-        let result = store.get("resp_123").await.unwrap();
-        assert!(result.is_none());
     }
 }
