@@ -15,8 +15,10 @@ categories = ["web-programming", "api-bindings"]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
 async-stream = "0.3"
 async-trait = "0.1.88"
+brotli = "8"
 bytes = "1.10"
 axum = "0.8.4"
+flate2 = "1"
 clap = { version = "4.5.40", features = ["derive", "env"] }
 dashmap = "6.1.0"
 futures-util = "0.3"

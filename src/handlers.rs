@@ -916,6 +916,19 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         }
 
+        // Override the response `id` field for /responses requests when the
+        // caller supplied a response ID via the configured header.
+        if let Some(ref header_name) = state.response_id_header
+            && path_and_query.contains("/responses")
+            && (200..300).contains(&status)
+        {
+            if let Some(override_id) =
+                crate::response_id::extract_override_id(&original_headers, header_name)
+            {
+                crate::response_id::patch_response_body_id(&mut response, override_id).await;
+            }
+        }
+
         // Add custom response headers
         if let Some(headers) = response_headers {
             for (key, value) in headers.iter() {
@@ -1779,6 +1792,7 @@ mod tests {
             body_transform_fn: None,
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
         };

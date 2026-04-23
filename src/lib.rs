@@ -51,6 +51,7 @@ pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
 pub mod models;
+pub mod response_id;
 pub mod response_sanitizer;
 pub mod sse;
 pub mod strict;
@@ -202,6 +203,13 @@ pub struct AppState<T: HttpClient> {
     /// use the streaming path before forwarding (since the body transform runs
     /// too late for that decision). Defaults to `None` (header check disabled).
     pub streaming_header: Option<String>,
+    /// Header name whose value overrides the generated `id` in Responses API
+    /// responses. When set, the handler reads this header from the incoming
+    /// request and uses its value (prefixed with `resp_` if not already) as the
+    /// response object's `id` field. This lets callers (e.g. dwctl, fusillade)
+    /// correlate responses with pre-created tracking records without needing to
+    /// patch the response body after the fact.
+    pub response_id_header: Option<String>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub response_store: Arc<dyn ResponseStore>,
 }
@@ -220,6 +228,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
             .field("streaming_header", &self.streaming_header)
+            .field("response_id_header", &self.response_id_header)
             .field("tool_executor", &"<dyn ToolExecutor>")
             .field("response_store", &"<dyn ResponseStore>")
             .finish()
@@ -242,6 +251,7 @@ impl AppState<HyperClient> {
             body_transform_fn: None,
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -262,6 +272,7 @@ impl AppState<HyperClient> {
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -277,6 +288,7 @@ impl<T: HttpClient> AppState<T> {
             body_transform_fn: None,
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -294,6 +306,7 @@ impl<T: HttpClient> AppState<T> {
             body_transform_fn: Some(body_transform_fn),
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
         }
@@ -303,6 +316,12 @@ impl<T: HttpClient> AppState<T> {
     /// Used by the responses adapter to decide streaming vs non-streaming before forwarding.
     pub fn with_streaming_header(mut self, header: impl Into<String>) -> Self {
         self.streaming_header = Some(header.into());
+        self
+    }
+
+    /// Set the header name whose value overrides the Responses API `id` field.
+    pub fn with_response_id_header(mut self, header: impl Into<String>) -> Self {
+        self.response_id_header = Some(header.into());
         self
     }
 
