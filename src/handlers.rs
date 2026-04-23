@@ -452,6 +452,16 @@ pub async fn target_message_handler<T: HttpClient>(
         .unwrap_or(req.uri().path())
         .to_string();
 
+    // When the response_id_header is configured and this is a /responses
+    // request, strip Accept-Encoding so the upstream returns uncompressed JSON
+    // that we can patch the `id` field in. Without this, gzip/brotli responses
+    // can't be parsed for ID injection.
+    let needs_response_id_patch = state.response_id_header.is_some()
+        && path_and_query.contains("/responses");
+    if needs_response_id_patch {
+        req.headers_mut().remove(axum::http::header::ACCEPT_ENCODING);
+    }
+
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
@@ -911,6 +921,57 @@ pub async fn target_message_handler<T: HttpClient>(
                     Err(e) => {
                         error!("Response sanitization failed: {}", e);
                         return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+                    }
+                }
+            }
+        }
+
+        // Override the response `id` field for /responses requests when the
+        // caller supplied a response ID via the configured header. This is the
+        // non-strict mode equivalent of the logic in strict/handlers.rs.
+        if let Some(ref header_name) = state.response_id_header
+            && path_and_query.contains("/responses")
+            && (200..300).contains(&status)
+        {
+            if let Some(override_id) = original_headers
+                .get(header_name.as_str())
+                .and_then(|v| v.to_str().ok())
+            {
+                let override_id = if override_id.starts_with("resp_") {
+                    override_id.to_string()
+                } else {
+                    format!("resp_{override_id}")
+                };
+
+                // Read, patch, and rewrite the body. For SSE streams this is a
+                // no-op (the ID is in the JSON chunks, not patchable here without
+                // buffering — strict mode handles that).
+                let is_json = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|ct| ct.contains("application/json"));
+
+                if is_json {
+                    if let Ok(bytes) = axum::body::to_bytes(
+                        std::mem::take(response.body_mut()),
+                        usize::MAX,
+                    ).await {
+                        if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                            if json.get("id").is_some() {
+                                json["id"] = serde_json::Value::String(override_id);
+                            }
+                            let patched = serde_json::to_vec(&json).unwrap_or_else(|_| bytes.to_vec());
+                            let content_length = patched.len();
+                            *response.body_mut() = axum::body::Body::from(patched);
+                            response.headers_mut().remove(TRANSFER_ENCODING);
+                            response.headers_mut().insert(
+                                CONTENT_LENGTH,
+                                HeaderValue::from(content_length),
+                            );
+                        } else {
+                            *response.body_mut() = axum::body::Body::from(bytes);
+                        }
                     }
                 }
             }
@@ -1779,6 +1840,7 @@ mod tests {
             body_transform_fn: None,
             response_transform_fn: None,
             streaming_header: None,
+            response_id_header: None,
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
         };

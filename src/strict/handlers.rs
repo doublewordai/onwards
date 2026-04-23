@@ -191,6 +191,20 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "));
 
+    // Extract response ID override from configured header (if any).
+    let response_id_override = state
+        .response_id_header
+        .as_ref()
+        .and_then(|name| headers.get(name.as_str()))
+        .and_then(|v| v.to_str().ok())
+        .map(|id| {
+            if id.starts_with("resp_") {
+                id.to_string()
+            } else {
+                format!("resp_{id}")
+            }
+        });
+
     // Create a pending response record before proxying
     let request_value = match serde_json::to_value(&request) {
         Ok(v) => v,
@@ -222,13 +236,19 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 
     debug!(response_id = %response_id, "Created pending response");
 
+    // For the adapter path, use the header-supplied ID if present, otherwise
+    // fall back to the store-generated ID. For the passthrough sanitizer path,
+    // only the header override is used (the upstream provider's ID is preserved
+    // if no override was set).
+    let effective_response_id = response_id_override.clone().unwrap_or(response_id.clone());
+
     // Check if we should use the adapter for this target
     let use_adapter = should_use_adapter(&state, &request.model, bearer_token);
 
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request, extensions, response_id).await;
+        return handle_adapter_request(state, headers, request, extensions, effective_response_id).await;
     }
 
     // Passthrough mode: forward request as-is
@@ -282,9 +302,9 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let response_is_sse = response_is_sse(&response);
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_responses_response(response, resolved_model, trusted).await
+            sanitize_streaming_responses_response(response, resolved_model, trusted, response_id_override).await
         } else {
-            sanitize_responses_response(response, resolved_model).await
+            sanitize_responses_response(response, resolved_model, response_id_override).await
         }
     } else if trusted || internal_error {
         debug!(model = %resolved_model, "Bypassing error sanitization for trusted provider");
@@ -642,7 +662,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             chat_request,
             server_tool_names,
             ctx,
-            response_id,
+            response_id.clone(),
         )
         .await;
     }
@@ -786,11 +806,12 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                 let aggregate_response_usage = accumulated_usage
                     .as_ref()
                     .map(super::chat_usage_to_response_usage);
-                let responses_response = adapter.to_responses_response_with_usage(
+                let mut responses_response = adapter.to_responses_response_with_usage(
                     &chat_response,
                     &request,
                     aggregate_response_usage,
                 );
+                responses_response.id = response_id.clone();
 
                 let response_bytes = match serde_json::to_vec(&responses_response) {
                     Ok(bytes) => bytes,
@@ -842,8 +863,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             &request,
             aggregate_response_usage,
         );
-
-        // Patch the response ID to use our store-assigned ID
         responses_response.id = response_id.clone();
 
         info!(
@@ -906,7 +925,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     mut chat_request: ChatCompletionRequest,
     server_tool_names: HashSet<String>,
     ctx: RequestContext,
-    _response_id: String,
+    response_id: String,
 ) -> Response {
     // Ensure stream is enabled on the chat request
     chat_request.stream = Some(true);
@@ -962,6 +981,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     // Open Responses events, with tool loop support.
     let transformed_stream = async_stream::stream! {
         let mut streaming_state = StreamingState::new(&request);
+        streaming_state.set_response_id(response_id.clone());
         let mut messages = chat_request.messages.clone();
         let mut current_body = Some(first_body);
         let mut iteration = 0u32;
@@ -1812,7 +1832,7 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
 ///
 /// Deserializes the response through our strict schema (drops extra fields),
 /// rewrites the model field, and re-serializes.
-async fn sanitize_responses_response(mut response: Response, original_model: String) -> Response {
+async fn sanitize_responses_response(mut response: Response, original_model: String, response_id_override: Option<String>) -> Response {
     let body_bytes =
         match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
@@ -1854,6 +1874,10 @@ async fn sanitize_responses_response(mut response: Response, original_model: Str
 
     // Rewrite model field
     responses_response.model = original_model;
+    // Override response ID if configured header was present on the request.
+    if let Some(id) = response_id_override {
+        responses_response.id = id;
+    }
 
     match serde_json::to_vec(&responses_response) {
         Ok(sanitized_bytes) => {
@@ -1899,6 +1923,7 @@ async fn sanitize_streaming_responses_response(
     mut response: Response,
     original_model: String,
     trusted: bool,
+    response_id_override: Option<String>,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
@@ -1906,7 +1931,8 @@ async fn sanitize_streaming_responses_response(
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
-    let stream_fallback_response_id = generated_response_id();
+    let response_id_override = response_id_override.clone();
+    let stream_fallback_response_id = response_id_override.clone().unwrap_or_else(generated_response_id);
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
         match chunk_result {
@@ -1960,9 +1986,13 @@ async fn sanitize_streaming_responses_response(
 
                         match serde_json::from_value::<ResponsesStreamingEvent>(raw_event) {
                             Ok(mut event) => {
-                                // Rewrite model on response-level events
+                                // Rewrite model on response-level events, and
+                                // override the ID if a caller-supplied override was set.
                                 if let Some(ref mut response) = event.response {
                                     response.model = original_model.clone();
+                                    if response_id_override.is_some() {
+                                        response.id = stream_fallback_response_id.clone();
+                                    }
                                 }
 
                                 // Re-serialize
@@ -3783,7 +3813,7 @@ mod tests {
             .unwrap();
 
         let result =
-            sanitize_streaming_responses_response(response, "test-model".to_string(), true).await;
+            sanitize_streaming_responses_response(response, "test-model".to_string(), true, None).await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)

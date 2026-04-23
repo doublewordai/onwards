@@ -128,6 +128,11 @@ impl StreamingState {
         }
     }
 
+    /// Override the generated response ID with a caller-supplied value.
+    pub fn set_response_id(&mut self, id: String) {
+        self.response_id = id;
+    }
+
     /// Process a chat completion chunk and return semantic events
     pub fn process_chunk(&mut self, chunk: &ChatCompletionChunk) -> Vec<StreamingEvent> {
         let mut events = Vec::new();
