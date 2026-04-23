@@ -51,6 +51,7 @@ pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
 pub mod models;
+pub mod response_id;
 pub mod response_sanitizer;
 pub mod sse;
 pub mod strict;

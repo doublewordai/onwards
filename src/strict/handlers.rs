@@ -195,15 +195,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let response_id_override = state
         .response_id_header
         .as_ref()
-        .and_then(|name| headers.get(name.as_str()))
-        .and_then(|v| v.to_str().ok())
-        .map(|id| {
-            if id.starts_with("resp_") {
-                id.to_string()
-            } else {
-                format!("resp_{id}")
-            }
-        });
+        .and_then(|name| crate::response_id::extract_override_id(&headers, name));
 
     // Create a pending response record before proxying
     let request_value = match serde_json::to_value(&request) {
