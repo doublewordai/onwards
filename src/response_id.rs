@@ -27,6 +27,19 @@ pub fn extract_override_id(headers: &HeaderMap, header_name: &str) -> Option<Str
         })
 }
 
+/// Returns true if response bodies at this path expose a top-level `id` field
+/// that the caller may want to override via the configured header.
+///
+/// Currently: `/v1/responses` (Open Responses API) and `/v1/chat/completions`
+/// (OpenAI-compatible chat completions). Query strings and trailing slashes
+/// are ignored; substring matches on other routes (e.g. `/responses-logs`)
+/// are rejected.
+pub fn path_supports_id_override(path_and_query: &str) -> bool {
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let path = path.trim_end_matches('/');
+    path.ends_with("/responses") || path.ends_with("/chat/completions")
+}
+
 /// Patch the `id` field in a JSON response body with the given override.
 ///
 /// Handles `Content-Encoding: gzip` and `Content-Encoding: br` transparently:
@@ -150,6 +163,49 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-other", HeaderValue::from_static("abc"));
         assert_eq!(extract_override_id(&headers, "x-custom-id"), None);
+    }
+
+    // --- path_supports_id_override ---
+
+    #[test]
+    fn path_supports_id_override_responses() {
+        assert!(path_supports_id_override("/v1/responses"));
+        assert!(path_supports_id_override("/responses"));
+    }
+
+    #[test]
+    fn path_supports_id_override_chat_completions() {
+        assert!(path_supports_id_override("/v1/chat/completions"));
+        assert!(path_supports_id_override("/chat/completions"));
+    }
+
+    #[test]
+    fn path_supports_id_override_with_query_string() {
+        assert!(path_supports_id_override("/v1/chat/completions?stream=true"));
+        assert!(path_supports_id_override("/v1/responses?foo=bar"));
+    }
+
+    #[test]
+    fn path_supports_id_override_trailing_slash() {
+        assert!(path_supports_id_override("/v1/chat/completions/"));
+        assert!(path_supports_id_override("/v1/responses/"));
+    }
+
+    #[test]
+    fn path_supports_id_override_rejects_other_paths() {
+        assert!(!path_supports_id_override("/v1/embeddings"));
+        assert!(!path_supports_id_override("/v1/completions"));
+        assert!(!path_supports_id_override("/v1/models"));
+        assert!(!path_supports_id_override("/"));
+        assert!(!path_supports_id_override(""));
+    }
+
+    #[test]
+    fn path_supports_id_override_rejects_substring_lookalikes() {
+        // The old `.contains()` implementation matched these; `.ends_with()` should not.
+        assert!(!path_supports_id_override("/v1/responses-logs"));
+        assert!(!path_supports_id_override("/v1/chat/completions/history"));
+        assert!(!path_supports_id_override("/responses_v2"));
     }
 
     // --- patch_response_body_id ---
