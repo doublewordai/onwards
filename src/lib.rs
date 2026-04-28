@@ -52,6 +52,7 @@ pub mod handlers;
 pub mod load_balancer;
 pub mod models;
 pub mod response_id;
+pub mod response_loop;
 pub mod response_sanitizer;
 pub mod sse;
 pub mod strict;
@@ -62,9 +63,10 @@ pub mod traits;
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+pub use response_loop::{LoopConfig, LoopError, run_response_loop};
 pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolSchema,
+    NextAction, NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StepDescriptor,
+    StepKind, StoreError, ToolError, ToolExecutor, ToolSchema,
 };
 
 /// Type alias for body transformation function

@@ -75,20 +75,13 @@ pub trait ResponseStore: Send + Sync {
     }
 
     /// Post-request: mark the response as failed.
-    async fn fail(
-        &self,
-        response_id: &str,
-        error: &str,
-    ) -> Result<(), StoreError> {
+    async fn fail(&self, response_id: &str, error: &str) -> Result<(), StoreError> {
         let _ = (response_id, error);
         Ok(())
     }
 
     /// Retrieve a response by ID (for `GET /v1/responses/{id}`).
-    async fn get(
-        &self,
-        response_id: &str,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         let _ = response_id;
         Ok(None)
     }
@@ -104,6 +97,175 @@ pub trait ResponseStore: Send + Sync {
     /// from the stored response and prepends them as conversation context.
     async fn get_context(&self, response_id: &str)
     -> Result<Option<serde_json::Value>, StoreError>;
+
+    // ====================================================================
+    // Multi-step orchestration (additive — default impls fall through)
+    // ====================================================================
+    //
+    // The following methods make the trait sufficient for
+    // [`crate::run_response_loop`] to drive a multi-step Open Responses
+    // request end-to-end. Implementations that don't support multi-step
+    // (e.g. `NoOpResponseStore`) inherit the default impls, which return
+    // `StoreError::StorageError` — `run_response_loop` will surface that
+    // as a `LoopError::Store` and exit cleanly.
+    //
+    // The "transition" + "assembly" responsibility lives in the
+    // implementor (per the plan, dwctl owns Open Responses domain logic);
+    // the loop itself is a free function that's purely a function of the
+    // chain-walk state these methods expose.
+
+    /// Decide the next action for a request given the chain so far.
+    ///
+    /// Called once per loop iteration. The implementor walks the existing
+    /// `response_steps` chain (filtered to `scope_parent`'s sub-loop), looks
+    /// at the most recent step's `response_payload`, and returns whether to
+    /// append more steps, complete, or fail.
+    ///
+    /// `scope_parent`:
+    /// - `None`  — the top-level chain (user-visible response)
+    /// - `Some(step_id)` — the sub-loop spawned by that step (sub-agent)
+    async fn next_action_for(
+        &self,
+        request_id: &str,
+        scope_parent: Option<&str>,
+    ) -> Result<NextAction, StoreError> {
+        let _ = (request_id, scope_parent);
+        Err(StoreError::StorageError(
+            "next_action_for not implemented".into(),
+        ))
+    }
+
+    /// Persist a new step row in `pending` state and return its id.
+    async fn record_step(
+        &self,
+        request_id: &str,
+        scope_parent: Option<&str>,
+        prev_step: Option<&str>,
+        descriptor: &StepDescriptor,
+        sequence: i64,
+    ) -> Result<String, StoreError> {
+        let _ = (request_id, scope_parent, prev_step, descriptor, sequence);
+        Err(StoreError::StorageError(
+            "record_step not implemented".into(),
+        ))
+    }
+
+    /// Transition a `pending` step to `processing`.
+    async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
+        let _ = step_id;
+        Err(StoreError::StorageError(
+            "mark_step_processing not implemented".into(),
+        ))
+    }
+
+    /// Persist a step's terminal output (transition to `completed`).
+    async fn complete_step(
+        &self,
+        step_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let _ = (step_id, payload);
+        Err(StoreError::StorageError(
+            "complete_step not implemented".into(),
+        ))
+    }
+
+    /// Persist a step's terminal error (transition to `failed`).
+    async fn fail_step(&self, step_id: &str, error: &serde_json::Value) -> Result<(), StoreError> {
+        let _ = (step_id, error);
+        Err(StoreError::StorageError("fail_step not implemented".into()))
+    }
+
+    /// Execute a `model_call` step: fire the upstream model and return the
+    /// raw response payload to persist in `response_payload`. The loop
+    /// will call `complete_step` with the returned value on success or
+    /// `fail_step` with a structured error on failure.
+    async fn execute_model_call(
+        &self,
+        step_id: &str,
+        request_payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, StoreError> {
+        let _ = (step_id, request_payload);
+        Err(StoreError::StorageError(
+            "execute_model_call not implemented".into(),
+        ))
+    }
+
+    /// Execute a `tool_call` step that is NOT a sub-agent dispatch.
+    /// Sub-agent dispatch is handled by [`crate::run_response_loop`]
+    /// directly (it recurses into a sub-loop).
+    async fn execute_tool_call(
+        &self,
+        step_id: &str,
+        request_payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, StoreError> {
+        let _ = (step_id, request_payload);
+        Err(StoreError::StorageError(
+            "execute_tool_call not implemented".into(),
+        ))
+    }
+
+    /// Allocate the next monotonic `step_sequence` value for a request.
+    /// The sequence is global across nesting levels; it doubles as the
+    /// `Last-Event-ID` cursor for the user-visible event stream.
+    async fn next_sequence(&self, request_id: &str) -> Result<i64, StoreError> {
+        let _ = request_id;
+        Err(StoreError::StorageError(
+            "next_sequence not implemented".into(),
+        ))
+    }
+
+    /// Materialize the final `Response` JSON (per the OpenAI Responses
+    /// API contract) from the chain of completed steps.
+    async fn assemble_response(&self, request_id: &str) -> Result<serde_json::Value, StoreError> {
+        let _ = request_id;
+        Err(StoreError::StorageError(
+            "assemble_response not implemented".into(),
+        ))
+    }
+}
+
+/// Discrete kinds of work a response step can represent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    /// Upstream LLM invocation.
+    ModelCall,
+    /// Server-side tool invocation. When `StepDescriptor::is_subagent` is
+    /// true, [`crate::run_response_loop`] recurses into a sub-loop instead
+    /// of calling the storage's tool executor.
+    ToolCall,
+}
+
+/// Description of a single step the transition function wants the loop to
+/// execute next. Returned (one or more, for fan-out) inside
+/// [`NextAction::AppendSteps`].
+#[derive(Debug, Clone)]
+pub struct StepDescriptor {
+    pub kind: StepKind,
+    /// Step-specific input payload (instructions, tool name + arguments,
+    /// etc.). Persisted verbatim into `response_steps.request_payload`.
+    pub request_payload: serde_json::Value,
+    /// When `true` and `kind == ToolCall`, the loop recurses into a
+    /// sub-agent loop scoped under this step. The implementation's
+    /// `execute_tool_call` is *not* called for this step; instead, the
+    /// loop runs `next_action_for(request_id, Some(step_id))` to drive
+    /// the sub-loop.
+    pub is_subagent: bool,
+}
+
+/// The transition function's verdict for the next iteration.
+#[derive(Debug, Clone)]
+pub enum NextAction {
+    /// Append one or more steps. A single descriptor = serial; multiple =
+    /// parallel fan-out (the loop fires them concurrently via
+    /// `futures::future::join_all`).
+    AppendSteps(Vec<StepDescriptor>),
+    /// Stop — the response is complete with the given final payload.
+    /// `run_response_loop` returns this payload to the caller.
+    Complete(serde_json::Value),
+    /// Stop — the response failed with the given structured error.
+    /// `run_response_loop` returns `LoopError::Failed`.
+    Fail(serde_json::Value),
 }
 
 /// No-op implementation that always returns None.

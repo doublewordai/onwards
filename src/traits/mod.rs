@@ -9,5 +9,7 @@
 mod response_store;
 mod tool_executor;
 
-pub use response_store::{NoOpResponseStore, ResponseStore, StoreError};
+pub use response_store::{
+    NextAction, NoOpResponseStore, ResponseStore, StepDescriptor, StepKind, StoreError,
+};
 pub use tool_executor::{NoOpToolExecutor, RequestContext, ToolError, ToolExecutor, ToolSchema};
