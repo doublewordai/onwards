@@ -337,6 +337,7 @@ async fn complete_immediately_returns_payload() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -366,6 +367,7 @@ async fn fail_immediately_returns_loop_error_failed() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -405,6 +407,7 @@ async fn single_model_call_then_complete_routes_through_real_http_client() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -454,6 +457,7 @@ async fn parallel_fan_out_chains_prev_step_id() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -513,6 +517,7 @@ async fn step_failure_does_not_abort_loop() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -554,6 +559,7 @@ async fn max_iterations_cap_fires() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         config,
@@ -595,6 +601,7 @@ async fn agent_kind_tool_triggers_recursion() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -641,6 +648,7 @@ async fn http_kind_tool_routes_through_tool_executor() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -672,6 +680,7 @@ async fn empty_action_returns_empty_action_error() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -720,6 +729,7 @@ async fn resume_picks_up_chain_tail_for_prev_step_id() {
         &ctx,
         &target,
         http_client_for_tests(),
+        None,
         "req_1",
         None,
         LoopConfig::default(),
@@ -737,4 +747,192 @@ async fn resume_picks_up_chain_tail_for_prev_step_id() {
         "resumed step must chain onto existing tail"
     );
     assert_eq!(chain[1].sequence, preexisting.sequence + 1);
+}
+
+#[tokio::test]
+async fn streaming_model_call_forwards_token_deltas_and_emits_terminals() {
+    use crate::streaming::{LoopEventKind, RecordingSink};
+
+    // Wiremock that returns SSE chunks for a chat completions stream.
+    let server = MockServer::start().await;
+    let sse_body = "\
+        data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n\
+        data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+        data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+        data: [DONE]\n\n";
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_body.as_bytes(), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let store = MockStore::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: format!("{}/chat", server.uri()),
+        api_key: None,
+    };
+    let sink = RecordingSink::new();
+
+    store.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![StepDescriptor {
+                kind: StepKind::ModelCall,
+                request_payload: json!({"prompt": "hi", "stream": true}),
+            }]),
+            NextAction::Complete(json!({"done": true})),
+        ],
+    );
+
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        Some(&sink),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let events = sink.events();
+    let kinds: Vec<LoopEventKind> = events.iter().map(|e| e.kind).collect();
+
+    // Created at start, two text deltas (one per chunk), then completed
+    // at terminal. The exact sequencing is:
+    //   Created (sequence 0) → OutputTextDelta × 2 (sequence 1) →
+    //   Completed (sequence > 1).
+    assert!(
+        kinds.contains(&LoopEventKind::Created),
+        "missing Created, got {:?}",
+        kinds
+    );
+    assert!(
+        kinds.iter().filter(|k| **k == LoopEventKind::OutputTextDelta).count() >= 2,
+        "expected ≥2 OutputTextDelta events, got {:?}",
+        kinds
+    );
+    assert!(
+        kinds.contains(&LoopEventKind::Completed),
+        "missing Completed terminal, got {:?}",
+        kinds
+    );
+
+    // Text deltas carry the assistant content verbatim.
+    let text_deltas: Vec<String> = events
+        .iter()
+        .filter(|e| e.kind == LoopEventKind::OutputTextDelta)
+        .map(|e| e.data["delta"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(text_deltas, vec!["Hello".to_string(), " world".to_string()]);
+
+    // The Created event has sequence 0 (the canonical start cursor).
+    let created = events.iter().find(|e| e.kind == LoopEventKind::Created).unwrap();
+    assert_eq!(created.sequence, 0);
+}
+
+#[tokio::test]
+async fn tool_call_emits_output_item_done_to_sink() {
+    use crate::streaming::{LoopEventKind, RecordingSink};
+
+    let store = MockStore::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("calculator", ToolKind::Http);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
+    let sink = RecordingSink::new();
+
+    store.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![tool_call("calculator", json!({"x": 1}))]),
+            NextAction::Complete(json!({"done": true})),
+        ],
+    );
+
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        Some(&sink),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let events = sink.events();
+    let tool_done: Vec<&crate::streaming::LoopEvent> = events
+        .iter()
+        .filter(|e| e.kind == LoopEventKind::OutputItemDone)
+        .filter(|e| e.data["type"] == "function_call_output")
+        .collect();
+    assert_eq!(tool_done.len(), 1, "tool_call should emit one output_item.done");
+    assert!(
+        events.iter().any(|e| e.kind == LoopEventKind::Completed),
+        "terminal Completed event should be emitted"
+    );
+}
+
+#[tokio::test]
+async fn non_streaming_model_call_emits_no_token_deltas() {
+    // When stream=false, model_call uses single-shot HTTP. No token
+    // deltas should be emitted to the sink, but Created and Completed
+    // terminal events still fire.
+    use crate::streaming::{LoopEventKind, RecordingSink};
+
+    let (_model, url) = model_wiremock(vec![json!({"output": "hello"})]).await;
+    let store = MockStore::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget { url, api_key: None };
+    let sink = RecordingSink::new();
+
+    store.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![model_call(json!({"stream": false}))]),
+            NextAction::Complete(json!({"done": true})),
+        ],
+    );
+
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        Some(&sink),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let kinds: Vec<LoopEventKind> = sink.events().iter().map(|e| e.kind).collect();
+    assert!(
+        !kinds.contains(&LoopEventKind::OutputTextDelta),
+        "non-streaming model call must not emit token deltas, got {:?}",
+        kinds
+    );
+    assert!(kinds.contains(&LoopEventKind::Completed));
 }
