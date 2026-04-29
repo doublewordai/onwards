@@ -63,11 +63,11 @@ pub mod traits;
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-pub use response_loop::{LoopConfig, LoopError, run_response_loop};
+pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
 pub use traits::{
     ChainStep, ExecutorError, MultiStepStore, NextAction, NoOpResponseStore, NoOpToolExecutor,
-    RecordedStep, RequestContext, ResponseStore, StepDescriptor, StepExecutor, StepKind, StepState,
-    StoreError, ToolDispatch, ToolError, ToolExecutor, ToolSchema,
+    RecordedStep, RequestContext, ResponseStore, StepDescriptor, StepKind, StepState, StoreError,
+    ToolError, ToolExecutor, ToolKind, ToolSchema,
 };
 
 /// Type alias for body transformation function

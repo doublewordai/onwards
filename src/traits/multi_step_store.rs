@@ -16,9 +16,10 @@
 //! - **assembly** ([`assemble_response`](MultiStepStore::assemble_response))
 //!   from the chain to the final OpenAI Response JSON.
 //!
-//! Execution lives elsewhere — see [`super::StepExecutor`]. The split keeps
-//! storage and execution independently mockable, and keeps onwards free of
-//! tool-kind or storage-backend specifics.
+//! Execution lives in the existing [`super::ToolExecutor`] trait (for
+//! tools) and in the loop itself (for model calls). There is no
+//! dedicated multi-step execution trait — onwards reuses what's already
+//! there.
 //!
 //! Implementing this trait is opt-in: consumers that don't need multi-step
 //! support (legacy callers using only [`super::ResponseStore`]) don't need
@@ -62,10 +63,11 @@ impl StepState {
 /// execute next. Returned (one or more, for fan-out) inside
 /// [`NextAction::AppendSteps`].
 ///
-/// Note the absence of an `is_subagent` field: tool dispatch is the
-/// executor's responsibility (see [`super::ToolDispatch`]). Onwards has no
-/// notion of tool kinds — the transition function decides *what* should
-/// happen, the executor decides *how*.
+/// Note the absence of an `is_subagent` field: tool dispatch is decided
+/// by the tool's [`super::ToolKind`] on its schema, surfaced by the
+/// `ToolExecutor` implementation. The transition function decides *what*
+/// step to run; the dispatch (HTTP fire vs sub-agent recursion) follows
+/// from the tool's declared kind.
 #[derive(Debug, Clone)]
 pub struct StepDescriptor {
     pub kind: StepKind,
@@ -193,6 +195,10 @@ pub trait MultiStepStore: Send + Sync {
 /// Errors specific to step execution. Distinct from
 /// [`StoreError`](crate::traits::StoreError) so storage failures and
 /// execution failures are separable in the loop's error type.
+///
+/// Used by [`crate::run_response_loop`] to wrap failures from
+/// [`super::ToolExecutor::execute`] and from the loop's internal model
+/// HTTP fire.
 #[derive(Debug, Clone)]
 pub enum ExecutorError {
     /// Tool/model is not registered or is unknown to the executor.

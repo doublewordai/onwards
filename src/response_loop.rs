@@ -1,65 +1,52 @@
 //! Multi-step Open Responses orchestration loop.
 //!
-//! [`run_response_loop`] is the single source of truth for driving a
-//! multi-step response from `pending` to terminal state. It is a free
-//! function over the [`MultiStepStore`] and [`StepExecutor`] traits so
-//! that both execution paths described in
-//! `fusillade/docs/plans/2026-04-28-multi-step-responses.md` — onwards
-//! inline (warm) and a fusillade daemon worker (cold) — invoke the same
-//! code with the same semantics.
+//! [`run_response_loop`] drives a multi-step response from `pending` to
+//! terminal state. It is a free function over the [`MultiStepStore`] and
+//! [`ToolExecutor`] traits — both already exist in onwards for other
+//! purposes, so the multi-step path adds no parallel execution
+//! abstraction.
 //!
-//! ## Storage / execution split
+//! ## Wiring
 //!
-//! Onwards holds two trait objects, never one:
+//! - **Storage** — [`MultiStepStore`] handles CRUD + transition +
+//!   chain walk + assembly.
+//! - **Tool dispatch** — [`ToolExecutor::tools`] declares the tools and
+//!   their [`ToolKind`]; [`ToolExecutor::execute`] runs `Http`-kind
+//!   tools. `Agent`-kind tools cause the loop to recurse into a sub-loop
+//!   instead of calling `execute`.
+//! - **Model calls** — fired directly by the loop using the supplied
+//!   `reqwest::Client` against the configured [`UpstreamTarget`]. No
+//!   trait abstraction.
 //!
-//! - [`MultiStepStore`] — pure CRUD + transition + assembly + chain walk.
-//!   Self-contained: implementors expose chain state via
-//!   [`MultiStepStore::list_chain`] so onwards never reaches around the
-//!   trait into storage internals.
-//! - [`StepExecutor`] — model and tool execution. Decides what kind of
-//!   tool a `tool_call` step is via [`ToolDispatch`]. Onwards stays
-//!   agnostic to tool kinds (HTTP, sub-agent, MCP, etc.).
-//!
-//! ## Why a free function (and not a struct method)
-//!
-//! A free function makes the recursion in [`ToolDispatch::Recurse`]
-//! trivial: the recursive call is just `run_response_loop(store,
-//! executor, ...)` against the same trait references. There is no
-//! per-loop state to thread through; everything is a pure function of
-//! the chain in storage.
+//! This means dwctl's existing `HttpToolExecutor` (which already
+//! implements `ToolExecutor`) plugs straight in — no wrapping, no
+//! adapter, no parallel multi-step trait.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use axum::body::Body;
+use axum::http::header::AUTHORIZATION;
+use serde_json::Value;
+
+use crate::client::HttpClient;
 use crate::traits::{
-    ExecutorError, MultiStepStore, NextAction, StepDescriptor, StepExecutor, StepKind, StoreError,
-    ToolDispatch,
+    ChainStep, ExecutorError, MultiStepStore, NextAction, RequestContext, StepDescriptor,
+    StepKind, StoreError, ToolError, ToolExecutor, ToolKind,
 };
 
 /// Type alias for the recursive sub-loop call. Required because async fns
 /// can't directly recurse — the future type is its own type, infinitely.
-type LoopFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<serde_json::Value, LoopError>> + Send + 'a>>;
+type LoopFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, LoopError>> + Send + 'a>>;
 
 #[cfg(test)]
 #[path = "response_loop_tests.rs"]
 mod tests;
 
 /// Configuration for [`run_response_loop`]'s safety caps.
-///
-/// Two independent caps bound the absolute worst-case work for any single
-/// response (per plan §C11):
-///
-/// - `max_response_step_depth` — how many levels deep sub-agent recursion
-///   can go. A `tool_call` step that would exceed this depth is failed
-///   with [`LoopError::MaxDepthExceeded`] before the sub-loop is entered.
-/// - `max_response_iterations` — how many model_call ↔ tool_call
-///   iterations a single loop level can run. When a level reaches this
-///   cap, that level fails with [`LoopError::MaxIterationsExceeded`].
-///
-/// With the default values (depth 8, iterations 10) the absolute upper
-/// bound on work for one response is `8 × 10 × fan_out_width`.
 #[derive(Debug, Clone, Copy)]
 pub struct LoopConfig {
     pub max_response_step_depth: u32,
@@ -75,27 +62,25 @@ impl Default for LoopConfig {
     }
 }
 
+/// Where the loop should send model_call HTTP requests.
+///
+/// The integration test passes a wiremock URL; production wiring will
+/// pass a target resolved through onwards' load balancer (this is the
+/// follow-up coupling for COR-349).
+#[derive(Debug, Clone)]
+pub struct UpstreamTarget {
+    pub url: String,
+    pub api_key: Option<String>,
+}
+
 /// Errors returned by [`run_response_loop`].
 #[derive(Debug)]
 pub enum LoopError {
-    /// The transition function returned `Fail(payload)` — the implementor
-    /// decided the response cannot continue.
-    Failed(serde_json::Value),
-    /// A loop level exhausted `max_response_iterations` without reaching
-    /// a `Complete` or `Fail` action.
+    Failed(Value),
     MaxIterationsExceeded,
-    /// A `tool_call` step's sub-agent dispatch would exceed
-    /// `max_response_step_depth`. The spawning step is failed with this
-    /// error before the sub-loop is entered, so the parent loop can
-    /// observe it like any other tool failure.
     MaxDepthExceeded,
-    /// The transition function returned `AppendSteps(vec![])`. This is a
-    /// programming error in the implementor — the loop has no meaningful
-    /// way to continue.
     EmptyAction,
-    /// The storage layer returned an error.
     Store(StoreError),
-    /// The executor returned an error.
     Executor(ExecutorError),
 }
 
@@ -136,40 +121,23 @@ impl From<ExecutorError> for LoopError {
 
 /// Drive a multi-step Open Responses request to a terminal state.
 ///
-/// `scope_parent`:
-/// - `None` — top-level loop for the user-visible response. The returned
-///   value is the final response payload (typically materialized via
-///   [`MultiStepStore::assemble_response`] inside the implementor's
-///   `next_action_for` returning `Complete`).
-/// - `Some(step_id)` — sub-agent loop scoped under that step. The
-///   returned value is what gets persisted as the spawning step's
-///   `response_payload`.
+/// `tool_executor` is the same trait dwctl already implements via
+/// `HttpToolExecutor` for the single-step in-process loop — no separate
+/// abstraction.
 ///
-/// Behavior contract:
+/// `model_target` is where model_call steps fire HTTP. The loop POSTs
+/// the step's `request_payload` as JSON, optionally with a Bearer
+/// token, and parses the response as JSON.
 ///
-/// 1. Each iteration calls
-///    `store.next_action_for(request_id, scope_parent)`.
-/// 2. `Complete(v)` returns `Ok(v)`.
-/// 3. `Fail(v)` returns `Err(LoopError::Failed(v))`.
-/// 4. `AppendSteps(descriptors)`:
-///    - For each descriptor, the store records a step (allocating its
-///      sequence atomically) whose `prev_step_id` chains linearly through
-///      the siblings — transcript order is stable even though execution
-///      is concurrent.
-///    - All sibling steps execute concurrently via
-///      `futures_util::future::join_all`.
-///    - Per-step dispatch: `ModelCall` →
-///      `executor.execute_model_call(...)`; `ToolCall` →
-///      `executor.dispatch_tool_call(...)`. A `ToolDispatch::Recurse`
-///      result triggers a recursive `run_response_loop` call with
-///      `scope_parent = Some(step_id)` and `depth + 1`.
-///    - Per-step success → `complete_step`. Per-step failure →
-///      `fail_step` with a structured error payload; the loop continues
-///      to the next iteration so the implementor's transition function
-///      can react to the failed sibling.
-pub fn run_response_loop<'a, S, E>(
+/// `tool_ctx` is the `RequestContext` passed to `ToolExecutor::tools`
+/// and `::execute` — carries the per-request resolved tool set for
+/// dwctl's middleware-driven model.
+pub fn run_response_loop<'a, S, T>(
     store: &'a S,
-    executor: &'a E,
+    tool_executor: &'a T,
+    tool_ctx: &'a RequestContext,
+    model_target: &'a UpstreamTarget,
+    http_client: Arc<dyn HttpClient + Send + Sync>,
     request_id: &'a str,
     scope_parent: Option<&'a str>,
     config: LoopConfig,
@@ -177,25 +145,34 @@ pub fn run_response_loop<'a, S, E>(
 ) -> LoopFuture<'a>
 where
     S: MultiStepStore + ?Sized,
-    E: StepExecutor + ?Sized,
+    T: ToolExecutor + ?Sized,
 {
     Box::pin(async move {
         if depth > config.max_response_step_depth {
             return Err(LoopError::MaxDepthExceeded);
         }
 
+        // Resolve tool kinds once at the start of this loop level; the
+        // dispatch path looks up by name on each tool_call. Cached locally
+        // so dispatch is O(1) and we don't spam the executor with
+        // discovery calls.
+        let kinds: HashMap<String, ToolKind> = tool_executor
+            .tools(tool_ctx)
+            .await
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect();
+
         let mut iterations: u32 = 0;
-        // Initialize prev_step from the existing chain tail so resumed
-        // workers (crash recovery, executor handoff) chain new rows onto
-        // whatever the previous worker already persisted, rather than
-        // starting a parallel chain at the head. Walk the same scope the
-        // loop is about to operate on; rows are returned in sequence
-        // order so `.last()` is the tail.
+        // Resume-aware: chain new steps onto whatever this scope's
+        // existing tail is. A worker picking up a partially-populated
+        // chain (crash recovery, executor handoff) chains correctly
+        // instead of starting a parallel chain at the head.
         let mut prev_step: Option<String> = store
             .list_chain(request_id, scope_parent)
             .await?
             .last()
-            .map(|step| step.id.clone());
+            .map(|step: &ChainStep| step.id.clone());
 
         loop {
             if iterations >= config.max_response_iterations {
@@ -213,11 +190,12 @@ where
                         return Err(LoopError::EmptyAction);
                     }
 
-                    // Insert each step in order, linking prev_step_id
-                    // through siblings so the chain reads as a stable
-                    // transcript even though we'll fire them concurrently
-                    // below. record_step allocates the sequence atomically
-                    // so there's no separate round-trip.
+                    // Insert each step in order, chaining prev_step_id
+                    // through siblings for stable transcript ordering even
+                    // though execution is concurrent below. record_step
+                    // allocates the sequence atomically — N siblings = N
+                    // queries (no separate sequence-allocation
+                    // round-trip).
                     let mut step_ids: Vec<String> = Vec::with_capacity(descriptors.len());
                     let mut current_prev: Option<String> = prev_step.clone();
                     for descriptor in &descriptors {
@@ -233,25 +211,30 @@ where
                         step_ids.push(recorded.id);
                     }
 
-                    // Execute siblings concurrently. Per-step failures are
-                    // recorded but do not abort the fan-out — the next
-                    // next_action_for iteration sees the failed sibling
-                    // row and the implementor decides recovery.
-                    let futures =
-                        descriptors
-                            .iter()
-                            .zip(step_ids.iter())
-                            .map(|(descriptor, step_id)| {
-                                execute_step(
-                                    store, executor, request_id, step_id, descriptor, config, depth,
-                                )
-                            });
+                    // Execute siblings concurrently. Per-step failures
+                    // are persisted via fail_step and swallowed; storage
+                    // failures propagate. Sub-agent recursion happens
+                    // inside execute_step.
+                    let futures = descriptors.iter().zip(step_ids.iter()).map(
+                        |(descriptor, step_id)| {
+                            execute_step(
+                                store,
+                                tool_executor,
+                                tool_ctx,
+                                model_target,
+                                http_client.clone(),
+                                &kinds,
+                                request_id,
+                                step_id,
+                                descriptor,
+                                config,
+                                depth,
+                            )
+                        },
+                    );
                     let results: Vec<Result<(), LoopError>> =
                         futures_util::future::join_all(futures).await;
 
-                    // Step-level outcomes are persisted by execute_step via
-                    // complete_step / fail_step and then swallowed; only
-                    // storage-layer failures propagate up here.
                     for outcome in results {
                         outcome?;
                     }
@@ -263,10 +246,14 @@ where
     })
 }
 
-/// Execute one step in the chain.
-fn execute_step<'a, S, E>(
+#[allow(clippy::too_many_arguments)]
+fn execute_step<'a, S, T>(
     store: &'a S,
-    executor: &'a E,
+    tool_executor: &'a T,
+    tool_ctx: &'a RequestContext,
+    model_target: &'a UpstreamTarget,
+    http_client: Arc<dyn HttpClient + Send + Sync>,
+    kinds: &'a HashMap<String, ToolKind>,
     request_id: &'a str,
     step_id: &'a str,
     descriptor: &'a StepDescriptor,
@@ -275,33 +262,38 @@ fn execute_step<'a, S, E>(
 ) -> Pin<Box<dyn Future<Output = Result<(), LoopError>> + Send + 'a>>
 where
     S: MultiStepStore + ?Sized,
-    E: StepExecutor + ?Sized,
+    T: ToolExecutor + ?Sized,
 {
     Box::pin(async move {
         store.mark_step_processing(step_id).await?;
 
-        let outcome: Result<serde_json::Value, LoopError> = match descriptor.kind {
-            StepKind::ModelCall => executor
-                .execute_model_call(step_id, &descriptor.request_payload)
-                .await
-                .map_err(LoopError::Executor),
+        let outcome: Result<Value, LoopError> = match descriptor.kind {
+            StepKind::ModelCall => {
+                fire_model_call(&*http_client, model_target, &descriptor.request_payload).await
+            }
             StepKind::ToolCall => {
-                match executor
-                    .dispatch_tool_call(step_id, &descriptor.request_payload)
-                    .await
-                {
-                    Ok(ToolDispatch::Executed(payload)) => Ok(payload),
-                    Ok(ToolDispatch::Recurse) => {
-                        // Pre-check the depth cap before recursing so the
-                        // spawning step is failed cleanly with
-                        // `max_depth_exceeded` rather than entering a
-                        // sub-loop that's about to bail out (plan §C11).
+                let tool_name = descriptor
+                    .request_payload
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        LoopError::Executor(ExecutorError::ExecutionError(
+                            "tool_call request_payload missing 'name'".into(),
+                        ))
+                    })?;
+                let kind = kinds.get(tool_name).copied().unwrap_or(ToolKind::Http);
+
+                match kind {
+                    ToolKind::Agent => {
                         if depth + 1 > config.max_response_step_depth {
                             Err(LoopError::MaxDepthExceeded)
                         } else {
                             run_response_loop(
                                 store,
-                                executor,
+                                tool_executor,
+                                tool_ctx,
+                                model_target,
+                                http_client.clone(),
                                 request_id,
                                 Some(step_id),
                                 config,
@@ -310,7 +302,17 @@ where
                             .await
                         }
                     }
-                    Err(e) => Err(LoopError::Executor(e)),
+                    ToolKind::Http => {
+                        let args = descriptor
+                            .request_payload
+                            .get("args")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({}));
+                        tool_executor
+                            .execute(tool_name, step_id, &args, tool_ctx)
+                            .await
+                            .map_err(|e| LoopError::Executor(translate_tool_error(e)))
+                    }
                 }
             }
         };
@@ -320,15 +322,7 @@ where
                 store.complete_step(step_id, &payload).await?;
                 Ok(())
             }
-            // Storage-layer failures inside execution (e.g. a sub-loop's
-            // record_step or complete_step failed) propagate. Trying to
-            // call fail_step on a store that's already broken is at best
-            // pointless and at worst masks the real error.
             Err(loop_err @ LoopError::Store(_)) => Err(loop_err),
-            // Executor errors, transition Fail outcomes, and cap
-            // violations from sub-loops are step-level failures: persist
-            // them and let the next next_action_for iteration decide
-            // recovery.
             Err(loop_err) => {
                 let error_payload = error_to_payload(&loop_err);
                 store.fail_step(step_id, &error_payload).await?;
@@ -338,7 +332,72 @@ where
     })
 }
 
-fn error_to_payload(e: &LoopError) -> serde_json::Value {
+async fn fire_model_call(
+    http_client: &(dyn HttpClient + Send + Sync),
+    target: &UpstreamTarget,
+    request_payload: &Value,
+) -> Result<Value, LoopError> {
+    // Build an axum::Request the same way the rest of onwards does, so
+    // the model call goes through the same connection pool, TLS, and
+    // observability surface as single-step proxying.
+    let body_bytes = serde_json::to_vec(request_payload).map_err(|e| {
+        LoopError::Executor(ExecutorError::ExecutionError(format!(
+            "model call body serialize: {e}"
+        )))
+    })?;
+
+    let mut builder = axum::http::Request::builder()
+        .method(axum::http::Method::POST)
+        .uri(&target.url)
+        .header(axum::http::header::CONTENT_TYPE, "application/json");
+    if let Some(key) = &target.api_key {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {key}"));
+    }
+    let req = builder.body(Body::from(body_bytes)).map_err(|e| {
+        LoopError::Executor(ExecutorError::ExecutionError(format!(
+            "model call request build: {e}"
+        )))
+    })?;
+
+    let resp = http_client.request(req).await.map_err(|e| {
+        LoopError::Executor(ExecutorError::ExecutionError(format!(
+            "model call HTTP error: {e}"
+        )))
+    })?;
+
+    let status = resp.status();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .map_err(|e| {
+            LoopError::Executor(ExecutorError::ExecutionError(format!(
+                "model call body read: {e}"
+            )))
+        })?;
+
+    if !status.is_success() {
+        let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+        return Err(LoopError::Executor(ExecutorError::ExecutionError(format!(
+            "model call returned HTTP {status}: {body_text}"
+        ))));
+    }
+
+    serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
+        LoopError::Executor(ExecutorError::ExecutionError(format!(
+            "model call body parse: {e}"
+        )))
+    })
+}
+
+fn translate_tool_error(e: ToolError) -> ExecutorError {
+    match e {
+        ToolError::NotFound(name) => ExecutorError::NotFound(name),
+        ToolError::ExecutionError(msg)
+        | ToolError::InvalidArguments(msg)
+        | ToolError::Timeout(msg) => ExecutorError::ExecutionError(msg),
+    }
+}
+
+fn error_to_payload(e: &LoopError) -> Value {
     match e {
         LoopError::Failed(payload) => payload.clone(),
         LoopError::MaxIterationsExceeded => serde_json::json!({

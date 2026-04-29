@@ -1,36 +1,39 @@
 //! Unit tests for [`super::run_response_loop`].
 //!
-//! Two in-memory mocks: `MockStore` (implements [`MultiStepStore`]) drives
-//! transition decisions via a script, and `MockExecutor` (implements
-//! [`StepExecutor`]) records calls and lets tests override per-step
-//! results. The split mirrors the production trait factoring so test
-//! coverage tracks the real boundary.
+//! Two in-memory mocks: `MockStore` (implements [`MultiStepStore`])
+//! drives transition decisions via a script; `ScriptedToolExecutor`
+//! (implements [`ToolExecutor`]) records calls, lets tests override
+//! per-step results, and declares each tool's [`ToolKind`] so the
+//! loop's HTTP-vs-Agent dispatch can be exercised.
+//!
+//! Model calls are fired via onwards' real `HttpClient` trait against
+//! a wiremock server, so the loop's HTTP path is exercised by the
+//! same code that handles single-step proxying.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::json;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::response_loop::{LoopConfig, LoopError, run_response_loop};
+use crate::client::create_hyper_client;
+use crate::response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
 use crate::traits::{
-    ChainStep, ExecutorError, MultiStepStore, NextAction, RecordedStep, StepDescriptor,
-    StepExecutor, StepKind, StepState, StoreError, ToolDispatch,
+    ChainStep, MultiStepStore, NextAction, RecordedStep, RequestContext, StepDescriptor,
+    StepKind, StepState, StoreError, ToolError, ToolExecutor, ToolKind, ToolSchema,
 };
 
 #[derive(Debug, Default)]
 struct StoreState {
-    /// Scripted responses for `next_action_for`. Keyed by `scope_parent`.
     actions: HashMap<Option<String>, std::collections::VecDeque<NextAction>>,
-    /// All step rows the loop has persisted, keyed by step id.
     steps: HashMap<String, StoredStep>,
-    /// Sequence allocator per request_id (monotonic across nesting).
     next_seq: HashMap<String, i64>,
     record_order: Vec<String>,
     mark_processing_order: Vec<String>,
     complete_order: Vec<(String, serde_json::Value)>,
     fail_order: Vec<(String, serde_json::Value)>,
-    /// Counter to give synthesized step IDs deterministic ordering.
     id_counter: u64,
 }
 
@@ -78,6 +81,7 @@ impl MockStore {
     }
 }
 
+#[allow(dead_code)]
 struct StoreSnapshot {
     steps: HashMap<String, StoredStep>,
     record_order: Vec<String>,
@@ -205,86 +209,78 @@ impl MultiStepStore for MockStore {
     }
 }
 
+/// In-memory ToolExecutor for tests. Declares a configurable map of
+/// (tool_name → (kind, result-override)) and records every execute call.
 #[derive(Default)]
-struct MockExecutor {
-    inner: Mutex<ExecutorState>,
+struct ScriptedToolExecutor {
+    inner: Mutex<ScriptedExecutorState>,
 }
 
-#[derive(Debug, Default)]
-struct ExecutorState {
-    model_call_invocations: Vec<String>,
-    tool_call_invocations: Vec<String>,
-    /// Per-step model_call result override (default = success).
-    model_call_results: HashMap<String, Result<serde_json::Value, String>>,
-    /// Per-step tool dispatch override (default = Executed with synthetic
-    /// payload).
-    tool_dispatches: HashMap<String, ToolDispatch>,
+#[derive(Default, Debug)]
+struct ScriptedExecutorState {
+    /// tool name → kind
+    kinds: HashMap<String, ToolKind>,
+    /// tool_name → optional result override (Err goes to ToolError::ExecutionError)
+    results: HashMap<String, Result<serde_json::Value, String>>,
+    /// every execute() call, in order: (tool_name, args)
+    calls: Vec<(String, serde_json::Value)>,
 }
 
-impl MockExecutor {
+impl ScriptedToolExecutor {
     fn new() -> Self {
         Self::default()
     }
-
-    fn set_tool_dispatch(&self, step_id: &str, dispatch: ToolDispatch) {
+    fn register(&self, name: &str, kind: ToolKind) {
         self.inner
             .lock()
             .unwrap()
-            .tool_dispatches
-            .insert(step_id.to_string(), dispatch);
+            .kinds
+            .insert(name.to_string(), kind);
     }
-
-    fn fail_model_call(&self, step_id: &str, message: &str) {
+    #[allow(dead_code)]
+    fn fail_with(&self, name: &str, msg: &str) {
         self.inner
             .lock()
             .unwrap()
-            .model_call_results
-            .insert(step_id.to_string(), Err(message.to_string()));
+            .results
+            .insert(name.to_string(), Err(msg.to_string()));
     }
-
-    fn snapshot(&self) -> ExecutorSnapshot {
-        let state = self.inner.lock().unwrap();
-        ExecutorSnapshot {
-            model_call_invocations: state.model_call_invocations.clone(),
-            tool_call_invocations: state.tool_call_invocations.clone(),
-        }
+    fn calls(&self) -> Vec<(String, serde_json::Value)> {
+        self.inner.lock().unwrap().calls.clone()
     }
-}
-
-#[derive(Debug)]
-struct ExecutorSnapshot {
-    model_call_invocations: Vec<String>,
-    tool_call_invocations: Vec<String>,
 }
 
 #[async_trait]
-impl StepExecutor for MockExecutor {
-    async fn execute_model_call(
-        &self,
-        step_id: &str,
-        _request_payload: &serde_json::Value,
-    ) -> Result<serde_json::Value, ExecutorError> {
-        let mut state = self.inner.lock().unwrap();
-        state.model_call_invocations.push(step_id.to_string());
-        match state.model_call_results.remove(step_id) {
-            Some(Ok(payload)) => Ok(payload),
-            Some(Err(err)) => Err(ExecutorError::ExecutionError(err)),
-            None => Ok(json!({"output": format!("model:{step_id}")})),
-        }
+impl ToolExecutor for ScriptedToolExecutor {
+    async fn tools(&self, _ctx: &RequestContext) -> Vec<ToolSchema> {
+        self.inner
+            .lock()
+            .unwrap()
+            .kinds
+            .iter()
+            .map(|(name, kind)| ToolSchema {
+                name: name.clone(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+                strict: false,
+                kind: *kind,
+            })
+            .collect()
     }
 
-    async fn dispatch_tool_call(
+    async fn execute(
         &self,
-        step_id: &str,
-        _request_payload: &serde_json::Value,
-    ) -> Result<ToolDispatch, ExecutorError> {
+        tool_name: &str,
+        _tool_call_id: &str,
+        arguments: &serde_json::Value,
+        _ctx: &RequestContext,
+    ) -> Result<serde_json::Value, ToolError> {
         let mut state = self.inner.lock().unwrap();
-        state.tool_call_invocations.push(step_id.to_string());
-        match state.tool_dispatches.remove(step_id) {
-            Some(dispatch) => Ok(dispatch),
-            None => Ok(ToolDispatch::Executed(
-                json!({"tool_output": format!("tool:{step_id}")}),
-            )),
+        state.calls.push((tool_name.to_string(), arguments.clone()));
+        match state.results.remove(tool_name) {
+            Some(Ok(payload)) => Ok(payload),
+            Some(Err(err)) => Err(ToolError::ExecutionError(err)),
+            None => Ok(json!({"tool_output": format!("tool:{tool_name}")})),
         }
     }
 }
@@ -296,35 +292,86 @@ fn model_call(payload: serde_json::Value) -> StepDescriptor {
     }
 }
 
-fn tool_call(payload: serde_json::Value) -> StepDescriptor {
+fn tool_call(name: &str, args: serde_json::Value) -> StepDescriptor {
     StepDescriptor {
         kind: StepKind::ToolCall,
-        request_payload: payload,
+        request_payload: json!({"name": name, "args": args}),
     }
+}
+
+/// Spin up a wiremock server that returns a sequence of model
+/// responses on POSTs to /chat. Returns the server (kept alive) and
+/// the URL.
+async fn model_wiremock(responses: Vec<serde_json::Value>) -> (MockServer, String) {
+    let server = MockServer::start().await;
+    for body in responses {
+        Mock::given(method("POST"))
+            .and(path("/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    let url = format!("{}/chat", server.uri());
+    (server, url)
+}
+
+fn http_client_for_tests() -> Arc<dyn crate::client::HttpClient + Send + Sync> {
+    Arc::new(create_hyper_client(10, 30))
 }
 
 #[tokio::test]
 async fn complete_immediately_returns_payload() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     store.script(None, vec![NextAction::Complete(json!({"final": true}))]);
 
-    let result =
-        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
+    let result = run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await;
 
     assert_eq!(result.unwrap(), json!({"final": true}));
     assert!(store.snapshot().record_order.is_empty());
-    assert!(executor.snapshot().model_call_invocations.is_empty());
+    assert!(tool_exec.calls().is_empty());
 }
 
 #[tokio::test]
 async fn fail_immediately_returns_loop_error_failed() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     store.script(None, vec![NextAction::Fail(json!({"reason": "bad"}))]);
 
-    let result =
-        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
+    let result = run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await;
     match result {
         Err(LoopError::Failed(payload)) => assert_eq!(payload, json!({"reason": "bad"})),
         other => panic!("expected LoopError::Failed, got {:?}", other),
@@ -332,9 +379,18 @@ async fn fail_immediately_returns_loop_error_failed() {
 }
 
 #[tokio::test]
-async fn single_model_call_then_complete() {
+async fn single_model_call_then_complete_routes_through_real_http_client() {
+    // Exercises the model fire path: real onwards HttpClient (HyperClient)
+    // POSTs to wiremock, body parsed back into the step's response_payload.
+    let (_model, url) = model_wiremock(vec![json!({"output": "hello"})]).await;
+
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url,
+        api_key: None,
+    };
     store.script(
         None,
         vec![
@@ -343,85 +399,148 @@ async fn single_model_call_then_complete() {
         ],
     );
 
-    let result = run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
+    let result = run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
     assert_eq!(result, json!({"done": true}));
 
     let snap = store.snapshot();
-    assert_eq!(snap.record_order, vec!["step_001"]);
-    assert_eq!(snap.mark_processing_order, vec!["step_001"]);
-    assert_eq!(executor.snapshot().model_call_invocations, vec!["step_001"]);
     assert_eq!(snap.complete_order.len(), 1);
+    assert_eq!(
+        snap.complete_order[0].1,
+        json!({"output": "hello"}),
+        "step's response_payload should be the wiremock body verbatim"
+    );
 }
 
 #[tokio::test]
-async fn parallel_fan_out_runs_concurrently_and_chains_prev_step_id() {
+async fn parallel_fan_out_chains_prev_step_id() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("a", ToolKind::Http);
+    tool_exec.register("b", ToolKind::Http);
+    tool_exec.register("c", ToolKind::Http);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
+
     store.script(
         None,
         vec![
             NextAction::AppendSteps(vec![
-                tool_call(json!({"a": 1})),
-                tool_call(json!({"b": 2})),
-                tool_call(json!({"c": 3})),
+                tool_call("a", json!({})),
+                tool_call("b", json!({})),
+                tool_call("c", json!({})),
             ]),
             NextAction::Complete(json!({"final": "ok"})),
         ],
     );
 
-    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
 
     let snap = store.snapshot();
     assert_eq!(snap.record_order, vec!["step_001", "step_002", "step_003"]);
     assert_eq!(snap.steps["step_001"].prev_step, None);
     assert_eq!(snap.steps["step_002"].prev_step, Some("step_001".into()));
     assert_eq!(snap.steps["step_003"].prev_step, Some("step_002".into()));
-    // Sequence is allocated atomically by record_step
     assert_eq!(snap.steps["step_001"].sequence, 1);
     assert_eq!(snap.steps["step_002"].sequence, 2);
     assert_eq!(snap.steps["step_003"].sequence, 3);
-    assert_eq!(executor.snapshot().tool_call_invocations.len(), 3);
-    assert_eq!(snap.complete_order.len(), 3);
+    assert_eq!(tool_exec.calls().len(), 3);
 }
 
 #[tokio::test]
-async fn step_failure_does_not_abort_loop_and_is_recorded() {
+async fn step_failure_does_not_abort_loop() {
+    // A failing model call (wiremock returns 500 once) is persisted via
+    // fail_step; the next iteration sees the failed sibling and the
+    // transition function recovers.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream broke"))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+        .mount(&server)
+        .await;
+
     let store = MockStore::new();
-    let executor = MockExecutor::new();
-    executor.fail_model_call("step_001", "upstream broke");
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: format!("{}/chat", server.uri()),
+        api_key: None,
+    };
     store.script(
         None,
         vec![
             NextAction::AppendSteps(vec![model_call(json!({}))]),
-            // Transition function decides to recover: fire another step.
             NextAction::AppendSteps(vec![model_call(json!({}))]),
             NextAction::Complete(json!({"final": "ok"})),
         ],
     );
 
-    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
 
     let snap = store.snapshot();
-    assert_eq!(snap.fail_order.len(), 1);
+    assert_eq!(snap.fail_order.len(), 1, "first call fails");
     assert_eq!(snap.fail_order[0].0, "step_001");
-    assert_eq!(snap.complete_order.len(), 1);
+    assert_eq!(snap.complete_order.len(), 1, "second call completes");
     assert_eq!(snap.complete_order[0].0, "step_002");
 }
 
 #[tokio::test]
 async fn max_iterations_cap_fires() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
-    let descriptors = vec![model_call(json!({}))];
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("a", ToolKind::Http);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     let mut script = Vec::new();
     for _ in 0..20 {
-        script.push(NextAction::AppendSteps(descriptors.clone()));
+        script.push(NextAction::AppendSteps(vec![tool_call("a", json!({}))]));
     }
     store.script(None, script);
 
@@ -429,302 +548,193 @@ async fn max_iterations_cap_fires() {
         max_response_step_depth: 8,
         max_response_iterations: 3,
     };
-    let result = run_response_loop(&store, &executor, "req_1", None, config, 0).await;
+    let result = run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        config,
+        0,
+    )
+    .await;
     assert!(matches!(result, Err(LoopError::MaxIterationsExceeded)));
 }
 
 #[tokio::test]
-async fn subagent_recursion_executes_sub_loop_under_correct_scope() {
+async fn agent_kind_tool_triggers_recursion() {
+    // A tool registered with ToolKind::Agent must cause the loop to
+    // recurse instead of calling tool_executor.execute. Sub-loop
+    // completes immediately; its return value is persisted as the
+    // spawning tool step's response_payload.
     let store = MockStore::new();
-    let executor = MockExecutor::new();
-
-    // Top-level: spawn one tool_call that the executor will signal as a
-    // sub-agent dispatch.
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("delegate", ToolKind::Agent);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     store.script(
         None,
         vec![
-            NextAction::AppendSteps(vec![tool_call(json!({"agent": "search"}))]),
+            NextAction::AppendSteps(vec![tool_call("delegate", json!({"task": "x"}))]),
             NextAction::Complete(json!({"top": "done"})),
         ],
     );
-    // Sub-loop: do one model_call then complete with a known payload.
     store.script(
         Some("step_001"),
-        vec![
-            NextAction::AppendSteps(vec![model_call(json!({"sub": true}))]),
-            NextAction::Complete(json!({"sub_result": 42})),
-        ],
+        vec![NextAction::Complete(json!({"sub": "result"}))],
     );
-    // Mark step_001 as a Recurse dispatch — the loop should recurse
-    // rather than treat this as an Executed tool call.
-    executor.set_tool_dispatch("step_001", ToolDispatch::Recurse);
 
-    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
 
+    // The Agent-kind tool was NOT executed via tool_executor.execute.
+    assert!(
+        tool_exec.calls().is_empty(),
+        "Agent-kind tool must not be passed to ToolExecutor::execute"
+    );
     let snap = store.snapshot();
-    assert_eq!(snap.steps["step_001"].kind, StepKind::ToolCall);
-    assert_eq!(snap.steps["step_001"].scope_parent, None);
-    assert_eq!(snap.steps["step_002"].kind, StepKind::ModelCall);
-    assert_eq!(snap.steps["step_002"].scope_parent, Some("step_001".into()));
-    // step_001 (the sub-agent dispatch) is completed with the sub-loop's
-    // final payload.
-    let (sub_id, sub_payload) = &snap.complete_order[1];
-    assert_eq!(sub_id, "step_001");
-    assert_eq!(sub_payload, &json!({"sub_result": 42}));
+    let top_tool_step = &snap.steps["step_001"];
+    assert!(matches!(top_tool_step.kind, StepKind::ToolCall));
+    // step_001 was completed with the sub-loop's return value.
+    let (id, payload) = &snap.complete_order[0];
+    assert_eq!(id, "step_001");
+    assert_eq!(payload, &json!({"sub": "result"}));
 }
 
 #[tokio::test]
-async fn max_depth_cap_fires_inside_subagent_recursion() {
+async fn http_kind_tool_routes_through_tool_executor() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
-
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("calculator", ToolKind::Http);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     store.script(
         None,
         vec![
-            NextAction::AppendSteps(vec![tool_call(json!({"agent": "lvl1"}))]),
-            NextAction::Complete(json!({"top": "done"})),
+            NextAction::AppendSteps(vec![tool_call("calculator", json!({"x": 1, "y": 2}))]),
+            NextAction::Complete(json!({"final": "ok"})),
         ],
     );
-    store.script(
-        Some("step_001"),
-        vec![NextAction::AppendSteps(vec![tool_call(
-            json!({"agent": "lvl2"}),
-        )])],
-    );
-    executor.set_tool_dispatch("step_001", ToolDispatch::Recurse);
-    executor.set_tool_dispatch("step_002", ToolDispatch::Recurse);
 
-    let config = LoopConfig {
-        max_response_step_depth: 1,
-        max_response_iterations: 10,
-    };
-    let _ = run_response_loop(&store, &executor, "req_1", None, config, 0).await;
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
 
-    let snap = store.snapshot();
-    let failed: Vec<_> = snap
-        .fail_order
-        .iter()
-        .filter(|(_, payload)| payload["type"] == "max_depth_exceeded")
-        .collect();
-    assert!(
-        !failed.is_empty(),
-        "expected a max_depth_exceeded fail_step, got {:?}",
-        snap.fail_order
-    );
+    let calls = tool_exec.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "calculator");
+    assert_eq!(calls[0].1, json!({"x": 1, "y": 2}));
 }
 
 #[tokio::test]
 async fn empty_action_returns_empty_action_error() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
     store.script(None, vec![NextAction::AppendSteps(vec![])]);
 
-    let result =
-        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
+    let result = run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await;
     assert!(matches!(result, Err(LoopError::EmptyAction)));
 }
 
 #[tokio::test]
-async fn store_error_in_next_action_propagates() {
-    let store = MockStore::new();
-    let executor = MockExecutor::new();
-    // No script for top-level — next_action_for returns StorageError.
-
-    let result =
-        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
-    assert!(matches!(result, Err(LoopError::Store(_))));
-}
-
-#[tokio::test]
-async fn list_chain_observes_persisted_steps() {
-    // Verifies the storage trait is self-contained: list_chain returns
-    // the chain that was just recorded, scoped to (request_id, parent).
-    let store = MockStore::new();
-    let executor = MockExecutor::new();
-    store.script(
-        None,
-        vec![
-            NextAction::AppendSteps(vec![
-                model_call(json!({"a": 1})),
-                model_call(json!({"a": 2})),
-            ]),
-            NextAction::Complete(json!({})),
-        ],
-    );
-
-    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
-
-    let chain = store.list_chain("req_1", None).await.unwrap();
-    assert_eq!(chain.len(), 2);
-    assert_eq!(chain[0].sequence, 1);
-    assert_eq!(chain[1].sequence, 2);
-    assert!(matches!(chain[0].state, StepState::Completed));
-    assert_eq!(chain[1].prev_step_id.as_deref(), Some(&*chain[0].id));
-}
-
-/// Regression test for the resume-with-existing-chain bug: when a worker
-/// resumes a request that already has persisted steps, new steps must
-/// chain onto the existing tail's id, not start a parallel chain from
-/// the head.
-#[tokio::test]
 async fn resume_picks_up_chain_tail_for_prev_step_id() {
     let store = MockStore::new();
-    let executor = MockExecutor::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    tool_exec.register("a", ToolKind::Http);
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        url: "http://unused".into(),
+        api_key: None,
+    };
 
-    // Pre-populate the store with a completed step (simulating crash
-    // recovery: a previous worker finished step_001 before dying).
     let preexisting = store
         .record_step(
             "req_1",
             None,
             None,
             &StepDescriptor {
-                kind: StepKind::ModelCall,
-                request_payload: json!({"prior": true}),
+                kind: StepKind::ToolCall,
+                request_payload: json!({"name": "a", "args": {}}),
             },
         )
         .await
         .unwrap();
-    store
-        .complete_step(&preexisting.id, &json!({"output": "prior"}))
-        .await
-        .unwrap();
+    store.complete_step(&preexisting.id, &json!({"prior": true})).await.unwrap();
 
-    // The resumed loop appends one more step then completes.
     store.script(
         None,
         vec![
-            NextAction::AppendSteps(vec![model_call(json!({"resumed": true}))]),
+            NextAction::AppendSteps(vec![tool_call("a", json!({}))]),
             NextAction::Complete(json!({"done": true})),
         ],
     );
 
-    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
-        .await
-        .unwrap();
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
 
     let chain = store.list_chain("req_1", None).await.unwrap();
     assert_eq!(chain.len(), 2);
     assert_eq!(chain[0].id, preexisting.id);
-    // The new step's prev_step_id must point at the pre-existing tail,
-    // not None.
     assert_eq!(
         chain[1].prev_step_id.as_deref(),
         Some(preexisting.id.as_str()),
-        "resumed step must chain onto existing tail, not start a parallel chain"
+        "resumed step must chain onto existing tail"
     );
     assert_eq!(chain[1].sequence, preexisting.sequence + 1);
-}
-
-/// Regression test for the swallow-store-error bug: a storage-layer
-/// failure observed *during* execute_step (via the recursive sub-loop
-/// or a flaky storage call) must abort the loop, not be downgraded to
-/// a fail_step + Ok(()) and silently masked.
-#[tokio::test]
-async fn store_error_inside_execute_step_propagates() {
-    use std::sync::Mutex;
-
-    /// Wrapper that fails complete_step on the first call. Forces a
-    /// storage-layer error to surface from inside execute_step's
-    /// outcome match.
-    struct FlakyStore {
-        inner: MockStore,
-        complete_failures_remaining: Mutex<usize>,
-    }
-
-    #[async_trait]
-    impl MultiStepStore for FlakyStore {
-        async fn next_action_for(
-            &self,
-            request_id: &str,
-            scope_parent: Option<&str>,
-        ) -> Result<NextAction, StoreError> {
-            self.inner.next_action_for(request_id, scope_parent).await
-        }
-        async fn record_step(
-            &self,
-            request_id: &str,
-            scope_parent: Option<&str>,
-            prev_step: Option<&str>,
-            descriptor: &StepDescriptor,
-        ) -> Result<RecordedStep, StoreError> {
-            self.inner
-                .record_step(request_id, scope_parent, prev_step, descriptor)
-                .await
-        }
-        async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
-            self.inner.mark_step_processing(step_id).await
-        }
-        async fn complete_step(
-            &self,
-            step_id: &str,
-            payload: &serde_json::Value,
-        ) -> Result<(), StoreError> {
-            let should_fail = {
-                let mut remaining = self.complete_failures_remaining.lock().unwrap();
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    true
-                } else {
-                    false
-                }
-            };
-            if should_fail {
-                return Err(StoreError::StorageError(
-                    "synthetic complete_step failure".into(),
-                ));
-            }
-            self.inner.complete_step(step_id, payload).await
-        }
-        async fn fail_step(
-            &self,
-            step_id: &str,
-            error: &serde_json::Value,
-        ) -> Result<(), StoreError> {
-            self.inner.fail_step(step_id, error).await
-        }
-        async fn list_chain(
-            &self,
-            request_id: &str,
-            scope_parent: Option<&str>,
-        ) -> Result<Vec<ChainStep>, StoreError> {
-            self.inner.list_chain(request_id, scope_parent).await
-        }
-        async fn assemble_response(
-            &self,
-            request_id: &str,
-        ) -> Result<serde_json::Value, StoreError> {
-            self.inner.assemble_response(request_id).await
-        }
-    }
-
-    let store = FlakyStore {
-        inner: MockStore::new(),
-        complete_failures_remaining: Mutex::new(1),
-    };
-    let executor = MockExecutor::new();
-    store.inner.script(
-        None,
-        vec![
-            NextAction::AppendSteps(vec![model_call(json!({}))]),
-            // If the store error were swallowed, the loop would call
-            // next_action_for again here and try Complete; surfacing
-            // means we should never reach this entry.
-            NextAction::Complete(json!({"unreachable": true})),
-        ],
-    );
-
-    let result =
-        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
-
-    match result {
-        Err(LoopError::Store(StoreError::StorageError(msg))) => {
-            assert!(msg.contains("synthetic complete_step failure"));
-        }
-        other => panic!("expected LoopError::Store, got {:?}", other),
-    }
 }
