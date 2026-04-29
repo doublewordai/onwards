@@ -1259,6 +1259,7 @@ mod tests {
                     description: "A server-side tool".to_string(),
                     parameters: serde_json::json!({"type": "object", "properties": {}}),
                     strict: false,
+                    kind: Default::default(),
                 }]
             }
 

@@ -52,9 +52,11 @@ pub mod handlers;
 pub mod load_balancer;
 pub mod models;
 pub mod response_id;
+pub mod response_loop;
 pub mod response_sanitizer;
 pub mod sse;
 pub mod strict;
+pub mod streaming;
 pub mod target;
 pub mod telemetry;
 pub mod traits;
@@ -62,9 +64,12 @@ pub mod traits;
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
+pub use streaming::{EventSink, EventSinkError, LoopEvent, LoopEventKind};
 pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolSchema,
+    ChainStep, ExecutorError, MultiStepStore, NextAction, NoOpResponseStore, NoOpToolExecutor,
+    RecordedStep, RequestContext, ResponseStore, StepDescriptor, StepKind, StepState, StoreError,
+    ToolError, ToolExecutor, ToolKind, ToolSchema,
 };
 
 /// Type alias for body transformation function

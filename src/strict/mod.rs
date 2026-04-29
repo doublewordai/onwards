@@ -833,6 +833,7 @@ mod tests {
                     }
                 }),
                 strict: false,
+                kind: Default::default(),
             }]
         }
 

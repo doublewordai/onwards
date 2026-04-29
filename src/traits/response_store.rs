@@ -75,20 +75,13 @@ pub trait ResponseStore: Send + Sync {
     }
 
     /// Post-request: mark the response as failed.
-    async fn fail(
-        &self,
-        response_id: &str,
-        error: &str,
-    ) -> Result<(), StoreError> {
+    async fn fail(&self, response_id: &str, error: &str) -> Result<(), StoreError> {
         let _ = (response_id, error);
         Ok(())
     }
 
     /// Retrieve a response by ID (for `GET /v1/responses/{id}`).
-    async fn get(
-        &self,
-        response_id: &str,
-    ) -> Result<Option<serde_json::Value>, StoreError> {
+    async fn get(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
         let _ = response_id;
         Ok(None)
     }

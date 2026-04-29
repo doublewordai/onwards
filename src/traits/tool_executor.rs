@@ -48,6 +48,26 @@ impl RequestContext {
     }
 }
 
+/// Dispatch kind for a server-side tool.
+///
+/// Onwards stays agnostic to the underlying implementation (HTTP, MCP,
+/// sandboxed execution, etc.) — `Http` covers anything the executor
+/// fires-and-returns through [`ToolExecutor::execute`]. `Agent` is the
+/// only special case: when the multi-step orchestration loop encounters
+/// a step whose tool has `kind = Agent`, it recurses into a sub-loop
+/// scoped under that step instead of calling `execute`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolKind {
+    /// Standard tool. The loop calls [`ToolExecutor::execute`] and
+    /// persists the returned payload as the step's `response_payload`.
+    #[default]
+    Http,
+    /// Sub-agent dispatch. The loop recurses with `scope_parent =
+    /// Some(step_id)` and `depth + 1`. The sub-loop's final return value
+    /// becomes the spawning step's `response_payload`.
+    Agent,
+}
+
 /// Schema for a server-side tool, returned by [`ToolExecutor::tools`].
 #[derive(Debug, Clone)]
 pub struct ToolSchema {
@@ -59,6 +79,11 @@ pub struct ToolSchema {
     pub parameters: serde_json::Value,
     /// Whether to enforce strict schema adherence (OpenAI-specific).
     pub strict: bool,
+    /// Dispatch kind. Defaults to [`ToolKind::Http`] so existing
+    /// implementations that don't set this field continue to behave
+    /// exactly as before.
+    #[doc(hidden)] // hide from rendered docs while the field is opt-in
+    pub kind: ToolKind,
 }
 
 /// Error type for tool execution
