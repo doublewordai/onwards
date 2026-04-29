@@ -65,8 +65,9 @@ use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 pub use response_loop::{LoopConfig, LoopError, run_response_loop};
 pub use traits::{
-    NextAction, NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StepDescriptor,
-    StepKind, StoreError, ToolError, ToolExecutor, ToolSchema,
+    ChainStep, ExecutorError, MultiStepStore, NextAction, NoOpResponseStore, NoOpToolExecutor,
+    RecordedStep, RequestContext, ResponseStore, StepDescriptor, StepExecutor, StepKind, StepState,
+    StoreError, ToolDispatch, ToolError, ToolExecutor, ToolSchema,
 };
 
 /// Type alias for body transformation function
