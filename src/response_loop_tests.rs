@@ -565,3 +565,166 @@ async fn list_chain_observes_persisted_steps() {
     assert!(matches!(chain[0].state, StepState::Completed));
     assert_eq!(chain[1].prev_step_id.as_deref(), Some(&*chain[0].id));
 }
+
+/// Regression test for the resume-with-existing-chain bug: when a worker
+/// resumes a request that already has persisted steps, new steps must
+/// chain onto the existing tail's id, not start a parallel chain from
+/// the head.
+#[tokio::test]
+async fn resume_picks_up_chain_tail_for_prev_step_id() {
+    let store = MockStore::new();
+    let executor = MockExecutor::new();
+
+    // Pre-populate the store with a completed step (simulating crash
+    // recovery: a previous worker finished step_001 before dying).
+    let preexisting = store
+        .record_step(
+            "req_1",
+            None,
+            None,
+            &StepDescriptor {
+                kind: StepKind::ModelCall,
+                request_payload: json!({"prior": true}),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .complete_step(&preexisting.id, &json!({"output": "prior"}))
+        .await
+        .unwrap();
+
+    // The resumed loop appends one more step then completes.
+    store.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![model_call(json!({"resumed": true}))]),
+            NextAction::Complete(json!({"done": true})),
+        ],
+    );
+
+    run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0)
+        .await
+        .unwrap();
+
+    let chain = store.list_chain("req_1", None).await.unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[0].id, preexisting.id);
+    // The new step's prev_step_id must point at the pre-existing tail,
+    // not None.
+    assert_eq!(
+        chain[1].prev_step_id.as_deref(),
+        Some(preexisting.id.as_str()),
+        "resumed step must chain onto existing tail, not start a parallel chain"
+    );
+    assert_eq!(chain[1].sequence, preexisting.sequence + 1);
+}
+
+/// Regression test for the swallow-store-error bug: a storage-layer
+/// failure observed *during* execute_step (via the recursive sub-loop
+/// or a flaky storage call) must abort the loop, not be downgraded to
+/// a fail_step + Ok(()) and silently masked.
+#[tokio::test]
+async fn store_error_inside_execute_step_propagates() {
+    use std::sync::Mutex;
+
+    /// Wrapper that fails complete_step on the first call. Forces a
+    /// storage-layer error to surface from inside execute_step's
+    /// outcome match.
+    struct FlakyStore {
+        inner: MockStore,
+        complete_failures_remaining: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl MultiStepStore for FlakyStore {
+        async fn next_action_for(
+            &self,
+            request_id: &str,
+            scope_parent: Option<&str>,
+        ) -> Result<NextAction, StoreError> {
+            self.inner.next_action_for(request_id, scope_parent).await
+        }
+        async fn record_step(
+            &self,
+            request_id: &str,
+            scope_parent: Option<&str>,
+            prev_step: Option<&str>,
+            descriptor: &StepDescriptor,
+        ) -> Result<RecordedStep, StoreError> {
+            self.inner
+                .record_step(request_id, scope_parent, prev_step, descriptor)
+                .await
+        }
+        async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
+            self.inner.mark_step_processing(step_id).await
+        }
+        async fn complete_step(
+            &self,
+            step_id: &str,
+            payload: &serde_json::Value,
+        ) -> Result<(), StoreError> {
+            let should_fail = {
+                let mut remaining = self.complete_failures_remaining.lock().unwrap();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_fail {
+                return Err(StoreError::StorageError(
+                    "synthetic complete_step failure".into(),
+                ));
+            }
+            self.inner.complete_step(step_id, payload).await
+        }
+        async fn fail_step(
+            &self,
+            step_id: &str,
+            error: &serde_json::Value,
+        ) -> Result<(), StoreError> {
+            self.inner.fail_step(step_id, error).await
+        }
+        async fn list_chain(
+            &self,
+            request_id: &str,
+            scope_parent: Option<&str>,
+        ) -> Result<Vec<ChainStep>, StoreError> {
+            self.inner.list_chain(request_id, scope_parent).await
+        }
+        async fn assemble_response(
+            &self,
+            request_id: &str,
+        ) -> Result<serde_json::Value, StoreError> {
+            self.inner.assemble_response(request_id).await
+        }
+    }
+
+    let store = FlakyStore {
+        inner: MockStore::new(),
+        complete_failures_remaining: Mutex::new(1),
+    };
+    let executor = MockExecutor::new();
+    store.inner.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![model_call(json!({}))]),
+            // If the store error were swallowed, the loop would call
+            // next_action_for again here and try Complete; surfacing
+            // means we should never reach this entry.
+            NextAction::Complete(json!({"unreachable": true})),
+        ],
+    );
+
+    let result =
+        run_response_loop(&store, &executor, "req_1", None, LoopConfig::default(), 0).await;
+
+    match result {
+        Err(LoopError::Store(StoreError::StorageError(msg))) => {
+            assert!(msg.contains("synthetic complete_step failure"));
+        }
+        other => panic!("expected LoopError::Store, got {:?}", other),
+    }
+}

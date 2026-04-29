@@ -185,7 +185,17 @@ where
         }
 
         let mut iterations: u32 = 0;
-        let mut prev_step: Option<String> = None;
+        // Initialize prev_step from the existing chain tail so resumed
+        // workers (crash recovery, executor handoff) chain new rows onto
+        // whatever the previous worker already persisted, rather than
+        // starting a parallel chain at the head. Walk the same scope the
+        // loop is about to operate on; rows are returned in sequence
+        // order so `.last()` is the tail.
+        let mut prev_step: Option<String> = store
+            .list_chain(request_id, scope_parent)
+            .await?
+            .last()
+            .map(|step| step.id.clone());
 
         loop {
             if iterations >= config.max_response_iterations {
@@ -310,6 +320,15 @@ where
                 store.complete_step(step_id, &payload).await?;
                 Ok(())
             }
+            // Storage-layer failures inside execution (e.g. a sub-loop's
+            // record_step or complete_step failed) propagate. Trying to
+            // call fail_step on a store that's already broken is at best
+            // pointless and at worst masks the real error.
+            Err(loop_err @ LoopError::Store(_)) => Err(loop_err),
+            // Executor errors, transition Fail outcomes, and cap
+            // violations from sub-loops are step-level failures: persist
+            // them and let the next next_action_for iteration decide
+            // recovery.
             Err(loop_err) => {
                 let error_payload = error_to_payload(&loop_err);
                 store.fail_step(step_id, &error_payload).await?;
