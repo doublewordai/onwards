@@ -13,10 +13,12 @@
 //!   tool's schema, and model calls are fired by the loop directly via
 //!   the configured HTTP client.
 
+#[cfg(feature = "multi-step")]
 mod multi_step_store;
 mod response_store;
 mod tool_executor;
 
+#[cfg(feature = "multi-step")]
 pub use multi_step_store::{
     ChainStep, ExecutorError, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind,
     StepState,

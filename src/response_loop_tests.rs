@@ -6,23 +6,26 @@
 //! per-step results, and declares each tool's [`ToolKind`] so the
 //! loop's HTTP-vs-Agent dispatch can be exercised.
 //!
-//! Model calls are fired via onwards' real `HttpClient` trait against
-//! a wiremock server, so the loop's HTTP path is exercised by the
-//! same code that handles single-step proxying.
+//! Model calls are fired via fusillade's `ReqwestHttpClient` against a
+//! wiremock server, so the loop's HTTP path is exercised by the same
+//! code production uses for batch / single-step fires (which gets us
+//! header-stamping for free).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
+use fusillade::{RequestId, ReqwestHttpClient};
 use serde_json::json;
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::client::create_hyper_client;
 use crate::response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
 use crate::traits::{
-    ChainStep, MultiStepStore, NextAction, RecordedStep, RequestContext, StepDescriptor,
-    StepKind, StepState, StoreError, ToolError, ToolExecutor, ToolKind, ToolSchema,
+    ChainStep, MultiStepStore, NextAction, RecordedStep, RequestContext, StepDescriptor, StepKind,
+    StepState, StoreError, ToolError, ToolExecutor, ToolKind, ToolSchema,
 };
 
 #[derive(Debug, Default)]
@@ -139,7 +142,19 @@ impl MultiStepStore for MockStore {
             },
         );
         state.record_order.push(id.clone());
-        Ok(RecordedStep { id, sequence })
+        // Mirror the storage contract: model_call steps allocate a
+        // fusillade sub-request row; tool_call steps don't. Tests don't
+        // verify the UUID value itself — they only need it to be `Some`
+        // so `execute_step` doesn't bail with "missing sub_request_id".
+        let sub_request_id = match descriptor.kind {
+            StepKind::ModelCall => Some(RequestId(Uuid::new_v4())),
+            StepKind::ToolCall => None,
+        };
+        Ok(RecordedStep {
+            id,
+            sequence,
+            sub_request_id,
+        })
     }
 
     async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
@@ -300,9 +315,11 @@ fn tool_call(name: &str, args: serde_json::Value) -> StepDescriptor {
 }
 
 /// Spin up a wiremock server that returns a sequence of model
-/// responses on POSTs to /chat. Returns the server (kept alive) and
-/// the URL.
-async fn model_wiremock(responses: Vec<serde_json::Value>) -> (MockServer, String) {
+/// responses on POSTs to /chat. Returns the server (kept alive), the
+/// `endpoint` (host base) and `path` (`/chat`) for use as
+/// [`UpstreamTarget`] fields — fusillade's HttpClient consumes them
+/// separately, and its streaming dispatch keys on `path`.
+async fn model_wiremock(responses: Vec<serde_json::Value>) -> (MockServer, String, String) {
     let server = MockServer::start().await;
     for body in responses {
         Mock::given(method("POST"))
@@ -312,12 +329,36 @@ async fn model_wiremock(responses: Vec<serde_json::Value>) -> (MockServer, Strin
             .mount(&server)
             .await;
     }
-    let url = format!("{}/chat", server.uri());
-    (server, url)
+    let endpoint = server.uri();
+    (server, endpoint, "/chat".to_string())
 }
 
-fn http_client_for_tests() -> Arc<dyn crate::client::HttpClient + Send + Sync> {
-    Arc::new(create_hyper_client(10, 30))
+/// HTTP client for tests — fusillade's real `ReqwestHttpClient` with
+/// generous timeouts. `streamable_endpoints` is empty so every fire
+/// goes through the buffered branch by default (wiremock-returned
+/// non-SSE JSON bodies would otherwise be passed to the SSE
+/// reassembler and produce empty chunks). The streaming test wires up
+/// its own client via `streaming_http_client_for_tests`.
+fn http_client_for_tests() -> Arc<ReqwestHttpClient> {
+    Arc::new(ReqwestHttpClient::new(
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        Vec::new(),
+    ))
+}
+
+/// Client variant for the streaming SSE test: marks `/chat` streamable
+/// so fusillade reads the wiremock SSE response chunk-by-chunk and the
+/// per-event callback drives the sink-forwarding bridge in
+/// `fire_model_call`.
+fn streaming_http_client_for_tests() -> Arc<ReqwestHttpClient> {
+    Arc::new(ReqwestHttpClient::new(
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+        vec!["/chat".to_string()],
+    ))
 }
 
 #[tokio::test]
@@ -326,7 +367,8 @@ async fn complete_immediately_returns_payload() {
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(None, vec![NextAction::Complete(json!({"final": true}))]);
@@ -356,7 +398,8 @@ async fn fail_immediately_returns_loop_error_failed() {
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(None, vec![NextAction::Fail(json!({"reason": "bad"}))]);
@@ -384,13 +427,14 @@ async fn fail_immediately_returns_loop_error_failed() {
 async fn single_model_call_then_complete_routes_through_real_http_client() {
     // Exercises the model fire path: real onwards HttpClient (HyperClient)
     // POSTs to wiremock, body parsed back into the step's response_payload.
-    let (_model, url) = model_wiremock(vec![json!({"output": "hello"})]).await;
+    let (_model, endpoint, path) = model_wiremock(vec![json!({"output": "hello"})]).await;
 
     let store = MockStore::new();
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url,
+        endpoint,
+        path,
         api_key: None,
     };
     store.script(
@@ -435,7 +479,8 @@ async fn parallel_fan_out_chains_prev_step_id() {
     tool_exec.register("c", ToolKind::Http);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
 
@@ -499,7 +544,8 @@ async fn step_failure_does_not_abort_loop() {
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: format!("{}/chat", server.uri()),
+        endpoint: server.uri(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(
@@ -540,7 +586,8 @@ async fn max_iterations_cap_fires() {
     tool_exec.register("a", ToolKind::Http);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     let mut script = Vec::new();
@@ -580,7 +627,8 @@ async fn agent_kind_tool_triggers_recursion() {
     tool_exec.register("delegate", ToolKind::Agent);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(
@@ -631,7 +679,8 @@ async fn http_kind_tool_routes_through_tool_executor() {
     tool_exec.register("calculator", ToolKind::Http);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(
@@ -669,7 +718,8 @@ async fn empty_action_returns_empty_action_error() {
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     store.script(None, vec![NextAction::AppendSteps(vec![])]);
@@ -697,7 +747,8 @@ async fn resume_picks_up_chain_tail_for_prev_step_id() {
     tool_exec.register("a", ToolKind::Http);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
 
@@ -713,7 +764,10 @@ async fn resume_picks_up_chain_tail_for_prev_step_id() {
         )
         .await
         .unwrap();
-    store.complete_step(&preexisting.id, &json!({"prior": true})).await.unwrap();
+    store
+        .complete_step(&preexisting.id, &json!({"prior": true}))
+        .await
+        .unwrap();
 
     store.script(
         None,
@@ -774,7 +828,8 @@ async fn streaming_model_call_forwards_token_deltas_and_emits_terminals() {
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: format!("{}/chat", server.uri()),
+        endpoint: server.uri(),
+        path: "/chat".into(),
         api_key: None,
     };
     let sink = RecordingSink::new();
@@ -795,7 +850,7 @@ async fn streaming_model_call_forwards_token_deltas_and_emits_terminals() {
         &tool_exec,
         &ctx,
         &target,
-        http_client_for_tests(),
+        streaming_http_client_for_tests(),
         Some(&sink),
         "req_1",
         None,
@@ -818,7 +873,11 @@ async fn streaming_model_call_forwards_token_deltas_and_emits_terminals() {
         kinds
     );
     assert!(
-        kinds.iter().filter(|k| **k == LoopEventKind::OutputTextDelta).count() >= 2,
+        kinds
+            .iter()
+            .filter(|k| **k == LoopEventKind::OutputTextDelta)
+            .count()
+            >= 2,
         "expected ≥2 OutputTextDelta events, got {:?}",
         kinds
     );
@@ -837,7 +896,10 @@ async fn streaming_model_call_forwards_token_deltas_and_emits_terminals() {
     assert_eq!(text_deltas, vec!["Hello".to_string(), " world".to_string()]);
 
     // The Created event has sequence 0 (the canonical start cursor).
-    let created = events.iter().find(|e| e.kind == LoopEventKind::Created).unwrap();
+    let created = events
+        .iter()
+        .find(|e| e.kind == LoopEventKind::Created)
+        .unwrap();
     assert_eq!(created.sequence, 0);
 }
 
@@ -850,7 +912,8 @@ async fn tool_call_emits_output_item_done_to_sink() {
     tool_exec.register("calculator", ToolKind::Http);
     let ctx = RequestContext::new();
     let target = UpstreamTarget {
-        url: "http://unused".into(),
+        endpoint: "http://unused".into(),
+        path: "/chat".into(),
         api_key: None,
     };
     let sink = RecordingSink::new();
@@ -884,7 +947,11 @@ async fn tool_call_emits_output_item_done_to_sink() {
         .filter(|e| e.kind == LoopEventKind::OutputItemDone)
         .filter(|e| e.data["type"] == "function_call_output")
         .collect();
-    assert_eq!(tool_done.len(), 1, "tool_call should emit one output_item.done");
+    assert_eq!(
+        tool_done.len(),
+        1,
+        "tool_call should emit one output_item.done"
+    );
     assert!(
         events.iter().any(|e| e.kind == LoopEventKind::Completed),
         "terminal Completed event should be emitted"
@@ -898,11 +965,15 @@ async fn non_streaming_model_call_emits_no_token_deltas() {
     // terminal events still fire.
     use crate::streaming::{LoopEventKind, RecordingSink};
 
-    let (_model, url) = model_wiremock(vec![json!({"output": "hello"})]).await;
+    let (_model, endpoint, path) = model_wiremock(vec![json!({"output": "hello"})]).await;
     let store = MockStore::new();
     let tool_exec = ScriptedToolExecutor::new();
     let ctx = RequestContext::new();
-    let target = UpstreamTarget { url, api_key: None };
+    let target = UpstreamTarget {
+        endpoint,
+        path,
+        api_key: None,
+    };
     let sink = RecordingSink::new();
 
     store.script(

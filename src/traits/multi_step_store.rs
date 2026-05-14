@@ -26,6 +26,7 @@
 //! to touch [`MultiStepStore`] at all.
 
 use async_trait::async_trait;
+use fusillade::RequestId;
 use std::fmt;
 
 use super::response_store::StoreError;
@@ -95,10 +96,19 @@ pub enum NextAction {
 /// A step row recorded by [`MultiStepStore::record_step`]. Carries both
 /// the assigned id and its monotonic sequence value so the loop can chain
 /// siblings without a separate sequence-allocation round-trip.
+///
+/// For `model_call` steps, `sub_request_id` carries the
+/// `fusillade.requests` row id that the implementor created for this
+/// step's HTTP fire — the loop stamps it as `X-Fusillade-Request-Id` on
+/// the outgoing call so the `http_analytics` row produced by outlet
+/// middleware lines up with the right row in `requests`. For `tool_call`
+/// steps it's `None` (per the `response_steps` CHECK constraint —
+/// tool dispatch has its own analytics path).
 #[derive(Debug, Clone)]
 pub struct RecordedStep {
     pub id: String,
     pub sequence: i64,
+    pub sub_request_id: Option<RequestId>,
 }
 
 /// A read-only projection of a step row, returned by
