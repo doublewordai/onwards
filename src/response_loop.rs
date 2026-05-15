@@ -88,8 +88,11 @@ pub struct UpstreamTarget {
     /// Path component matched against fusillade's `streamable_endpoints`
     /// list (e.g. `/v1/chat/completions`).
     pub path: String,
-    /// Bearer token for the upstream call, if any. `None` skips the
-    /// `Authorization` header.
+    /// Bearer token for the upstream call. `None` and `Some("")` are
+    /// equivalent: both result in no `Authorization` header on the
+    /// outgoing request (fusillade's `ReqwestHttpClient` only stamps
+    /// the header when the api_key is non-empty), so callers can use
+    /// whichever shape matches their config-loading code.
     pub api_key: Option<String>,
 }
 
@@ -576,12 +579,18 @@ async fn fire_model_call<H: FusilladeHttpClient + 'static>(
     let response = if stream_mode {
         // Bridge: the callback is synchronous (fusillade's contract — see
         // its StreamEventCallback docstring) but the sink is async. Push
-        // LoopEvents through an unbounded mpsc; a drain future running
+        // LoopEvents through a bounded mpsc; a drain future running
         // concurrently with the model fire awaits them and forwards.
         // When fusillade's `execute_with_event_callback` returns, the
         // last Arc<dyn StreamEventCallback> drops, the Sender drops, the
         // channel closes, and the drain future completes naturally.
-        let (event_tx, event_rx) = mpsc::unbounded_channel::<crate::streaming::LoopEvent>();
+        //
+        // Bounded capacity caps memory if the downstream sink stalls
+        // (slow / disconnected client). Overflow drops the newest event
+        // — `try_emit` already swallows sink-emit failures, so the
+        // overall semantic is "best-effort live tail" either way.
+        let (event_tx, event_rx) =
+            mpsc::channel::<crate::streaming::LoopEvent>(SINK_BRIDGE_CAPACITY);
         let callback: Arc<dyn StreamEventCallback> = Arc::new(SinkChannelCallback {
             tx: event_tx,
             step_sequence,
@@ -621,27 +630,36 @@ async fn fire_model_call<H: FusilladeHttpClient + 'static>(
     })
 }
 
+/// Capacity of the bridge channel between fusillade's per-chunk
+/// callback and the async event sink. Picked to hold a comfortable
+/// burst of token deltas (an LLM emitting at hundreds-of-tokens/s
+/// while the client is briefly stalled) without unbounded growth.
+/// Overflow drops the newest event — fusillade's reassembler still
+/// produces the correct final body, so only the live tail is affected.
+const SINK_BRIDGE_CAPACITY: usize = 1024;
+
 /// Synchronous [`StreamEventCallback`] that bridges fusillade's
 /// chunk-by-chunk SSE callbacks into onwards' async [`EventSink`]
-/// vocabulary via an unbounded mpsc channel. The drain side of the
+/// vocabulary via a bounded mpsc channel. The drain side of the
 /// channel runs concurrently with the model fire (see
 /// [`fire_model_call`]) and forwards each event to the sink.
 ///
-/// Unbounded send is fine here: token chunks are small and the consumer
-/// (an axum SSE response) processes them as fast as they arrive over
-/// HTTP chunked transfer. The actual upstream-throttling backpressure
-/// surface is the model itself, not the channel.
+/// Uses `try_send` so the callback stays synchronous — overflow
+/// (drain side slow / client stalled) drops the event instead of
+/// blocking the upstream-read loop and tripping `body_timeout`.
 struct SinkChannelCallback {
-    tx: mpsc::UnboundedSender<crate::streaming::LoopEvent>,
+    tx: mpsc::Sender<crate::streaming::LoopEvent>,
     step_sequence: i64,
 }
 
 impl StreamEventCallback for SinkChannelCallback {
-    fn on_event(&self, event: &StreamEvent) {
+    fn on_event(&self, event: &StreamEvent<'_>) {
         for loop_event in delta_loop_events(event, self.step_sequence) {
-            // Drop events if the receiver was dropped — same best-effort
-            // semantic as `streaming::try_emit`'s closed-sink path.
-            let _ = self.tx.send(loop_event);
+            // Drop on closed/full channel — same best-effort semantic
+            // as `streaming::try_emit`'s closed-sink path. A full
+            // channel here means the SSE consumer is too slow; the
+            // reassembled final body is unaffected, only the live tail.
+            let _ = self.tx.try_send(loop_event);
         }
     }
 }

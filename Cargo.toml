@@ -70,7 +70,12 @@ metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-fusillade = { path = "../fusillade", optional = true }
+# Tracking the fusillade `feat/streaming-event-callback` branch until
+# the new `StreamEvent` / `StreamEventCallback` types ship in a tagged
+# release. Switch this to `version = "17.X"` once fusillade publishes
+# the matching version on crates.io and update the changelog entry to
+# match.
+fusillade = { git = "https://github.com/doublewordai/fusillade", branch = "feat/streaming-event-callback", optional = true }
 
 [dev-dependencies]
 axum-test = "18.0.0"

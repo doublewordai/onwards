@@ -425,7 +425,7 @@ async fn fail_immediately_returns_loop_error_failed() {
 
 #[tokio::test]
 async fn single_model_call_then_complete_routes_through_real_http_client() {
-    // Exercises the model fire path: real onwards HttpClient (HyperClient)
+    // Exercises the model fire path: real fusillade ReqwestHttpClient
     // POSTs to wiremock, body parsed back into the step's response_payload.
     let (_model, endpoint, path) = model_wiremock(vec![json!({"output": "hello"})]).await;
 
