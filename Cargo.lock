@@ -985,8 +985,8 @@ dependencies = [
 
 [[package]]
 name = "fusillade"
-version = "17.0.0"
-source = "git+https://github.com/doublewordai/fusillade?branch=feat%2Fstreaming-event-callback#41d5c52130286877a8cbefb4c8ad2091c0e9835f"
+version = "17.0.1"
+source = "git+https://github.com/doublewordai/fusillade?branch=main#975433e0812ee59d19609f54940e662bf25a64e5"
 dependencies = [
  "anyhow",
  "async-trait",
