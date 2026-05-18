@@ -70,11 +70,7 @@ metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-# Tracking fusillade `main` until the streaming-event-callback work
-# (already merged) ships in a tagged release. Switch this to
-# `version = "17.X"` once fusillade publishes the matching version
-# on crates.io.
-fusillade = { git = "https://github.com/doublewordai/fusillade", branch = "main", optional = true }
+fusillade = { version = "17.0.2", optional = true }
 
 [dev-dependencies]
 axum-test = "18.0.0"
