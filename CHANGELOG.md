@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0](https://github.com/doublewordai/onwards/compare/v0.27.0...v0.28.0) - 2026-05-18
+
+### Added
+
+- multi-step feature flag use of fusillade ([#188](https://github.com/doublewordai/onwards/pull/188))
+
+### Other
+
+- README section for multi-step Open Responses loop ([#190](https://github.com/doublewordai/onwards/pull/190))
+
 ## [0.27.0](https://github.com/doublewordai/onwards/compare/v0.26.1...v0.27.0) - 2026-04-29
 
 ### Added
