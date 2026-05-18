@@ -14,9 +14,15 @@
 //!   their [`ToolKind`]; [`ToolExecutor::execute`] runs `Http`-kind
 //!   tools. `Agent`-kind tools cause the loop to recurse into a sub-loop
 //!   instead of calling `execute`.
-//! - **Model calls** — fired directly by the loop using the supplied
-//!   `reqwest::Client` against the configured [`UpstreamTarget`]. No
-//!   trait abstraction.
+//! - **Model calls** — fired via [`fusillade::HttpClient`] against the
+//!   configured [`UpstreamTarget`]. Going through fusillade gets us the
+//!   `X-Fusillade-Request-Id` header stamping (using the
+//!   `RecordedStep.sub_request_id` the store handed back) for free, so
+//!   the `http_analytics` row produced by outlet middleware lines up
+//!   with the right row in `fusillade.requests`. Streaming responses
+//!   plug an [`fusillade::StreamEventCallback`] into the existing
+//!   chunk-read loop so live token deltas reach the [`EventSink`]
+//!   without losing fusillade's reassembly machinery.
 //!
 //! This means dwctl's existing `HttpToolExecutor` (which already
 //! implements `ToolExecutor`) plugs straight in — no wrapping, no
@@ -28,15 +34,18 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::http::header::AUTHORIZATION;
+use fusillade::{
+    HttpClient as FusilladeHttpClient, RequestData, RequestId, StreamEvent, StreamEventCallback,
+    TemplateId,
+};
 use serde_json::Value;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
-use crate::client::HttpClient;
 use crate::streaming::EventSink;
 use crate::traits::{
-    ChainStep, ExecutorError, MultiStepStore, NextAction, RequestContext, StepDescriptor,
-    StepKind, StoreError, ToolError, ToolExecutor, ToolKind,
+    ChainStep, ExecutorError, MultiStepStore, NextAction, RecordedStep, RequestContext,
+    StepDescriptor, StepKind, StoreError, ToolError, ToolExecutor, ToolKind,
 };
 
 /// Type alias for the recursive sub-loop call. Required because async fns
@@ -65,12 +74,25 @@ impl Default for LoopConfig {
 
 /// Where the loop should send model_call HTTP requests.
 ///
-/// The integration test passes a wiremock URL; production wiring will
-/// pass a target resolved through onwards' load balancer (this is the
-/// follow-up coupling for COR-349).
+/// Split into `endpoint` (base URL) + `path` rather than a single
+/// concatenated URL because fusillade's `HttpClient` classifies
+/// streaming-vs-buffered behavior off the `path` component of the
+/// `RequestData` it receives — passing the full URL in `endpoint` with
+/// `path = ""` defeats streamable-endpoint matching and forces every
+/// model fire down the non-streaming path.
 #[derive(Debug, Clone)]
 pub struct UpstreamTarget {
-    pub url: String,
+    /// Base URL — protocol + host + any prefix path that's not
+    /// streamable-dispatched (e.g. `http://127.0.0.1:3001/ai`).
+    pub endpoint: String,
+    /// Path component matched against fusillade's `streamable_endpoints`
+    /// list (e.g. `/v1/chat/completions`).
+    pub path: String,
+    /// Bearer token for the upstream call. `None` and `Some("")` are
+    /// equivalent: both result in no `Authorization` header on the
+    /// outgoing request (fusillade's `ReqwestHttpClient` only stamps
+    /// the header when the api_key is non-empty), so callers can use
+    /// whichever shape matches their config-loading code.
     pub api_key: Option<String>,
 }
 
@@ -133,12 +155,12 @@ impl From<ExecutorError> for LoopError {
 /// `tool_ctx` is the `RequestContext` passed to `ToolExecutor::tools`
 /// and `::execute` — carries the per-request resolved tool set for
 /// dwctl's middleware-driven model.
-pub fn run_response_loop<'a, S, T>(
+pub fn run_response_loop<'a, S, T, H>(
     store: &'a S,
     tool_executor: &'a T,
     tool_ctx: &'a RequestContext,
     model_target: &'a UpstreamTarget,
-    http_client: Arc<dyn HttpClient + Send + Sync>,
+    http_client: Arc<H>,
     event_sink: Option<&'a (dyn EventSink + 'a)>,
     request_id: &'a str,
     scope_parent: Option<&'a str>,
@@ -148,6 +170,7 @@ pub fn run_response_loop<'a, S, T>(
 where
     S: MultiStepStore + ?Sized,
     T: ToolExecutor + ?Sized,
+    H: FusilladeHttpClient + 'static,
 {
     Box::pin(async move {
         if depth > config.max_response_step_depth {
@@ -175,7 +198,8 @@ where
 
         // Once-per-response `created` event for the user-visible loop
         // (top-level only; sub-agents don't emit their own created).
-        if depth == 0 && scope_parent.is_none()
+        if depth == 0
+            && scope_parent.is_none()
             && let Some(sink) = event_sink
         {
             crate::streaming::try_emit(
@@ -242,9 +266,13 @@ where
                     // though execution is concurrent below. record_step
                     // allocates the sequence atomically — N siblings = N
                     // queries (no separate sequence-allocation
-                    // round-trip).
-                    let mut step_ids: Vec<String> = Vec::with_capacity(descriptors.len());
-                    let mut step_sequences: Vec<i64> = Vec::with_capacity(descriptors.len());
+                    // round-trip). RecordedStep also carries the
+                    // sub-request fusillade row id (Some for model_call,
+                    // None for tool_call) so execute_step can stamp it
+                    // as `X-Fusillade-Request-Id` on the outgoing HTTP
+                    // fire, lining up with the analytics row.
+                    let mut recorded_steps: Vec<RecordedStep> =
+                        Vec::with_capacity(descriptors.len());
                     let mut current_prev: Option<String> = prev_step.clone();
                     for descriptor in &descriptors {
                         let recorded = store
@@ -256,19 +284,15 @@ where
                             )
                             .await?;
                         current_prev = Some(recorded.id.clone());
-                        step_ids.push(recorded.id);
-                        step_sequences.push(recorded.sequence);
+                        recorded_steps.push(recorded);
                     }
 
                     // Execute siblings concurrently. Per-step failures
                     // are persisted via fail_step and swallowed; storage
                     // failures propagate. Sub-agent recursion happens
                     // inside execute_step.
-                    let futures = descriptors
-                        .iter()
-                        .zip(step_ids.iter())
-                        .zip(step_sequences.iter().copied())
-                        .map(|((descriptor, step_id), step_sequence)| {
+                    let futures = descriptors.iter().zip(recorded_steps.iter()).map(
+                        |(descriptor, recorded)| {
                             execute_step(
                                 store,
                                 tool_executor,
@@ -278,8 +302,9 @@ where
                                 event_sink,
                                 &kinds,
                                 request_id,
-                                step_id,
-                                step_sequence,
+                                &recorded.id,
+                                recorded.sequence,
+                                recorded.sub_request_id,
                                 descriptor,
                                 config,
                                 depth,
@@ -293,7 +318,7 @@ where
                         outcome?;
                     }
 
-                    prev_step = step_ids.last().cloned();
+                    prev_step = recorded_steps.last().map(|r| r.id.clone());
                 }
             }
         }
@@ -301,17 +326,18 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_step<'a, S, T>(
+fn execute_step<'a, S, T, H>(
     store: &'a S,
     tool_executor: &'a T,
     tool_ctx: &'a RequestContext,
     model_target: &'a UpstreamTarget,
-    http_client: Arc<dyn HttpClient + Send + Sync>,
+    http_client: Arc<H>,
     event_sink: Option<&'a (dyn EventSink + 'a)>,
     kinds: &'a HashMap<String, ToolKind>,
     request_id: &'a str,
     step_id: &'a str,
     step_sequence: i64,
+    sub_request_id: Option<RequestId>,
     descriptor: &'a StepDescriptor,
     config: LoopConfig,
     depth: u32,
@@ -319,15 +345,28 @@ fn execute_step<'a, S, T>(
 where
     S: MultiStepStore + ?Sized,
     T: ToolExecutor + ?Sized,
+    H: FusilladeHttpClient + 'static,
 {
     Box::pin(async move {
         store.mark_step_processing(step_id).await?;
 
         let outcome: Result<Value, LoopError> = match descriptor.kind {
             StepKind::ModelCall => {
+                // The store contract (RecordedStep) guarantees model_call
+                // steps carry a sub_request_id — that row anchors the
+                // analytics linkage. Surface a clean error rather than
+                // panicking if a store implementation violates it.
+                let sub_request_id = sub_request_id.ok_or_else(|| {
+                    LoopError::Executor(ExecutorError::ExecutionError(
+                        "model_call step has no sub_request_id; \
+                         MultiStepStore::record_step must populate it for ModelCall"
+                            .into(),
+                    ))
+                })?;
                 fire_model_call(
                     &*http_client,
                     model_target,
+                    sub_request_id,
                     &descriptor.request_payload,
                     event_sink,
                     step_sequence,
@@ -484,173 +523,182 @@ where
     }
 }
 
-async fn fire_model_call(
-    http_client: &(dyn HttpClient + Send + Sync),
+async fn fire_model_call<H: FusilladeHttpClient + 'static>(
+    http_client: &H,
     target: &UpstreamTarget,
+    sub_request_id: RequestId,
     request_payload: &Value,
     sink: Option<&dyn EventSink>,
     step_sequence: i64,
 ) -> Result<Value, LoopError> {
     // The user's `stream` flag propagates through the parent request →
-    // transition function → request_payload here. When true, we open a
-    // streaming HTTP request, parse SSE events, forward token deltas
-    // to the sink, and reassemble the final body via the upstream's
-    // own done-marker. When false, we POST and parse a single JSON
-    // body, ignoring the sink even if one is supplied (no SSE events
-    // to forward).
+    // transition function → request_payload here. When true, fusillade's
+    // streaming HTTP path parses SSE events, our callback forwards token
+    // deltas to the sink as each event arrives, and the reassembler
+    // hands us the final body. When false, we POST and parse a single
+    // JSON body, ignoring the sink even if one is supplied.
     let stream_mode = request_payload
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let body_bytes = serde_json::to_vec(request_payload).map_err(|e| {
+    let body = serde_json::to_string(request_payload).map_err(|e| {
         LoopError::Executor(ExecutorError::ExecutionError(format!(
             "model call body serialize: {e}"
         )))
     })?;
+    let model = request_payload
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let api_key = target.api_key.clone().unwrap_or_default();
 
-    let mut builder = axum::http::Request::builder()
-        .method(axum::http::Method::POST)
-        .uri(&target.url)
-        .header(axum::http::header::CONTENT_TYPE, "application/json");
-    if stream_mode {
-        builder = builder.header(axum::http::header::ACCEPT, "text/event-stream");
-    }
-    if let Some(key) = &target.api_key {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {key}"));
-    }
-    let req = builder.body(Body::from(body_bytes)).map_err(|e| {
-        LoopError::Executor(ExecutorError::ExecutionError(format!(
-            "model call request build: {e}"
-        )))
-    })?;
+    // Fusillade's RequestData is the input shape its HttpClient
+    // implementations consume. Most fields don't matter for the HTTP
+    // fire itself — they're metadata fusillade stamps as `x-fusillade-*`
+    // headers for analytics correlation. The two that DO matter for the
+    // wire are `endpoint + path` (URL composition) and `body`. `id` is
+    // load-bearing because it becomes the `X-Fusillade-Request-Id`
+    // header that lines the analytics row up with the sub-request row.
+    let request_data = RequestData {
+        id: sub_request_id,
+        batch_id: None,
+        template_id: TemplateId(Uuid::nil()),
+        custom_id: None,
+        endpoint: target.endpoint.clone(),
+        method: "POST".to_string(),
+        path: target.path.clone(),
+        body,
+        model,
+        api_key: api_key.clone(),
+        created_by: String::new(),
+        batch_metadata: HashMap::new(),
+    };
 
-    let resp = http_client.request(req).await.map_err(|e| {
+    let response = if stream_mode {
+        // Bridge: the callback is synchronous (fusillade's contract — see
+        // its StreamEventCallback docstring) but the sink is async. Push
+        // LoopEvents through a bounded mpsc; a drain future running
+        // concurrently with the model fire awaits them and forwards.
+        // When fusillade's `execute_with_event_callback` returns, the
+        // last Arc<dyn StreamEventCallback> drops, the Sender drops, the
+        // channel closes, and the drain future completes naturally.
+        //
+        // Bounded capacity caps memory if the downstream sink stalls
+        // (slow / disconnected client). Overflow drops the newest event
+        // — `try_emit` already swallows sink-emit failures, so the
+        // overall semantic is "best-effort live tail" either way.
+        let (event_tx, event_rx) =
+            mpsc::channel::<crate::streaming::LoopEvent>(SINK_BRIDGE_CAPACITY);
+        let callback: Arc<dyn StreamEventCallback> = Arc::new(SinkChannelCallback {
+            tx: event_tx,
+            step_sequence,
+        });
+        let drain_fut = async {
+            let mut rx = event_rx;
+            while let Some(event) = rx.recv().await {
+                if let Some(sink) = sink {
+                    crate::streaming::try_emit(sink, event).await;
+                }
+            }
+        };
+        let fire_fut =
+            http_client.execute_with_event_callback(&request_data, &api_key, Some(callback));
+        let (fire_result, _) = tokio::join!(fire_fut, drain_fut);
+        fire_result
+    } else {
+        http_client.execute(&request_data, &api_key).await
+    }
+    .map_err(|e| {
         LoopError::Executor(ExecutorError::ExecutionError(format!(
             "model call HTTP error: {e}"
         )))
     })?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .map_err(|e| {
-                LoopError::Executor(ExecutorError::ExecutionError(format!(
-                    "model call body read: {e}"
-                )))
-            })?;
-        let body_text = String::from_utf8_lossy(&body_bytes).into_owned();
+    if response.status < 200 || response.status >= 300 {
         return Err(LoopError::Executor(ExecutorError::ExecutionError(format!(
-            "model call returned HTTP {status}: {body_text}"
+            "model call returned HTTP {}: {}",
+            response.status, response.body
         ))));
     }
 
-    if stream_mode {
-        consume_streaming_model_response(resp, sink, step_sequence).await
-    } else {
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .map_err(|e| {
-                LoopError::Executor(ExecutorError::ExecutionError(format!(
-                    "model call body read: {e}"
-                )))
-            })?;
-        serde_json::from_slice::<Value>(&body_bytes).map_err(|e| {
-            LoopError::Executor(ExecutorError::ExecutionError(format!(
-                "model call body parse: {e}"
-            )))
-        })
-    }
-}
-
-/// Read an upstream `stream: true` response chunk by chunk, forwarding
-/// token deltas to the sink (if any) and reassembling the final body
-/// via [`openai_reassembler::reassemble`] for storage.
-///
-/// We forward two kinds of deltas:
-/// - assistant text content → `response.output_text.delta`
-/// - tool_call arguments → `response.function_call_arguments.delta`
-///
-/// Both carry the originating `step_sequence` as the SSE `id:` so
-/// reconnect-with-cursor can resume.
-async fn consume_streaming_model_response(
-    resp: axum::response::Response,
-    sink: Option<&dyn EventSink>,
-    step_sequence: i64,
-) -> Result<Value, LoopError> {
-    use eventsource_stream::Eventsource;
-    use futures_util::StreamExt;
-
-    let mut events: Vec<eventsource_stream::Event> = Vec::new();
-    let mut sse = resp.into_body().into_data_stream().eventsource();
-
-    while let Some(item) = sse.next().await {
-        let event = item.map_err(|e| {
-            LoopError::Executor(ExecutorError::ExecutionError(format!(
-                "SSE parse error: {e}"
-            )))
-        })?;
-
-        // Upstream signals end-of-stream with `data: [DONE]`. The
-        // openai-reassembler crate handles these markers internally, so
-        // we just drop them from the forwarded set and leave them in
-        // the event vec (their `data` is `[DONE]`, not JSON, and would
-        // be rejected by `serde_json::from_str`).
-        if event.data == "[DONE]" {
-            events.push(event);
-            break;
-        }
-
-        if let Some(sink) = sink {
-            forward_chunk_deltas(sink, &event, step_sequence).await;
-        }
-        events.push(event);
-    }
-
-    let reassembled = openai_reassembler::reassemble(&events).map_err(|e| {
+    serde_json::from_str::<Value>(&response.body).map_err(|e| {
         LoopError::Executor(ExecutorError::ExecutionError(format!(
-            "reassemble model stream: {e}"
-        )))
-    })?;
-    serde_json::from_str::<Value>(&reassembled).map_err(|e| {
-        LoopError::Executor(ExecutorError::ExecutionError(format!(
-            "reassembled body parse: {e}"
+            "model call body parse: {e}"
         )))
     })
 }
 
-/// Inspect an upstream SSE event and forward any token deltas to the
-/// sink. Best-effort: malformed events are skipped silently; the
-/// reassembler will produce the canonical final body regardless.
-async fn forward_chunk_deltas(sink: &dyn EventSink, event: &eventsource_stream::Event, sequence: i64) {
+/// Capacity of the bridge channel between fusillade's per-chunk
+/// callback and the async event sink. Picked to hold a comfortable
+/// burst of token deltas (an LLM emitting at hundreds-of-tokens/s
+/// while the client is briefly stalled) without unbounded growth.
+/// Overflow drops the newest event — fusillade's reassembler still
+/// produces the correct final body, so only the live tail is affected.
+const SINK_BRIDGE_CAPACITY: usize = 1024;
+
+/// Synchronous [`StreamEventCallback`] that bridges fusillade's
+/// chunk-by-chunk SSE callbacks into onwards' async [`EventSink`]
+/// vocabulary via a bounded mpsc channel. The drain side of the
+/// channel runs concurrently with the model fire (see
+/// [`fire_model_call`]) and forwards each event to the sink.
+///
+/// Uses `try_send` so the callback stays synchronous — overflow
+/// (drain side slow / client stalled) drops the event instead of
+/// blocking the upstream-read loop and tripping `body_timeout`.
+struct SinkChannelCallback {
+    tx: mpsc::Sender<crate::streaming::LoopEvent>,
+    step_sequence: i64,
+}
+
+impl StreamEventCallback for SinkChannelCallback {
+    fn on_event(&self, event: &StreamEvent<'_>) {
+        for loop_event in delta_loop_events(event, self.step_sequence) {
+            // Drop on closed/full channel — same best-effort semantic
+            // as `streaming::try_emit`'s closed-sink path. A full
+            // channel here means the SSE consumer is too slow; the
+            // reassembled final body is unaffected, only the live tail.
+            let _ = self.tx.try_send(loop_event);
+        }
+    }
+}
+
+/// Translate one upstream SSE event into zero or more [`LoopEvent`]s.
+///
+/// Forwards two kinds of deltas:
+/// - assistant text content → `response.output_text.delta`
+/// - tool_call arguments → `response.function_call_arguments.delta`
+///
+/// Both carry the originating `step_sequence` as the SSE `id:` so
+/// reconnect-with-cursor can resume. Malformed events and the `[DONE]`
+/// marker return no events (fusillade's reassembler handles `[DONE]`
+/// internally).
+fn delta_loop_events(event: &StreamEvent, sequence: i64) -> Vec<crate::streaming::LoopEvent> {
+    use crate::streaming::{LoopEvent, LoopEventKind};
+
+    let mut out = Vec::new();
     let parsed: Value = match serde_json::from_str(&event.data) {
         Ok(v) => v,
-        Err(_) => return,
+        Err(_) => return out,
     };
-
     let choices = match parsed.get("choices").and_then(|c| c.as_array()) {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return,
+        _ => return out,
     };
-
     let delta = match choices[0].get("delta") {
         Some(d) => d,
-        None => return,
+        None => return out,
     };
 
     if let Some(text) = delta.get("content").and_then(|c| c.as_str())
         && !text.is_empty()
     {
-        crate::streaming::try_emit(
-            sink,
-            crate::streaming::LoopEvent {
-                sequence,
-                kind: crate::streaming::LoopEventKind::OutputTextDelta,
-                data: serde_json::json!({"delta": text}),
-            },
-        )
-        .await;
+        out.push(LoopEvent {
+            sequence,
+            kind: LoopEventKind::OutputTextDelta,
+            data: serde_json::json!({"delta": text}),
+        });
     }
 
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
@@ -665,18 +713,16 @@ async fn forward_chunk_deltas(sink: &dyn EventSink, event: &eventsource_stream::
                     .get("id")
                     .and_then(|x| x.as_str())
                     .unwrap_or("call_unknown");
-                crate::streaming::try_emit(
-                    sink,
-                    crate::streaming::LoopEvent {
-                        sequence,
-                        kind: crate::streaming::LoopEventKind::FunctionCallArgumentsDelta,
-                        data: serde_json::json!({"call_id": call_id, "delta": args}),
-                    },
-                )
-                .await;
+                out.push(LoopEvent {
+                    sequence,
+                    kind: LoopEventKind::FunctionCallArgumentsDelta,
+                    data: serde_json::json!({"call_id": call_id, "delta": args}),
+                });
             }
         }
     }
+
+    out
 }
 
 fn translate_tool_error(e: ToolError) -> ExecutorError {
