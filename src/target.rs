@@ -88,6 +88,15 @@ pub struct ProviderSpec {
     /// When None (default), inherits the pool-level `trusted` setting.
     #[serde(default)]
     pub trusted: Option<bool>,
+
+    /// Propagate W3C trace context (traceparent / tracestate) on outbound
+    /// requests to this provider. When unset, defaults to the resolved
+    /// `trusted` value — providers participating in our distributed tracing
+    /// fabric (typically self-hosted upstreams marked `trusted: true`) receive
+    /// trace context; external providers do not. Explicit `Some(true)` /
+    /// `Some(false)` overrides the inherited value.
+    #[serde(default)]
+    pub propagate_trace_context: Option<bool>,
 }
 
 /// Configuration for Open Responses API behavior
@@ -346,6 +355,7 @@ impl TargetSpecOrList {
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
                         trusted: None, // pool-level trusted handles this for legacy format
+                        propagate_trace_context: None, // inherits from resolved trusted
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -382,6 +392,7 @@ impl TargetSpecOrList {
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
                     trusted: None, // pool-level trusted handles this for single-provider format
+                    propagate_trace_context: None, // inherits from resolved trusted
                 };
                 Ok(PoolConfig {
                     keys,
@@ -435,6 +446,7 @@ impl From<TargetSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
+            propagate_trace_context: None,
         }
     }
 }
@@ -459,6 +471,7 @@ impl From<ProviderSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
+            propagate_trace_context: value.propagate_trace_context,
         }
     }
 }
@@ -604,6 +617,9 @@ pub struct Target {
     /// Per-provider override for strict mode error sanitization trust.
     /// None means inherit from the pool-level trusted setting.
     pub trusted: Option<bool>,
+    /// Per-provider override for W3C trace context propagation on outbound
+    /// requests. None means inherit from the resolved trusted value.
+    pub propagate_trace_context: Option<bool>,
 }
 
 impl Target {
@@ -2144,6 +2160,7 @@ mod tests {
                 open_responses: None,
                 request_timeout_secs: None,
                 trusted: None,
+                propagate_trace_context: None,
             }],
         };
 
