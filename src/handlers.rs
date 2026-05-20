@@ -104,14 +104,6 @@ struct OriginalModel(String);
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTrust(pub(crate) bool);
 
-/// Filters and modifies headers before forwarding to upstream
-///
-/// This function implements RFC 7230 compliant proxy behavior by:
-/// - Removing hop-by-hop headers (connection, keep-alive, etc.)
-/// - Stripping authentication headers to prevent credential leakage
-/// - Removing browser-specific context headers (sec-*, origin, referer)
-/// - Adding upstream authentication if configured
-/// - Adding X-Forwarded-* headers for transparency
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
 /// when unset, defaults to the resolved trusted value (per-provider `trusted`
@@ -123,6 +115,14 @@ fn resolve_trace_propagation(target: &Target, pool_trusted: bool) -> bool {
         .unwrap_or_else(|| target.trusted.unwrap_or(pool_trusted))
 }
 
+/// Filters and modifies headers before forwarding to upstream
+///
+/// This function implements RFC 7230 compliant proxy behavior by:
+/// - Removing hop-by-hop headers (connection, keep-alive, etc.)
+/// - Stripping authentication headers to prevent credential leakage
+/// - Removing browser-specific context headers (sec-*, origin, referer)
+/// - Adding upstream authentication if configured
+/// - Adding X-Forwarded-* headers for transparency
 fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     // Headers to remove: hop-by-hop (RFC 7230), auth, browser context, and routing headers
     const HEADERS_TO_STRIP: &[&str] = &[

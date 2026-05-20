@@ -267,6 +267,13 @@ pub struct TargetSpec {
     #[builder(default)]
     pub trusted: bool,
 
+    /// Propagate W3C trace context (traceparent / tracestate) on outbound
+    /// requests to this provider. Same semantics as `ProviderSpec`'s
+    /// equivalent field — when unset, defaults to the resolved trusted
+    /// value. Honoured for the legacy single-provider config format.
+    #[serde(default)]
+    pub propagate_trace_context: Option<bool>,
+
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
     /// If fallback is enabled, the next provider will be tried.
@@ -392,7 +399,10 @@ impl TargetSpecOrList {
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
                     trusted: None, // pool-level trusted handles this for single-provider format
-                    propagate_trace_context: None, // inherits from resolved trusted
+                    // Carry the legacy spec's explicit override (if any). Without
+                    // this, setting propagate_trace_context on the single-provider
+                    // YAML form would be silently dropped.
+                    propagate_trace_context: spec.propagate_trace_context,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -446,7 +456,7 @@ impl From<TargetSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
-            propagate_trace_context: None,
+            propagate_trace_context: value.propagate_trace_context,
         }
     }
 }
