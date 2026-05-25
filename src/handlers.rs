@@ -985,7 +985,13 @@ pub async fn target_message_handler<T: HttpClient>(
                 if (attempt_number as usize) < pool_max_attempts
                     && let Some(backoff) = pool.fallback().and_then(|f| f.backoff.as_ref())
                 {
-                    let delay = backoff.delay(attempt_number);
+                    // `attempt_number` is the count of the attempt that just
+                    // failed (1-indexed), which matches `BackoffConfig::delay`'s
+                    // retry-index contract: `delay(N)` is the wait that goes
+                    // *before* attempt N+1. Bind it locally so the relationship
+                    // is obvious if the loop counter is ever refactored.
+                    let retry_index = attempt_number;
+                    let delay = backoff.delay(retry_index);
                     let delay_ms = delay.as_millis() as u64;
                     let next_total = total_backoff_ms.saturating_add(delay_ms);
                     if let Some(max_total) = pool.fallback().and_then(|f| f.max_total_backoff_ms)
@@ -1003,7 +1009,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     total_backoff_ms = next_total;
                     metrics::counter!("onwards_retries_total").increment(1);
                     debug!(
-                        retry = attempt_number,
+                        retry = retry_index,
                         delay_ms, "Backing off before next provider attempt"
                     );
                     tokio::time::sleep(delay).await;
