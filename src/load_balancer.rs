@@ -322,6 +322,25 @@ impl ProviderPool {
             .is_some_and(|f| f.enabled && f.on_rate_limit)
     }
 
+    /// Maximum number of attempts `select_iter()` may yield, given the current
+    /// fallback configuration and provider count. Mirrors the bookkeeping
+    /// inside `SelectIter`: without replacement, an attempt count above the
+    /// provider count is effectively clamped because already-tried providers
+    /// are excluded; with replacement, `max_attempts` is honored as-is.
+    pub fn fallback_max_attempts(&self) -> usize {
+        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
+        let configured = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.max_attempts)
+            .unwrap_or(self.providers.len());
+        if with_replacement {
+            configured
+        } else {
+            configured.min(self.providers.len())
+        }
+    }
+
     /// Get the load balancing strategy
     pub fn strategy(&self) -> LoadBalanceStrategy {
         self.strategy
@@ -604,6 +623,73 @@ mod tests {
         let first = pool.first_target();
         assert!(first.is_some());
         assert_eq!(first.unwrap().url.as_str(), "https://api1.example.com/");
+    }
+
+    #[test]
+    fn test_fallback_max_attempts() {
+        use crate::target::FallbackConfig;
+
+        let two_providers = || {
+            vec![
+                Provider::new(create_test_target("https://a.example.com"), 1),
+                Provider::new(create_test_target("https://b.example.com"), 1),
+            ]
+        };
+
+        // No fallback config — caps at provider count.
+        let pool = ProviderPool::new(two_providers());
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // max_attempts unset, no replacement — caps at provider count.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // max_attempts above provider count with no replacement — still clamped.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(10),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // with_replacement honors max_attempts beyond provider count.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(10),
+                with_replacement: true,
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 10);
     }
 
     #[test]
