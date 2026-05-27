@@ -138,6 +138,17 @@ pub struct FallbackConfig {
     /// Most useful with `with_replacement: true` to allow more attempts than providers.
     #[serde(default)]
     pub max_attempts: Option<usize>,
+
+    /// Inter-attempt backoff. When unset (default), attempts proceed with no delay.
+    #[serde(default)]
+    pub backoff: Option<BackoffConfig>,
+
+    /// Cap on cumulative time spent sleeping between attempts, in milliseconds.
+    /// When the next scheduled backoff would push the total past this cap, the
+    /// retry loop terminates and the last error is returned to the client.
+    /// Bounds only the inter-attempt sleeps, not upstream request time.
+    #[serde(default)]
+    pub max_total_backoff_ms: Option<u64>,
 }
 
 impl FallbackConfig {
@@ -158,6 +169,94 @@ impl FallbackConfig {
                 status == pattern
             }
         })
+    }
+}
+
+/// Jitter strategy applied to retry backoff delays.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JitterStrategy {
+    /// Use the computed exponential delay verbatim.
+    None,
+    /// Sample uniformly from `[0, computed_delay]`. Recommended for shared
+    /// upstreams, since synchronized retries from many clients would otherwise
+    /// arrive in lockstep (the "thundering herd" failure mode).
+    #[default]
+    Full,
+}
+
+/// Exponential backoff between attempts inside the fallback / retry loop.
+///
+/// `delay(N) = min(initial_ms * factor^(N-1), max_ms)` where `N` is the
+/// 1-indexed retry attempt (1 = first retry, i.e. the wait *after* the
+/// original attempt failed). Jitter is then applied per `jitter`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackoffConfig {
+    /// Delay before the first retry, in milliseconds.
+    pub initial_ms: u64,
+
+    /// Hard ceiling on the per-retry delay, in milliseconds. Defaults to 5000.
+    #[serde(default = "default_max_backoff_ms")]
+    pub max_ms: u64,
+
+    /// Exponential growth factor between successive retries. Defaults to 2.0.
+    #[serde(default = "default_backoff_factor")]
+    pub factor: f64,
+
+    /// Jitter strategy applied to each delay. Defaults to `full`.
+    #[serde(default)]
+    pub jitter: JitterStrategy,
+}
+
+fn default_max_backoff_ms() -> u64 {
+    5_000
+}
+
+fn default_backoff_factor() -> f64 {
+    2.0
+}
+
+impl BackoffConfig {
+    /// Compute the un-jittered exponential delay for the given 1-indexed retry
+    /// attempt. Returns `max_ms` once the exponential overflows or exceeds the
+    /// ceiling, so unreasonable `factor`/`retry` combinations stay bounded.
+    fn base_delay_ms(&self, retry_index: u32) -> u64 {
+        if retry_index == 0 {
+            return 0;
+        }
+        let exponent = retry_index.saturating_sub(1);
+        // Bail out early on absurd retry indices — a u32 → i32 cast would wrap
+        // negative and yield a *smaller* delay, the opposite of what we want.
+        // Any reasonable factor reaches max_ms well within 64 doublings.
+        let scaled = match i32::try_from(exponent) {
+            Ok(e) => (self.initial_ms as f64) * self.factor.powi(e),
+            Err(_) => f64::INFINITY,
+        };
+        if !scaled.is_finite() || scaled >= self.max_ms as f64 {
+            self.max_ms
+        } else if scaled <= 0.0 {
+            0
+        } else {
+            scaled as u64
+        }
+    }
+
+    /// Compute the actual sleep duration for the given 1-indexed retry attempt,
+    /// applying the configured jitter strategy.
+    pub fn delay(&self, retry_index: u32) -> std::time::Duration {
+        let base = self.base_delay_ms(retry_index);
+        let jittered = match self.jitter {
+            JitterStrategy::None => base,
+            JitterStrategy::Full => {
+                if base == 0 {
+                    0
+                } else {
+                    use rand::Rng;
+                    rand::rng().random_range(0..=base)
+                }
+            }
+        };
+        std::time::Duration::from_millis(jittered)
     }
 }
 
@@ -2559,5 +2658,125 @@ mod tests {
 
         let pool = targets.targets.get("gpt-4").unwrap();
         assert!(pool.routing_rules().is_empty());
+    }
+
+    fn backoff(initial_ms: u64, max_ms: u64, factor: f64, jitter: JitterStrategy) -> BackoffConfig {
+        BackoffConfig {
+            initial_ms,
+            max_ms,
+            factor,
+            jitter,
+        }
+    }
+
+    #[test]
+    fn test_backoff_first_retry_is_initial() {
+        let b = backoff(100, 5_000, 2.0, JitterStrategy::None);
+        assert_eq!(b.base_delay_ms(1), 100);
+    }
+
+    #[test]
+    fn test_backoff_exponential_growth() {
+        let b = backoff(100, 5_000, 2.0, JitterStrategy::None);
+        assert_eq!(b.base_delay_ms(1), 100);
+        assert_eq!(b.base_delay_ms(2), 200);
+        assert_eq!(b.base_delay_ms(3), 400);
+        assert_eq!(b.base_delay_ms(4), 800);
+        assert_eq!(b.base_delay_ms(5), 1_600);
+        assert_eq!(b.base_delay_ms(6), 3_200);
+    }
+
+    #[test]
+    fn test_backoff_clamped_to_max_ms() {
+        let b = backoff(100, 1_000, 2.0, JitterStrategy::None);
+        // Without clamping these would be 1600, 3200, ...
+        assert_eq!(b.base_delay_ms(5), 1_000);
+        assert_eq!(b.base_delay_ms(20), 1_000);
+    }
+
+    #[test]
+    fn test_backoff_zero_retry_index_is_zero() {
+        // retry_index 0 means "no retry yet" — the original attempt does not sleep.
+        let b = backoff(100, 5_000, 2.0, JitterStrategy::None);
+        assert_eq!(b.base_delay_ms(0), 0);
+    }
+
+    #[test]
+    fn test_backoff_extreme_exponent_stays_bounded() {
+        // Even silly inputs cannot escape the max_ms ceiling or cause overflow.
+        let b = backoff(1_000, 10_000, 10.0, JitterStrategy::None);
+        assert_eq!(b.base_delay_ms(100), 10_000);
+        assert_eq!(b.base_delay_ms(u32::MAX), 10_000);
+    }
+
+    #[test]
+    fn test_backoff_factor_one_is_constant() {
+        let b = backoff(250, 5_000, 1.0, JitterStrategy::None);
+        for retry in 1..=10 {
+            assert_eq!(b.base_delay_ms(retry), 250);
+        }
+    }
+
+    #[test]
+    fn test_backoff_full_jitter_within_bounds() {
+        let b = backoff(200, 5_000, 2.0, JitterStrategy::Full);
+        // delay(3) base = 800; full jitter should keep samples within [0, 800].
+        for _ in 0..256 {
+            let d = b.delay(3).as_millis() as u64;
+            assert!(d <= 800, "jittered delay {d} exceeded base 800");
+        }
+    }
+
+    #[test]
+    fn test_backoff_none_jitter_is_deterministic() {
+        let b = backoff(150, 5_000, 2.0, JitterStrategy::None);
+        let first = b.delay(2);
+        for _ in 0..16 {
+            assert_eq!(b.delay(2), first);
+        }
+        assert_eq!(first, std::time::Duration::from_millis(300));
+    }
+
+    #[test]
+    fn test_backoff_serde_defaults() {
+        // Operators should be able to specify just `initial_ms` and pick up
+        // sensible defaults for the rest.
+        let json = r#"{ "initial_ms": 100 }"#;
+        let b: BackoffConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(b.initial_ms, 100);
+        assert_eq!(b.max_ms, 5_000);
+        assert!((b.factor - 2.0).abs() < f64::EPSILON);
+        assert_eq!(b.jitter, JitterStrategy::Full);
+    }
+
+    #[test]
+    fn test_fallback_config_backoff_unset_by_default() {
+        // Existing configs without `backoff` keep the legacy zero-delay behavior.
+        let f: FallbackConfig = serde_json::from_str("{}").unwrap();
+        assert!(f.backoff.is_none());
+        assert!(f.max_total_backoff_ms.is_none());
+    }
+
+    #[test]
+    fn test_fallback_config_with_backoff_and_budget() {
+        let json = r#"{
+            "enabled": true,
+            "on_status": [502, 503],
+            "max_attempts": 4,
+            "max_total_backoff_ms": 3000,
+            "backoff": {
+                "initial_ms": 100,
+                "max_ms": 1500,
+                "factor": 2.0,
+                "jitter": "none"
+            }
+        }"#;
+        let f: FallbackConfig = serde_json::from_str(json).unwrap();
+        assert!(f.enabled);
+        assert_eq!(f.max_total_backoff_ms, Some(3000));
+        let b = f.backoff.expect("backoff parsed");
+        assert_eq!(b.initial_ms, 100);
+        assert_eq!(b.max_ms, 1500);
+        assert_eq!(b.jitter, JitterStrategy::None);
     }
 }

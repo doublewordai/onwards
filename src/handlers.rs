@@ -465,6 +465,8 @@ pub async fn target_message_handler<T: HttpClient>(
     // concurrency limit. The returned guard tracks the active connection.
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
+    let mut total_backoff_ms: u64 = 0;
+    let pool_max_attempts = pool.fallback_max_attempts();
     for (_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
@@ -976,6 +978,42 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
+                // Sleep here — *after* the current connection_guard has gone
+                // out of scope but *before* select_iter().next() grabs the
+                // next one — so we don't pin a concurrency slot while waiting.
+                // Skip if this was the last attempt the iterator would yield.
+                if (attempt_number as usize) < pool_max_attempts
+                    && let Some(backoff) = pool.fallback().and_then(|f| f.backoff.as_ref())
+                {
+                    // `attempt_number` is the count of the attempt that just
+                    // failed (1-indexed), which matches `BackoffConfig::delay`'s
+                    // retry-index contract: `delay(N)` is the wait that goes
+                    // *before* attempt N+1. Bind it locally so the relationship
+                    // is obvious if the loop counter is ever refactored.
+                    let retry_index = attempt_number;
+                    let delay = backoff.delay(retry_index);
+                    let delay_ms = delay.as_millis() as u64;
+                    let next_total = total_backoff_ms.saturating_add(delay_ms);
+                    if let Some(max_total) = pool.fallback().and_then(|f| f.max_total_backoff_ms)
+                        && next_total > max_total
+                    {
+                        debug!(
+                            used_ms = total_backoff_ms,
+                            next_ms = delay_ms,
+                            cap_ms = max_total,
+                            "Retry backoff budget exhausted, giving up"
+                        );
+                        metrics::counter!("onwards_retry_budget_exhausted_total").increment(1);
+                        break;
+                    }
+                    total_backoff_ms = next_total;
+                    metrics::counter!("onwards_retries_total").increment(1);
+                    debug!(
+                        retry = retry_index,
+                        delay_ms, "Backing off before next provider attempt"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
                 continue;
             }
             LoopAction::Done(result) => return result,

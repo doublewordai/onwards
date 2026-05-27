@@ -322,6 +322,30 @@ impl ProviderPool {
             .is_some_and(|f| f.enabled && f.on_rate_limit)
     }
 
+    /// Maximum number of attempts `select_iter()` may yield, given the current
+    /// fallback configuration, load-balancing strategy, and provider count.
+    ///
+    /// Mirrors `SelectIter::next` exactly: `with_replacement` is honored only
+    /// for `WeightedRandom`; `Priority` always excludes already-tried
+    /// providers (see `SelectIter::next` for the source of truth). When
+    /// providers can't be re-yielded, the configured `max_attempts` is
+    /// effectively clamped to `providers.len()`.
+    pub fn fallback_max_attempts(&self) -> usize {
+        let configured = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.max_attempts)
+            .unwrap_or(self.providers.len());
+        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
+        let allows_replacement =
+            with_replacement && matches!(self.strategy, LoadBalanceStrategy::WeightedRandom);
+        if allows_replacement {
+            configured
+        } else {
+            configured.min(self.providers.len())
+        }
+    }
+
     /// Get the load balancing strategy
     pub fn strategy(&self) -> LoadBalanceStrategy {
         self.strategy
@@ -604,6 +628,97 @@ mod tests {
         let first = pool.first_target();
         assert!(first.is_some());
         assert_eq!(first.unwrap().url.as_str(), "https://api1.example.com/");
+    }
+
+    #[test]
+    fn test_fallback_max_attempts() {
+        use crate::target::FallbackConfig;
+
+        let two_providers = || {
+            vec![
+                Provider::new(create_test_target("https://a.example.com"), 1),
+                Provider::new(create_test_target("https://b.example.com"), 1),
+            ]
+        };
+
+        // No fallback config — caps at provider count.
+        let pool = ProviderPool::new(two_providers());
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // max_attempts unset, no replacement — caps at provider count.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // max_attempts above provider count with no replacement — still clamped.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(10),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // with_replacement honors max_attempts beyond provider count.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(10),
+                with_replacement: true,
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 10);
+
+        // Priority strategy always excludes tried providers, so
+        // with_replacement is ignored — cap stays at provider count even
+        // if max_attempts is larger. This must match `SelectIter::next`.
+        let pool = ProviderPool::with_config(
+            two_providers(),
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(10),
+                with_replacement: true,
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        assert_eq!(pool.fallback_max_attempts(), 2);
+
+        // Sanity-check: helper agrees with what SelectIter actually yields
+        // for the surprising case (Priority + with_replacement).
+        assert_eq!(pool.select_iter().count(), 2);
     }
 
     #[test]
