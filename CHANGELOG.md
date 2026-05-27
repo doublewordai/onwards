@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.0](https://github.com/doublewordai/onwards/compare/v0.28.0...v0.29.0) - 2026-05-27
+
+### Added
+
+- *(fallback)* add inter-attempt backoff with jitter and budget cap ([#196](https://github.com/doublewordai/onwards/pull/196))
+
 ## [0.28.0](https://github.com/doublewordai/onwards/compare/v0.27.0...v0.28.0) - 2026-05-18
 
 ### Added
