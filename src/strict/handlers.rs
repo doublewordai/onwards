@@ -1453,19 +1453,28 @@ async fn sanitize_streaming_chat_response(
                             continue;
                         }
 
+                        // Provider error envelopes may appear either as the
+                        // entire chunk (`{"error":{...}}`) or alongside
+                        // otherwise valid chunk fields (OpenRouter shape:
+                        // `{"id":...,"choices":[],"error":{...}}`). Detect
+                        // them before strict deserialization — the strict
+                        // `ChatCompletionChunk` schema has no `error` field
+                        // and would silently drop it, leaving the
+                        // downstream reassembler with no signal.
+                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
+
                         // Deserialize the chunk through our strict schema
                         let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
                         {
                             Ok(chunk) => chunk,
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -1502,14 +1511,6 @@ async fn sanitize_streaming_chat_response(
                                 }
                             }
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -1659,18 +1660,24 @@ async fn sanitize_streaming_completions_response(
                             continue;
                         }
 
+                        // See `sanitize_streaming_chat_response` for the full
+                        // rationale — detecting embedded provider errors
+                        // before strict deserialization keeps OpenRouter-shape
+                        // chunks (normal fields + `error`) from getting their
+                        // error silently stripped.
+                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
+
                         let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
                         {
                             Ok(chunk) => chunk,
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     raw = %data_part.chars().take(200).collect::<String>(),
@@ -1702,14 +1709,6 @@ async fn sanitize_streaming_completions_response(
                                 }
                             }
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     raw = %data_part.chars().take(200).collect::<String>(),
@@ -1943,6 +1942,21 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
+                        // See `sanitize_streaming_chat_response` for the full
+                        // rationale — embedded provider error envelopes must
+                        // surface as stand-alone error events so the
+                        // downstream reassembler can reclassify the HTTP
+                        // status, rather than being dropped by the strict
+                        // schema.
+                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
+
                         // Parse into JSON first so we can normalize sparse provider
                         // payloads, then coerce into the typed ResponsesStreamingEvent
                         // envelope to validate type/sequence_number and rewrite the
@@ -1951,14 +1965,6 @@ async fn sanitize_streaming_responses_response(
                         {
                             Ok(event) => event,
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -2001,14 +2007,6 @@ async fn sanitize_streaming_responses_response(
                                 }
                             }
                             Err(e) => {
-                                if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                                    error!(
-                                        data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                        "Provider returned error object inside SSE stream, forwarding as error event"
-                                    );
-                                    sanitized_lines.push(error_event);
-                                    continue;
-                                }
                                 error!(
                                     error = %e,
                                     data_sample = ?data_part.chars().take(200).collect::<String>(),
@@ -2057,37 +2055,54 @@ async fn sanitize_streaming_responses_response(
     response
 }
 
-/// Check if an SSE data payload is a provider error object and return it
-/// formatted as an SSE data line if so.
+/// Detect a provider error envelope embedded in an SSE data payload and
+/// return it formatted as a stand-alone SSE data line.
 ///
-/// Some providers return HTTP 200 but embed an error object in the SSE stream
-/// instead of a valid chunk. For example:
+/// Two distinct provider shapes get caught here:
 ///
-/// ```text
-/// data: {"error": {"message": "...", "type": "BadRequestError", "code": 400}}
-/// ```
+/// 1. **Error-only chunks** — e.g. our own inference endpoints emit
+///    `data: {"error":{"message":"Engine was shut down...","code":500}}`
+///    when a worker dies mid-generation.
+/// 2. **Chunks that carry both completion fields *and* an `error` object** —
+///    OpenRouter (and similar third-party gateways) returns HTTP 200 with
+///    chunks like `{"id":"...","choices":[],"error":{"code":429,...}}` when
+///    a downstream provider returns 429. Without this detector the strict
+///    `ChatCompletionChunk` deserializer would silently drop the `error`
+///    field (it's a flatten-style unknown) and the downstream reassembler
+///    would see a content-less stream — surfacing as a control-layer 5xx.
 ///
-/// When detected, the error is forwarded as a clean SSE event so that
-/// downstream consumers (e.g. fusillade) can inspect the reassembled body
-/// and classify it as a non-retriable failure, rather than seeing a broken
-/// stream and treating it as a retriable network error.
+/// The emitted line is always a bare `{"error": {...}}` envelope (no
+/// surrounding chunk wrapper) so that downstream consumers like
+/// `fusillade::http`'s `event.data.starts_with("{\"error\"")` reclassifier
+/// match it and rewrite the HTTP status to the embedded `code`.
 ///
 /// `data_part` is the JSON string after stripping the `data: ` prefix.
-/// When `trusted` is false, the error message is replaced with a generic
-/// one to avoid leaking provider internals (consistent with how non-streaming
-/// error responses are sanitized in strict mode).
+///
+/// Trust gating:
+/// - `trusted = true` (our own endpoints): preserve message/type/code
+///   verbatim — the embedded code is real signal we want downstream to
+///   see (e.g. retry on 500).
+/// - `trusted = false` (third-party gateways): rewrite message to a
+///   generic one keyed off the embedded code, and apply
+///   [`mask_account_class_status`] so account-class codes (401/402/403/451)
+///   surface as 502 — callers must not be able to probe whether the
+///   upstream's key was bad or out of credits.
 fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(data_part).ok()?;
-    let error_obj = value.get("error")?;
+    let error_obj = value.get("error").filter(|v| v.is_object())?;
 
     if trusted {
-        let sanitized = serde_json::to_string(&value).ok()?;
-        Some(format!("data: {sanitized}"))
+        // Strip surrounding chunk fields and emit only the error envelope
+        // so `event.data.starts_with("{\"error\"")` in the downstream
+        // reassembler matches reliably (OpenRouter-shape chunks would
+        // otherwise start with `{"id"`).
+        let envelope = json!({ "error": error_obj });
+        Some(format!("data: {envelope}"))
     } else {
-        // For untrusted providers, replace with a generic error to avoid
-        // leaking provider internals. Reuses the same mapping as
-        // `standard_error_response` for consistency.
-        let code = match error_obj.get("code").and_then(|c| c.as_u64()) {
+        // For untrusted providers, replace prose with a generic message
+        // and mask account-class status codes to 502 so we don't leak
+        // upstream billing/auth state.
+        let provider_code = match error_obj.get("code").and_then(|c| c.as_u64()) {
             Some(c) => c as u16,
             None => {
                 warn!(
@@ -2097,16 +2112,17 @@ fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
                 500
             }
         };
-        let (error_type, message) = sanitized_error_for_status(code);
-        let sanitized = json!({
+        let masked_code = mask_account_class_status(provider_code);
+        let (error_type, message) = sanitized_error_for_status(masked_code);
+        let envelope = json!({
             "error": {
                 "message": message,
                 "type": error_type,
                 "param": null,
-                "code": code,
+                "code": masked_code,
             }
         });
-        Some(format!("data: {sanitized}"))
+        Some(format!("data: {envelope}"))
     }
 }
 
@@ -2142,25 +2158,66 @@ async fn sanitize_error_response(mut response: Response) -> Response {
 /// Map an HTTP status code to a generic (error_type, message) pair.
 /// Used by both `standard_error_response` and `try_format_sse_error` to
 /// sanitize errors from untrusted providers without leaking internals.
+///
+/// Callers should apply [`mask_account_class_status`] to the upstream
+/// status *before* calling this function so that account-class codes
+/// (401/402/403/451) are mapped to 502 first — this function alone does
+/// not mask, it only maps a (possibly-already-masked) status to a
+/// type/message pair.
 fn sanitized_error_for_status(status: u16) -> (&'static str, &'static str) {
     match status {
         400 => ("invalid_request_error", "Invalid request"),
         401 => ("authentication_error", "Authentication failed"),
+        402 => ("api_error", "Service unavailable"),
         403 => ("permission_error", "Permission denied"),
         404 => ("not_found_error", "Not found"),
+        408 => ("api_error", "Gateway timeout"),
+        413 => ("invalid_request_error", "Request too large"),
+        422 => ("invalid_request_error", "Unprocessable request"),
         429 => ("rate_limit_error", "Rate limit exceeded"),
         500 => ("api_error", "Internal server error"),
         502 => ("api_error", "Bad gateway"),
         503 => ("api_error", "Service unavailable"),
+        504 => ("api_error", "Gateway timeout"),
         _ => ("api_error", "An error occurred"),
     }
 }
 
-/// Generate standard error response based on HTTP status code
-/// Never includes third-party error details
+/// Remap upstream HTTP status codes that would leak provider-side billing,
+/// authentication, or jurisdictional state to a single generic 502.
+///
+/// Onwards routes requests to third-party providers on the operator's
+/// behalf — the caller never sees the provider directly. Surfacing the
+/// provider's `401 Unauthorized` (our API key revoked), `402 Payment
+/// Required` (our credits exhausted), `403 Forbidden` (our org blocked),
+/// or `451 Unavailable For Legal Reasons` would let the caller probe
+/// the operator's account state, which is both an information leak and
+/// confusing (the *caller's* auth is fine — it's ours that isn't). All
+/// four collapse to `502 Bad Gateway`: a generic "upstream is sad".
+///
+/// `408 Request Timeout` is rewritten to `504 Gateway Timeout` for the
+/// same reason — the upstream timing out is *our* gateway timing out
+/// from the caller's perspective.
+///
+/// Everything else passes through unchanged: `400/404/413/422/429` are
+/// real user-facing signals about the caller's request and must surface,
+/// and `5xx` codes are already "upstream failed" semantics.
+fn mask_account_class_status(status: u16) -> u16 {
+    match status {
+        401 | 402 | 403 | 451 => 502,
+        408 => 504,
+        _ => status,
+    }
+}
+
+/// Generate standard error response based on HTTP status code, applying
+/// account-class masking so the caller can't distinguish account-state
+/// failures (auth/billing/permissions) from generic upstream errors.
 fn standard_error_response(status: StatusCode) -> Response {
-    let (error_type, message) = sanitized_error_for_status(status.as_u16());
-    error_response(status, error_type, message)
+    let masked_code = mask_account_class_status(status.as_u16());
+    let masked_status = StatusCode::from_u16(masked_code).unwrap_or(status);
+    let (error_type, message) = sanitized_error_for_status(masked_code);
+    error_response(masked_status, error_type, message)
 }
 
 #[cfg(test)]
@@ -2225,9 +2282,8 @@ mod tests {
     async fn test_error_types_match_openai_conventions() {
         // Test various status codes map to correct OpenAI error types
         let test_cases = vec![
+            // User-facing codes — passed through to the caller intact.
             (StatusCode::BAD_REQUEST, "invalid_request_error"),
-            (StatusCode::UNAUTHORIZED, "authentication_error"),
-            (StatusCode::FORBIDDEN, "permission_error"),
             (StatusCode::NOT_FOUND, "not_found_error"),
             (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
@@ -2237,6 +2293,11 @@ mod tests {
 
         for (status, expected_type) in test_cases {
             let response = standard_error_response(status);
+            assert_eq!(
+                response.status(),
+                status,
+                "Status {status} must pass through unmasked"
+            );
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -2248,6 +2309,22 @@ mod tests {
                 "Status {} should map to error type {}",
                 status,
                 expected_type
+            );
+        }
+
+        // Account-class codes — masked to 502 so the caller can't probe
+        // upstream auth/billing state. See `mask_account_class_status`.
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::PAYMENT_REQUIRED,
+            StatusCode::FORBIDDEN,
+            StatusCode::from_u16(451).unwrap(),
+        ] {
+            let response = standard_error_response(status);
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{status} must be masked to 502"
             );
         }
     }
@@ -6814,5 +6891,160 @@ mod tests {
         assert!(!body_str.contains("OOM on GPU 3"));
         // But error structure is preserved for callers to detect
         assert!(body_str.contains("\"error\""));
+    }
+
+    /// Regression: OpenRouter (and similar third-party gateways) sometimes
+    /// return HTTP 200 but embed `{"error": {...}}` alongside otherwise
+    /// valid chunk fields (e.g. `id`, `object`, `choices: []`). Previously
+    /// the strict `ChatCompletionChunk` deserializer would silently drop
+    /// the unknown `error` field and emit a content-less chunk, leaving
+    /// the downstream stream reassembler (fusillade) with no completion
+    /// and no signal — which fired control-layer 5xx alarms.
+    ///
+    /// The sanitizer must detect the embedded error *before* the strict
+    /// parse and emit it as a stand-alone `data: {"error": {...}}` event so
+    /// fusillade's prefix-match reclassifier picks it up.
+    #[tokio::test]
+    async fn test_streaming_chat_surfaces_openrouter_shape_embedded_error() {
+        let chunk_with_embedded_error = "data: {\"id\":\"gen-abc\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"openai/gpt-oss-20b\",\"choices\":[],\"error\":{\"message\":\"Provider returned error\",\"code\":429,\"metadata\":{\"raw\":\"You have been rate limited\"}}}\n\n";
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(chunk_with_embedded_error))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_chat_response(response, "test-model".to_string(), false).await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // The error envelope must survive — the downstream reassembler
+        // looks for an SSE data line whose JSON starts with `{"error"`.
+        assert!(
+            body_str.contains("data: {\"error\""),
+            "expected a stand-alone error event in output, got: {body_str}"
+        );
+        // The numeric `code` must be preserved so fusillade can
+        // reclassify the response to HTTP 429.
+        assert!(
+            body_str.contains("\"code\":429"),
+            "expected embedded code 429 to be preserved, got: {body_str}"
+        );
+        // Untrusted: provider's raw rate-limit copy must not leak.
+        assert!(!body_str.contains("You have been rate limited"));
+    }
+
+    /// A trusted provider's embedded error envelope must also be emitted
+    /// as a stand-alone `{"error":...}` line (no surrounding chunk
+    /// wrapper), so the downstream reassembler's prefix detector matches.
+    /// Pre-fix behaviour forwarded the entire chunk verbatim, which
+    /// started with `{"id"` and slipped past the detector.
+    #[tokio::test]
+    async fn test_streaming_chat_trusted_emits_envelope_only_for_embedded_error() {
+        let chunk_with_embedded_error = "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"qwen-internal\",\"choices\":[],\"error\":{\"message\":\"Engine was shut down during token generation\",\"type\":\"internal_server_error\",\"code\":500}}\n\n";
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(chunk_with_embedded_error))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_chat_response(response, "test-model".to_string(), true).await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // The emitted data line must begin with `{"error"` so fusillade's
+        // `starts_with("{\"error\"")` prefix check fires.
+        assert!(
+            body_str.contains("data: {\"error\""),
+            "expected envelope-only emission, got: {body_str}"
+        );
+        // Trusted: original message and code preserved.
+        assert!(body_str.contains("Engine was shut down during token generation"));
+        assert!(body_str.contains("\"code\":500"));
+        // The chunk wrapper fields must NOT be carried into the error event.
+        assert!(
+            !body_str.contains("\"object\":\"chat.completion.chunk\""),
+            "chunk wrapper must be stripped from the emitted error event"
+        );
+    }
+
+    /// Account-class status codes from untrusted providers must be
+    /// rewritten to 502 so callers can't tell whether the upstream's
+    /// API key was bad, out of credits, or revoked.
+    #[test]
+    fn test_mask_account_class_status_remaps_account_codes() {
+        // Account-class → 502
+        assert_eq!(mask_account_class_status(401), 502);
+        assert_eq!(mask_account_class_status(402), 502);
+        assert_eq!(mask_account_class_status(403), 502);
+        assert_eq!(mask_account_class_status(451), 502);
+        // Retriable timeout
+        assert_eq!(mask_account_class_status(408), 504);
+        // User-facing codes pass through
+        assert_eq!(mask_account_class_status(400), 400);
+        assert_eq!(mask_account_class_status(404), 404);
+        assert_eq!(mask_account_class_status(413), 413);
+        assert_eq!(mask_account_class_status(422), 422);
+        assert_eq!(mask_account_class_status(429), 429);
+        // Server-class pass through
+        assert_eq!(mask_account_class_status(500), 500);
+        assert_eq!(mask_account_class_status(502), 502);
+        assert_eq!(mask_account_class_status(503), 503);
+        assert_eq!(mask_account_class_status(504), 504);
+    }
+
+    /// In-stream errors from untrusted providers must apply the account-class
+    /// mask. A code 402 from OpenRouter (e.g. "insufficient credits") must
+    /// surface as code 502 to the caller — exposing the provider's billing
+    /// state is an information leak.
+    #[test]
+    fn test_try_format_sse_error_masks_untrusted_402_to_502() {
+        let data_part = r#"{"error": {"message": "Insufficient credits", "code": 402}}"#;
+        let line = try_format_sse_error(data_part, false).expect("should emit");
+        // Body must carry the masked code so fusillade reclassifies to 502.
+        assert!(
+            line.contains("\"code\":502"),
+            "expected code masked to 502, got: {line}"
+        );
+        // Provider's prose must not leak.
+        assert!(!line.contains("Insufficient credits"));
+    }
+
+    /// Standard (non-streaming) error responses from untrusted providers
+    /// must also have account-class codes masked before reaching the
+    /// caller.
+    #[tokio::test]
+    async fn test_standard_error_response_masks_402_to_502() {
+        let response = standard_error_response(StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "402 from an untrusted provider must surface as 502"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["type"], "api_error");
+    }
+
+    /// Explicit arms for 402 and 408 in `sanitized_error_for_status` —
+    /// the previous default fell through to "An error occurred", which
+    /// hid useful (and safe) signal.
+    #[test]
+    fn test_sanitized_error_for_status_explicit_402_408() {
+        let (kind, _) = sanitized_error_for_status(402);
+        assert_eq!(kind, "api_error");
+        let (kind, _) = sanitized_error_for_status(408);
+        assert_eq!(kind, "api_error");
     }
 }
