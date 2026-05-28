@@ -2126,6 +2126,7 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
         // envelope is self-consistent: a masked 402→502 must read as "Bad
         // gateway" and never surface the 402-specific message, which would
         // hint at the hidden billing/auth state we just masked.
+        // (401/402/403/451 → 502, 408 → 504; see `mask_account_class_status`.)
         let masked_code = mask_account_class_status(provider_code);
         let (error_type, message) = sanitized_error_for_status(masked_code);
         let envelope = json!({
@@ -2144,6 +2145,12 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
 /// Providers encode it inconsistently: as a number (`429`), a numeric
 /// string (`"429"`), or a named string (`"rate_limit"`). Returns `None`
 /// when the code is absent or unrecognized so the caller falls back to 500.
+///
+/// Only the rate-limit family of named codes is mapped (to `429`) because it
+/// has unambiguous retry semantics. Other named codes (`insufficient_quota`,
+/// `overloaded`, `server_error`, …) intentionally fall back to 500 — mapping
+/// them risks incorrect retry behavior, so additions should be deliberate and
+/// observed in practice rather than guessed.
 fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
     if let Some(n) = code.as_u64() {
         return u16::try_from(n).ok();
@@ -2255,6 +2262,8 @@ fn mask_account_class_status(status: u16) -> u16 {
 /// failures (auth/billing/permissions) from generic upstream errors.
 fn standard_error_response(status: StatusCode) -> Response {
     let masked_code = mask_account_class_status(status.as_u16());
+    // `mask_account_class_status` only yields valid codes (the input status or
+    // a fixed 502/504), so `from_u16` never fails; the fallback is defensive.
     let masked_status = StatusCode::from_u16(masked_code).unwrap_or(status);
     let (error_type, message) = sanitized_error_for_status(masked_code);
     error_response(masked_status, error_type, message)

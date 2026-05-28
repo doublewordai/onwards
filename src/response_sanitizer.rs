@@ -320,16 +320,23 @@ impl ResponseSanitizer {
 
 /// If `value` carries a provider `error` object — either as the entire
 /// payload or alongside completion fields (OpenRouter shape) — return a
-/// stand-alone `data: {"error":{...}}` line.
+/// stand-alone `data: {"error":{...}}` line. All surrounding chunk fields
+/// (`id`, `object`, `choices`, …) are discarded; only the `error` object
+/// itself is emitted.
 ///
 /// The chunk wrapper is stripped so the emitted SSE data line begins with
 /// `{"error"`, the prefix downstream reassemblers match on to reclassify the
 /// HTTP status from the embedded `code`.
 ///
-/// Non-strict mode forwards the error object verbatim and does not mask the
-/// status code — sanitization and account-class masking are strict mode's
-/// job. `error: null` and empty `error: {}` payloads (which some providers
-/// emit on healthy chunks) are ignored so they don't become spurious errors.
+/// WARNING: the `error` object is forwarded **verbatim** — the provider's
+/// `message` and any extra fields (`metadata`, `raw`, …) reach the client
+/// unchanged, and the status `code` is not masked. Non-strict mode performs
+/// no sanitization here; that is strict mode's job. Do not enable
+/// `sanitize_response` on targets proxying untrusted third parties if you need
+/// to hide upstream internals from clients.
+///
+/// `error: null` and empty `error: {}` payloads (which some providers emit on
+/// healthy chunks) are ignored so they don't become spurious error events.
 fn extract_embedded_error_envelope(value: &serde_json::Value) -> Option<String> {
     let error_obj = value
         .get("error")
