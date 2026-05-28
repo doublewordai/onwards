@@ -2122,6 +2122,10 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
                 );
                 500
             });
+        // Derive type/message from the *masked* code (not the original) so the
+        // envelope is self-consistent: a masked 402→502 must read as "Bad
+        // gateway" and never surface the 402-specific message, which would
+        // hint at the hidden billing/auth state we just masked.
         let masked_code = mask_account_class_status(provider_code);
         let (error_type, message) = sanitized_error_for_status(masked_code);
         let envelope = json!({
@@ -7073,6 +7077,21 @@ mod tests {
         );
         // Provider's prose must not leak.
         assert!(!line.contains("Insufficient credits"));
+    }
+
+    /// The 408→504 timeout-masking path: an untrusted upstream timeout must
+    /// surface as a 504 Gateway Timeout, not the original 408.
+    #[test]
+    fn test_try_format_sse_error_masks_untrusted_408_to_504() {
+        let value = serde_json::json!({"error": {"message": "upstream timed out", "code": 408}});
+        let line = try_format_sse_error(&value, false).expect("should emit");
+        assert!(
+            line.contains("\"code\":504"),
+            "expected 408 masked to 504, got: {line}"
+        );
+        assert!(line.contains("Gateway timeout"));
+        // The provider's prose must not leak.
+        assert!(!line.contains("upstream timed out"));
     }
 
     /// Some providers encode the error code as a numeric *string*
