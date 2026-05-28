@@ -4400,6 +4400,80 @@ mod tests {
         );
     }
 
+    /// A trusted endpoint's account-class error (e.g. 402 Payment Required)
+    /// must be forwarded with its original status and message. Account-class
+    /// masking (401/402/403/451 -> 502) applies only to untrusted providers;
+    /// a trusted provider's codes and prose are never rewritten.
+    #[tokio::test]
+    async fn test_trusted_target_account_class_error_not_masked() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{LoadBalanceStrategy, Target, Targets};
+        use crate::test_utils::MockHttpClient;
+        use axum::body::Body;
+        use axum::http::Request;
+        use dashmap::DashMap;
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        let pool = ProviderPool::with_config(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_key("sk-test".to_string())
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            true, // Mark pool as trusted
+            Vec::new(),
+        );
+        targets_map.insert("gpt-4".to_string(), pool);
+
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        // Account-class upstream error (402) with provider-specific prose.
+        let mock_error = r#"{"error":{"message":"You have insufficient credits","type":"billing_error","code":"insufficient_quota"}}"#;
+        let mock_client = MockHttpClient::new(StatusCode::PAYMENT_REQUIRED, mock_error);
+        let state = crate::AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        // Status preserved, NOT masked to 502.
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "trusted account-class error must keep its original status, not be masked to 502"
+        );
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        // Original message preserved, not replaced with a generic one.
+        assert_eq!(json["error"]["message"], "You have insufficient credits");
+    }
+
     #[tokio::test]
     async fn test_trusted_target_bypasses_streaming_error_sanitization() {
         use crate::load_balancer::{Provider, ProviderPool};
