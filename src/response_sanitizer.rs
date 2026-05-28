@@ -271,6 +271,10 @@ impl ResponseSanitizer {
                         // event so a downstream reassembler can detect them and
                         // reclassify the HTTP status. Non-strict mode forwards
                         // the envelope verbatim and preserves the upstream code.
+                        tracing::warn!(
+                            data_sample = ?data_part.chars().take(200).collect::<String>(),
+                            "Provider returned error envelope in SSE stream (non-strict: forwarding verbatim)"
+                        );
                         sanitized_lines.push(error_event);
                     } else {
                         // Deserialize using lenient types that ignore unknown fields and provide defaults
