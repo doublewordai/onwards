@@ -237,15 +237,6 @@ impl ResponseSanitizer {
     /// Sanitizes a streaming Server-Sent Events (SSE) response
     ///
     /// SSE format: `data: {...}\n\ndata: {...}\n\ndata: [DONE]\n\n`
-    ///
-    /// Embedded provider error envelopes — either bare
-    /// `{"error":{...}}` chunks or otherwise normal chunks that also
-    /// carry an `error` field (OpenRouter shape) — are forwarded as
-    /// stand-alone `data: {"error":{...}}` events. Without this step the
-    /// lenient deserializer would absorb the `error` field into its
-    /// flatten-style unknown-fields map and drop it on re-serialize,
-    /// leaving the caller with a content-less stream and no signal that
-    /// anything went wrong.
     pub fn sanitize_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
         let body_str = std::str::from_utf8(body)
             .map_err(|e| format!("Invalid UTF-8 in streaming response: {}", e))?;
@@ -259,15 +250,6 @@ impl ResponseSanitizer {
                 if data_part.trim() == "[DONE]" {
                     // Preserve [DONE] marker as-is
                     sanitized_lines.push(line.to_string());
-                } else if let Some(error_event) = extract_embedded_error_envelope(data_part) {
-                    // Provider error envelopes — either stand-alone
-                    // `{"error":{...}}` or embedded alongside completion
-                    // fields (OpenRouter shape). The lenient deserializer
-                    // would silently drop the `error` field via the
-                    // `_extra` flatten; emit a stand-alone error event
-                    // here instead so downstream reassemblers can detect
-                    // it and reclassify the HTTP status.
-                    sanitized_lines.push(error_event);
                 } else {
                     // Deserialize using lenient types that ignore unknown fields and provide defaults
                     let mut chunk: LenientStreamChunk = serde_json::from_str(data_part)
@@ -311,26 +293,6 @@ impl ResponseSanitizer {
 
         Ok(Some(Bytes::from(sanitized_body)))
     }
-}
-
-/// If `data_part` carries a provider `error` object — either as the
-/// entire payload or alongside completion fields — return a stand-alone
-/// `data: {"error":{...}}` line.
-///
-/// The output is always a bare error envelope (chunk wrapper fields
-/// stripped) so that downstream reassemblers (e.g. `fusillade::http`'s
-/// `event.data.starts_with("{\"error\"")` reclassifier) match it and
-/// rewrite the HTTP status to the embedded `code`.
-///
-/// Returns `None` if no `error` object is present or the payload is not
-/// valid JSON. Unlike the strict-mode counterpart, this non-strict path
-/// has no trust gate and forwards the envelope verbatim — sanitization
-/// is the strict mode's job.
-fn extract_embedded_error_envelope(data_part: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(data_part).ok()?;
-    let error_obj = value.get("error").filter(|v| v.is_object())?;
-    let envelope = serde_json::json!({ "error": error_obj });
-    Some(format!("data: {envelope}"))
 }
 
 #[cfg(test)]
@@ -615,34 +577,5 @@ mod tests {
         let completion_details = &usage["completion_tokens_details"];
         assert_eq!(completion_details["reasoning_tokens"], 0);
         assert!(completion_details.get("image_tokens").is_none()); // OpenRouter-specific, should be removed
-    }
-
-    /// Regression: providers like OpenRouter return HTTP 200 streams whose
-    /// chunks carry both normal completion fields and an `error` object.
-    /// Without a pre-parse check, the lenient deserializer captures `error`
-    /// into the `_extra` flatten and drops it on re-serialize, leaving the
-    /// downstream consumer with no completion content and no signal.
-    /// The sanitizer must emit the embedded `{"error": ...}` envelope as
-    /// its own SSE data line so a reassembler can reclassify the response.
-    #[test]
-    fn test_streaming_sanitizer_surfaces_openrouter_shape_embedded_error() {
-        let sanitizer = ResponseSanitizer {
-            original_model: Some("gpt-4".to_string()),
-        };
-
-        let body = b"data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"openai/gpt-oss-20b\",\"choices\":[],\"error\":{\"message\":\"Provider returned error\",\"code\":429}}\n\n";
-        let result = sanitizer.sanitize_streaming(body).unwrap().unwrap();
-        let out = std::str::from_utf8(&result).unwrap();
-
-        // A stand-alone error event must survive in the output, starting
-        // with `{"error"` so a downstream reassembler can detect it.
-        assert!(
-            out.contains("data: {\"error\""),
-            "expected stand-alone error event, got: {out}"
-        );
-        assert!(
-            out.contains("\"code\":429"),
-            "expected embedded code 429 to be preserved, got: {out}"
-        );
     }
 }

@@ -1453,24 +1453,10 @@ async fn sanitize_streaming_chat_response(
                             continue;
                         }
 
-                        // Provider error envelopes may appear either as the
-                        // entire chunk (`{"error":{...}}`) or alongside
-                        // otherwise valid chunk fields (OpenRouter shape:
-                        // `{"id":...,"choices":[],"error":{...}}`). Detect
-                        // them before strict deserialization — the strict
-                        // `ChatCompletionChunk` schema has no `error` field
-                        // and would silently drop it, leaving the
-                        // downstream reassembler with no signal.
-                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                            error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
-                        // Deserialize the chunk through our strict schema
+                        // Deserialize the chunk through our strict schema.
+                        // Parse once here: an embedded error envelope and a
+                        // normal chunk are both valid JSON, so this same parse
+                        // feeds the error check below and the typed coercion.
                         let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
                         {
                             Ok(chunk) => chunk,
@@ -1485,6 +1471,23 @@ async fn sanitize_streaming_chat_response(
                                 ));
                             }
                         };
+
+                        // Provider error envelopes may appear either as the
+                        // entire chunk (`{"error":{...}}`) or alongside
+                        // otherwise valid chunk fields (OpenRouter shape:
+                        // `{"id":...,"choices":[],"error":{...}}`). Detect
+                        // them before strict coercion — the strict
+                        // `ChatCompletionChunk` schema has no `error` field
+                        // and would silently drop it, leaving the
+                        // downstream reassembler with no signal.
+                        if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
 
                         normalize_chat_completion_chunk_value(
                             &mut raw_chunk,
@@ -1660,20 +1663,6 @@ async fn sanitize_streaming_completions_response(
                             continue;
                         }
 
-                        // See `sanitize_streaming_chat_response` for the full
-                        // rationale — detecting embedded provider errors
-                        // before strict deserialization keeps OpenRouter-shape
-                        // chunks (normal fields + `error`) from getting their
-                        // error silently stripped.
-                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                            error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
                         let mut raw_chunk: serde_json::Value = match serde_json::from_str(data_part)
                         {
                             Ok(chunk) => chunk,
@@ -1688,6 +1677,20 @@ async fn sanitize_streaming_completions_response(
                                 ));
                             }
                         };
+
+                        // See `sanitize_streaming_chat_response` for the full
+                        // rationale — detecting embedded provider errors
+                        // before strict coercion keeps OpenRouter-shape chunks
+                        // (normal fields + `error`) from getting their error
+                        // silently stripped. Reuses the parse above.
+                        if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
 
                         normalize_completion_chunk_value(
                             &mut raw_chunk,
@@ -1942,21 +1945,6 @@ async fn sanitize_streaming_responses_response(
                             continue;
                         }
 
-                        // See `sanitize_streaming_chat_response` for the full
-                        // rationale — embedded provider error envelopes must
-                        // surface as stand-alone error events so the
-                        // downstream reassembler can reclassify the HTTP
-                        // status, rather than being dropped by the strict
-                        // schema.
-                        if let Some(error_event) = try_format_sse_error(data_part, trusted) {
-                            error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
-                                "Provider returned error envelope in SSE chunk, forwarding as error event"
-                            );
-                            sanitized_lines.push(error_event);
-                            continue;
-                        }
-
                         // Parse into JSON first so we can normalize sparse provider
                         // payloads, then coerce into the typed ResponsesStreamingEvent
                         // envelope to validate type/sequence_number and rewrite the
@@ -1975,6 +1963,21 @@ async fn sanitize_streaming_responses_response(
                                 ));
                             }
                         };
+
+                        // See `sanitize_streaming_chat_response` for the full
+                        // rationale — embedded provider error envelopes must
+                        // surface as stand-alone error events so the
+                        // downstream reassembler can reclassify the HTTP
+                        // status, rather than being dropped by the strict
+                        // schema. Reuses the parse above.
+                        if let Some(error_event) = try_format_sse_error(&raw_event, trusted) {
+                            error!(
+                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                "Provider returned error envelope in SSE chunk, forwarding as error event"
+                            );
+                            sanitized_lines.push(error_event);
+                            continue;
+                        }
 
                         normalize_responses_streaming_event_value(
                             &mut raw_event,
@@ -2076,7 +2079,9 @@ async fn sanitize_streaming_responses_response(
 /// `fusillade::http`'s `event.data.starts_with("{\"error\"")` reclassifier
 /// match it and rewrite the HTTP status to the embedded `code`.
 ///
-/// `data_part` is the JSON string after stripping the `data: ` prefix.
+/// `value` is the already-parsed chunk JSON (the caller parses once and
+/// reuses the value for typed coercion, avoiding a second parse on the
+/// SSE hot path).
 ///
 /// Trust gating:
 /// - `trusted = true` (our own endpoints): preserve message/type/code
@@ -2087,9 +2092,14 @@ async fn sanitize_streaming_responses_response(
 ///   [`mask_account_class_status`] so account-class codes (401/402/403/451)
 ///   surface as 502 — callers must not be able to probe whether the
 ///   upstream's key was bad or out of credits.
-fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(data_part).ok()?;
-    let error_obj = value.get("error").filter(|v| v.is_object())?;
+fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<String> {
+    // Require a real error: an object carrying at least a `message` or a
+    // `code`. This rejects `error: null` and empty `error: {}` payloads
+    // (which some providers emit on healthy chunks) so they aren't mistaken
+    // for a failure and turned into a spurious error event.
+    let error_obj = value
+        .get("error")
+        .filter(|v| v.is_object() && (v.get("message").is_some() || v.get("code").is_some()))?;
 
     if trusted {
         // Strip surrounding chunk fields and emit only the error envelope
@@ -2102,16 +2112,16 @@ fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
         // For untrusted providers, replace prose with a generic message
         // and mask account-class status codes to 502 so we don't leak
         // upstream billing/auth state.
-        let provider_code = match error_obj.get("code").and_then(|c| c.as_u64()) {
-            Some(c) => c as u16,
-            None => {
+        let provider_code = error_obj
+            .get("code")
+            .and_then(parse_provider_status_code)
+            .unwrap_or_else(|| {
                 warn!(
                     code = ?error_obj.get("code"),
-                    "Provider error object has non-numeric or missing code, defaulting to 500"
+                    "Provider error object has missing or unrecognized code, defaulting to 500"
                 );
                 500
-            }
-        };
+            });
         let masked_code = mask_account_class_status(provider_code);
         let (error_type, message) = sanitized_error_for_status(masked_code);
         let envelope = json!({
@@ -2123,6 +2133,26 @@ fn try_format_sse_error(data_part: &str, trusted: bool) -> Option<String> {
             }
         });
         Some(format!("data: {envelope}"))
+    }
+}
+
+/// Extract an HTTP-style status code from a provider error's `code` field.
+/// Providers encode it inconsistently: as a number (`429`), a numeric
+/// string (`"429"`), or a named string (`"rate_limit"`). Returns `None`
+/// when the code is absent or unrecognized so the caller falls back to 500.
+fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
+    if let Some(n) = code.as_u64() {
+        return u16::try_from(n).ok();
+    }
+    let s = code.as_str()?;
+    if let Ok(n) = s.parse::<u16>() {
+        return Some(n);
+    }
+    // Map the rate-limit family to 429 so retry semantics survive; other
+    // named codes have no safe numeric mapping and fall back to 500.
+    match s {
+        "rate_limit" | "rate_limit_error" | "rate_limit_exceeded" => Some(429),
+        _ => None,
     }
 }
 
@@ -6817,7 +6847,8 @@ mod tests {
     fn test_try_format_sse_error_trusted_forwards_verbatim() {
         let data_part =
             r#"{"error": {"message": "Input too long", "type": "BadRequestError", "code": 400}}"#;
-        let result = try_format_sse_error(data_part, true);
+        let value: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        let result = try_format_sse_error(&value, true);
         assert!(result.is_some());
         let line = result.unwrap();
         assert!(line.starts_with("data: "));
@@ -6829,7 +6860,8 @@ mod tests {
     fn test_try_format_sse_error_untrusted_sanitizes() {
         let data_part =
             r#"{"error": {"message": "OOM on GPU 3", "type": "BadRequestError", "code": 400}}"#;
-        let result = try_format_sse_error(data_part, false);
+        let value: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        let result = try_format_sse_error(&value, false);
         assert!(result.is_some());
         let line = result.unwrap();
         // Untrusted: provider message must NOT leak
@@ -6841,12 +6873,29 @@ mod tests {
     #[test]
     fn test_try_format_sse_error_ignores_valid_chunk() {
         let data_part = r#"{"id": "chatcmpl-123", "object": "chat.completion.chunk"}"#;
-        assert!(try_format_sse_error(data_part, true).is_none());
+        let value: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        assert!(try_format_sse_error(&value, true).is_none());
     }
 
+    /// A chunk whose `error` field is not an object — e.g. OpenRouter sends
+    /// `"error": null` on healthy chunks — must not be treated as an error.
     #[test]
-    fn test_try_format_sse_error_ignores_non_json() {
-        assert!(try_format_sse_error("[DONE]", true).is_none());
+    fn test_try_format_sse_error_ignores_non_object_error() {
+        let null_error = serde_json::json!({"error": null});
+        assert!(try_format_sse_error(&null_error, true).is_none());
+        let string_error = serde_json::json!({"error": "boom"});
+        assert!(try_format_sse_error(&string_error, false).is_none());
+    }
+
+    /// An empty `error: {}` object carries no signal (no message, no code).
+    /// Treating it as an error would emit a spurious 500 event and derail
+    /// an otherwise valid stream, so it must be ignored — the chunk falls
+    /// through to normal strict coercion.
+    #[test]
+    fn test_try_format_sse_error_ignores_empty_error_object() {
+        let empty_error = serde_json::json!({"error": {}});
+        assert!(try_format_sse_error(&empty_error, false).is_none());
+        assert!(try_format_sse_error(&empty_error, true).is_none());
     }
 
     #[tokio::test]
@@ -6936,6 +6985,12 @@ mod tests {
         );
         // Untrusted: provider's raw rate-limit copy must not leak.
         assert!(!body_str.contains("You have been rate limited"));
+        // Untrusted: extra fields (e.g. `metadata`) must be dropped, not
+        // just the prose — only message/type/param/code are re-emitted.
+        assert!(
+            !body_str.contains("metadata"),
+            "untrusted error must strip extra fields like metadata, got: {body_str}"
+        );
     }
 
     /// A trusted provider's embedded error envelope must also be emitted
@@ -7009,7 +7064,8 @@ mod tests {
     #[test]
     fn test_try_format_sse_error_masks_untrusted_402_to_502() {
         let data_part = r#"{"error": {"message": "Insufficient credits", "code": 402}}"#;
-        let line = try_format_sse_error(data_part, false).expect("should emit");
+        let value: serde_json::Value = serde_json::from_str(data_part).unwrap();
+        let line = try_format_sse_error(&value, false).expect("should emit");
         // Body must carry the masked code so fusillade reclassifies to 502.
         assert!(
             line.contains("\"code\":502"),
@@ -7017,6 +7073,33 @@ mod tests {
         );
         // Provider's prose must not leak.
         assert!(!line.contains("Insufficient credits"));
+    }
+
+    /// Some providers encode the error code as a numeric *string*
+    /// (`"code": "429"`). It must still be read as 429 so retry semantics
+    /// survive, rather than defaulting to 500.
+    #[test]
+    fn test_try_format_sse_error_untrusted_numeric_string_code() {
+        let value = serde_json::json!({"error": {"message": "slow down", "code": "429"}});
+        let line = try_format_sse_error(&value, false).expect("should emit");
+        assert!(
+            line.contains("\"code\":429"),
+            "expected numeric string code parsed to 429, got: {line}"
+        );
+        assert!(line.contains("rate_limit_error"));
+    }
+
+    /// Providers like Anthropic use named string codes (`"rate_limit"`)
+    /// rather than numeric ones. The rate-limit family must map to 429 so
+    /// downstream retry logic still fires instead of seeing a generic 500.
+    #[test]
+    fn test_try_format_sse_error_untrusted_named_rate_limit_code() {
+        let value = serde_json::json!({"error": {"message": "slow down", "code": "rate_limit"}});
+        let line = try_format_sse_error(&value, false).expect("should emit");
+        assert!(
+            line.contains("\"code\":429"),
+            "expected named rate-limit code mapped to 429, got: {line}"
+        );
     }
 
     /// Standard (non-streaming) error responses from untrusted providers
