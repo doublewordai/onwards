@@ -106,6 +106,8 @@ Untrusted providers can return status codes that describe the *operator's* relat
 
 User-facing codes (`400`, `404`, `413`, `422`, `429`) pass through unchanged — they're real signal about the caller's request and downstream retry logic depends on seeing them.
 
+For untrusted providers, the embedded error's `code` is read whether the provider encodes it as a number (`429`), a numeric string (`"429"`), or a named string — the rate-limit family (`rate_limit`, `rate_limit_error`, `rate_limit_exceeded`) maps to `429` so retry semantics survive, and unrecognized names fall back to `500`. The resulting code is then masked per the table above.
+
 Masking is applied to both non-streaming error responses (where the upstream status is the outer HTTP status) and to embedded `error.code` values in SSE streams (so a downstream reassembler that reclassifies on the embedded code surfaces the masked code as the HTTP status). Trusted targets bypass masking entirely.
 
 ## Errors embedded in 2xx SSE streams

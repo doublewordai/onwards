@@ -669,4 +669,34 @@ mod tests {
             "empty error object must not surface as an error event, got: {out}"
         );
     }
+
+    /// Behavioral delta from strict mode: non-strict does NOT mask
+    /// account-class codes. An embedded `402` must surface as `402`, whereas
+    /// strict mode's `try_format_sse_error` would mask it to `502` for an
+    /// untrusted provider.
+    #[test]
+    fn test_streaming_sanitizer_does_not_mask_account_class_code() {
+        let sanitizer = ResponseSanitizer {
+            original_model: None,
+        };
+        let body = b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[],\"error\":{\"message\":\"insufficient credits\",\"code\":402}}\n\n";
+        let result = sanitizer.sanitize_streaming(body).unwrap().unwrap();
+        let out = std::str::from_utf8(&result).unwrap();
+
+        assert!(
+            out.contains("data: {\"error\""),
+            "expected stand-alone error event, got: {out}"
+        );
+        // 402 preserved, NOT masked to 502 (non-strict forwards verbatim).
+        assert!(
+            out.contains("\"code\":402"),
+            "non-strict must preserve the original 402, got: {out}"
+        );
+        assert!(
+            !out.contains("\"code\":502"),
+            "non-strict must not mask the code to 502, got: {out}"
+        );
+        // Verbatim message preserved too.
+        assert!(out.contains("insufficient credits"));
+    }
 }
