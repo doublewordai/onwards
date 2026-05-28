@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(strict)* surface provider `error` envelopes embedded in HTTP 200 SSE chunks (e.g. OpenRouter's wrapped 429/402) instead of silently dropping them during strict deserialization, so downstream reassemblers can reclassify the response status
 - *(strict)* emit embedded provider errors as bare `{"error":{...}}` events (chunk wrapper stripped) so a downstream reassembler's `starts_with("{\"error\"")` detector matches, even when the upstream chunk carried both completion fields and an error
+- *(sanitize_response)* also detect embedded `error` envelopes in HTTP 200 SSE chunks in the non-strict path and surface them as stand-alone events, forwarded verbatim with the upstream code preserved (non-strict does not mask account-class codes — use strict mode for that)
 
 ### Changed
 

@@ -237,6 +237,15 @@ impl ResponseSanitizer {
     /// Sanitizes a streaming Server-Sent Events (SSE) response
     ///
     /// SSE format: `data: {...}\n\ndata: {...}\n\ndata: [DONE]\n\n`
+    ///
+    /// Embedded provider error envelopes — either bare `{"error":{...}}`
+    /// chunks or normal chunks that also carry an `error` field (OpenRouter
+    /// shape) — are surfaced as stand-alone `data: {"error":{...}}` events.
+    /// Otherwise the lenient deserializer would absorb the `error` field into
+    /// its unknown-fields map and drop it on re-serialize, leaving the caller
+    /// with a content-less stream and no signal. Non-strict mode forwards the
+    /// envelope verbatim and does not mask the status code — masking is strict
+    /// mode's job.
     pub fn sanitize_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
         let body_str = std::str::from_utf8(body)
             .map_err(|e| format!("Invalid UTF-8 in streaming response: {}", e))?;
@@ -251,20 +260,34 @@ impl ResponseSanitizer {
                     // Preserve [DONE] marker as-is
                     sanitized_lines.push(line.to_string());
                 } else {
-                    // Deserialize using lenient types that ignore unknown fields and provide defaults
-                    let mut chunk: LenientStreamChunk = serde_json::from_str(data_part)
+                    // Parse once: an embedded error envelope and a normal
+                    // chunk are both valid JSON, so reuse this value for the
+                    // error check and the lenient coercion below.
+                    let value: serde_json::Value = serde_json::from_str(data_part)
                         .map_err(|e| format!("Failed to parse stream chunk: {}", e))?;
 
-                    // Rewrite model field if original model provided
-                    if let Some(ref original) = self.original_model {
-                        chunk.model = original.clone();
+                    if let Some(error_event) = extract_embedded_error_envelope(&value) {
+                        // Surface embedded provider errors as a stand-alone
+                        // event so a downstream reassembler can detect them and
+                        // reclassify the HTTP status. Non-strict mode forwards
+                        // the envelope verbatim and preserves the upstream code.
+                        sanitized_lines.push(error_event);
+                    } else {
+                        // Deserialize using lenient types that ignore unknown fields and provide defaults
+                        let mut chunk: LenientStreamChunk = serde_json::from_value(value)
+                            .map_err(|e| format!("Failed to parse stream chunk: {}", e))?;
+
+                        // Rewrite model field if original model provided
+                        if let Some(ref original) = self.original_model {
+                            chunk.model = original.clone();
+                        }
+
+                        // Serialize the sanitized chunk (unknown fields are automatically dropped)
+                        let sanitized_json = serde_json::to_string(&chunk)
+                            .map_err(|e| format!("Failed to serialize stream chunk: {}", e))?;
+
+                        sanitized_lines.push(format!("data: {}", sanitized_json));
                     }
-
-                    // Serialize the sanitized chunk (unknown fields are automatically dropped)
-                    let sanitized_json = serde_json::to_string(&chunk)
-                        .map_err(|e| format!("Failed to serialize stream chunk: {}", e))?;
-
-                    sanitized_lines.push(format!("data: {}", sanitized_json));
                 }
             } else if line.is_empty() {
                 // Preserve empty lines (SSE delimiter)
@@ -293,6 +316,26 @@ impl ResponseSanitizer {
 
         Ok(Some(Bytes::from(sanitized_body)))
     }
+}
+
+/// If `value` carries a provider `error` object — either as the entire
+/// payload or alongside completion fields (OpenRouter shape) — return a
+/// stand-alone `data: {"error":{...}}` line.
+///
+/// The chunk wrapper is stripped so the emitted SSE data line begins with
+/// `{"error"`, the prefix downstream reassemblers match on to reclassify the
+/// HTTP status from the embedded `code`.
+///
+/// Non-strict mode forwards the error object verbatim and does not mask the
+/// status code — sanitization and account-class masking are strict mode's
+/// job. `error: null` and empty `error: {}` payloads (which some providers
+/// emit on healthy chunks) are ignored so they don't become spurious errors.
+fn extract_embedded_error_envelope(value: &serde_json::Value) -> Option<String> {
+    let error_obj = value
+        .get("error")
+        .filter(|v| v.is_object() && (v.get("message").is_some() || v.get("code").is_some()))?;
+    let envelope = serde_json::json!({ "error": error_obj });
+    Some(format!("data: {envelope}"))
 }
 
 #[cfg(test)]
@@ -577,5 +620,53 @@ mod tests {
         let completion_details = &usage["completion_tokens_details"];
         assert_eq!(completion_details["reasoning_tokens"], 0);
         assert!(completion_details.get("image_tokens").is_none()); // OpenRouter-specific, should be removed
+    }
+
+    /// Non-strict mode must surface embedded provider errors (OpenRouter
+    /// shape: normal chunk fields alongside an `error` object) as a
+    /// stand-alone event so a downstream reassembler can detect them. The
+    /// error is forwarded verbatim — non-strict does not mask the code or
+    /// rewrite the message.
+    #[test]
+    fn test_streaming_sanitizer_surfaces_embedded_error_verbatim() {
+        let sanitizer = ResponseSanitizer {
+            original_model: Some("gpt-4".to_string()),
+        };
+        let body = b"data: {\"id\":\"gen-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"openai/gpt-oss-20b\",\"choices\":[],\"error\":{\"message\":\"Provider rate limited\",\"code\":429}}\n\n";
+        let result = sanitizer.sanitize_streaming(body).unwrap().unwrap();
+        let out = std::str::from_utf8(&result).unwrap();
+
+        // Stand-alone error event surfaces with the `{"error"` prefix.
+        assert!(
+            out.contains("data: {\"error\""),
+            "expected stand-alone error event, got: {out}"
+        );
+        // Code preserved and NOT masked — non-strict keeps the upstream status.
+        assert!(
+            out.contains("\"code\":429"),
+            "expected code 429 preserved, got: {out}"
+        );
+        // Verbatim: the provider's message passes through in non-strict mode.
+        assert!(
+            out.contains("Provider rate limited"),
+            "expected verbatim provider message, got: {out}"
+        );
+    }
+
+    /// An empty `error: {}` object carries no signal and must not be turned
+    /// into a spurious error event that would derail a valid stream.
+    #[test]
+    fn test_streaming_sanitizer_ignores_empty_error_object() {
+        let sanitizer = ResponseSanitizer {
+            original_model: None,
+        };
+        let body =
+            b"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"m\",\"choices\":[],\"error\":{}}\n\n";
+        let result = sanitizer.sanitize_streaming(body).unwrap().unwrap();
+        let out = std::str::from_utf8(&result).unwrap();
+        assert!(
+            !out.contains("data: {\"error\""),
+            "empty error object must not surface as an error event, got: {out}"
+        );
     }
 }
