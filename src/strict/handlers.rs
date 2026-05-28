@@ -2199,6 +2199,12 @@ async fn sanitize_error_response(mut response: Response) -> Response {
 /// not mask, it only maps a (possibly-already-masked) status to a
 /// type/message pair.
 fn sanitized_error_for_status(status: u16) -> (&'static str, &'static str) {
+    // The 401/402/403/408 arms are defensive. Both production callers
+    // (`try_format_sse_error`, `standard_error_response`) run
+    // `mask_account_class_status` first (401/402/403/451 -> 502, 408 -> 504),
+    // so those statuses are remapped before reaching here. These arms render
+    // only if a future caller maps an un-masked status — keeping them avoids
+    // falling through to the generic "An error occurred".
     match status {
         400 => ("invalid_request_error", "Invalid request"),
         401 => ("authentication_error", "Authentication failed"),
