@@ -67,7 +67,7 @@ When `sanitize_response: true` and a client requests `model: gpt-4`:
 
 ## Common use cases
 
-**Third-party providers** (e.g., OpenRouter, Together AI) often add extra fields like `provider`, `native_finish_reason`, `cost`, etc. Sanitization strips these.
+**Third-party providers** (e.g., Together AI) often add extra fields like `provider`, `native_finish_reason`, `cost`, etc. Sanitization strips these.
 
 **Provider comparison** -- normalize responses from different providers for consistent handling.
 
@@ -108,6 +108,26 @@ Onwards replaces the upstream error body with a generic OpenAI-compatible error,
 ```
 
 The original error body is logged at `ERROR` level (up to 64 KB) for debugging, so operators can still investigate upstream failures without exposing details to clients.
+
+### Errors embedded in 2xx SSE streams
+
+Some providers return `HTTP 200 OK` and start an SSE stream even when the upstream of the upstream has failed, embedding the failure in a chunk alongside (or instead of) normal completion fields:
+
+```text
+data: {"id":"...","object":"chat.completion.chunk","choices":[],"error":{"code":429,"message":"..."}}
+```
+
+Without handling, the lenient deserializer absorbs the `error` field into its unknown-fields map and drops it on re-serialize, leaving the caller with a content-less stream and no signal that anything went wrong. With `sanitize_response: true`, Onwards detects the embedded `error` envelope and forwards it as a stand-alone event with the chunk wrapper stripped:
+
+```text
+data: {"error":{"code":429,"message":"..."}}
+```
+
+The emitted data line begins with `{"error"`, the prefix downstream reassemblers match on to reclassify the response from HTTP 200 to the embedded `code`.
+
+**Non-strict mode forwards the error verbatim.** The provider's message and the original status `code` pass through unchanged — non-strict mode does **not** mask account-class codes (`401`/`402`/`403`/`451`) or replace the provider's prose. If you need that protection so callers can't probe the operator's auth/billing/jurisdictional state, use [Strict Mode](strict-mode.md), which masks account-class codes and replaces untrusted error messages with generic ones.
+
+> ⚠️ **Security warning:** Verbatim forwarding passes the **entire** error object through to your clients — every field, including the provider's `message`, billing/auth state hints, and any nested `metadata`/`raw`/unknown fields. Do not enable `sanitize_response: true` on targets proxying untrusted third parties if you need to hide upstream internals. Use [Strict Mode](strict-mode.md) for production deployments requiring information-leakage prevention.
 
 ### Error format
 
