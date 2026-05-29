@@ -67,7 +67,7 @@ When `sanitize_response: true` and a client requests `model: gpt-4`:
 
 ## Common use cases
 
-**Third-party providers** (e.g., OpenRouter, Together AI) often add extra fields like `provider`, `native_finish_reason`, `cost`, etc. Sanitization strips these.
+**Third-party providers** (e.g., Together AI) often add extra fields like `provider`, `native_finish_reason`, `cost`, etc. Sanitization strips these.
 
 **Provider comparison** -- normalize responses from different providers for consistent handling.
 
@@ -111,7 +111,7 @@ The original error body is logged at `ERROR` level (up to 64 KB) for debugging, 
 
 ### Errors embedded in 2xx SSE streams
 
-Some providers — most notably OpenRouter — return `HTTP 200 OK` and start an SSE stream even when the upstream of the upstream has failed, embedding the failure in a chunk alongside (or instead of) normal completion fields:
+Some providers return `HTTP 200 OK` and start an SSE stream even when the upstream of the upstream has failed, embedding the failure in a chunk alongside (or instead of) normal completion fields:
 
 ```text
 data: {"id":"...","object":"chat.completion.chunk","choices":[],"error":{"code":429,"message":"..."}}

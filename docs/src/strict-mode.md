@@ -112,7 +112,7 @@ Masking is applied to both non-streaming error responses (where the upstream sta
 
 ## Errors embedded in 2xx SSE streams
 
-Some providers — most notably OpenRouter — return `HTTP 200 OK` and start an SSE stream even when the *upstream* of the upstream has failed. The failure surfaces as a chunk with shape:
+Some providers return `HTTP 200 OK` and start an SSE stream even when the *upstream* of the upstream has failed. The failure surfaces as a chunk with shape:
 
 ```text
 data: {"id":"...","object":"chat.completion.chunk","choices":[],"error":{"code":429,"message":"..."}}

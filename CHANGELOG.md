@@ -7,17 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- *(strict)* surface provider `error` envelopes embedded in HTTP 200 SSE chunks (e.g. OpenRouter's wrapped 429/402) instead of silently dropping them during strict deserialization, so downstream reassemblers can reclassify the response status
-- *(strict)* emit embedded provider errors as bare `{"error":{...}}` events (chunk wrapper stripped) so a downstream reassembler's `starts_with("{\"error\"")` detector matches, even when the upstream chunk carried both completion fields and an error
-- *(sanitize_response)* also detect embedded `error` envelopes in HTTP 200 SSE chunks in the non-strict path and surface them as stand-alone events, forwarded verbatim with the upstream code preserved (non-strict does not mask account-class codes — use strict mode for that)
-
-### Changed
-
-- *(strict)* mask account-class HTTP status codes from untrusted providers (`401`/`402`/`403`/`451`) to `502 Bad Gateway`, and `408` to `504 Gateway Timeout`, so callers cannot probe upstream auth/billing/jurisdictional state through onwards
-- *(strict)* `sanitized_error_for_status` now has explicit arms for `402`, `408`, `413`, `422`, `504` (previously fell through to a generic `"An error occurred"`)
-
 ## [0.29.0](https://github.com/doublewordai/onwards/compare/v0.28.0...v0.29.0) - 2026-05-27
 
 ### Added
