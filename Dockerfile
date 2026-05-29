@@ -18,7 +18,7 @@ COPY src ./src
 RUN cargo build --release
 
 # Runtime stage - use Ubuntu for better compatibility
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
