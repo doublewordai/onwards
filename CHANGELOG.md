@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.29.2](https://github.com/doublewordai/onwards/compare/v0.29.1...v0.29.2) - 2026-05-29
+
+### Other
+
+- *(deps)* update actions/upload-pages-artifact action to v5 ([#176](https://github.com/doublewordai/onwards/pull/176))
+- *(deps)* update rust docker tag to v1.96.0 ([#126](https://github.com/doublewordai/onwards/pull/126))
+- *(deps)* update actions/deploy-pages action to v5 ([#164](https://github.com/doublewordai/onwards/pull/164))
+- *(deps)* update ubuntu docker tag to v26 ([#191](https://github.com/doublewordai/onwards/pull/191))
+
 ## [0.29.1](https://github.com/doublewordai/onwards/compare/v0.29.0...v0.29.1) - 2026-05-29
 
 ### Fixed
