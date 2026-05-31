@@ -104,6 +104,17 @@ struct OriginalModel(String);
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTrust(pub(crate) bool);
 
+/// Resolve whether W3C trace context headers should be propagated to an
+/// upstream provider. The per-provider `propagate_trace_context` overrides;
+/// when unset, defaults to the resolved trusted value (per-provider `trusted`
+/// falling back to the pool-level setting). Extracted as a pure function for
+/// unit testing.
+fn resolve_trace_propagation(target: &Target, pool_trusted: bool) -> bool {
+    target
+        .propagate_trace_context
+        .unwrap_or_else(|| target.trusted.unwrap_or(pool_trusted))
+}
+
 /// Filters and modifies headers before forwarding to upstream
 ///
 /// This function implements RFC 7230 compliant proxy behavior by:
@@ -615,10 +626,14 @@ pub async fn target_message_handler<T: HttpClient>(
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
 
-        // Inject W3C traceparent + tracestate headers for distributed tracing.
-        // This propagates the current span context to upstream services (e.g. vLLM),
-        // creating a continuous trace: fusillade → dwctl → onwards → vLLM
-        {
+        // Inject W3C traceparent + tracestate headers for distributed tracing,
+        // gated on the per-target propagate_trace_context flag (defaults to the
+        // resolved trusted value). This propagates the current span context to
+        // upstreams that participate in our distributed tracing fabric
+        // (typically self-hosted, marked trusted), while withholding it from
+        // upstreams that do not — preventing trace IDs from being forwarded to
+        // third parties that re-emit them on their own outbound calls.
+        if resolve_trace_propagation(target, pool.is_trusted()) {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
@@ -1895,5 +1910,55 @@ mod tests {
 
         assert!(pool.fallback_enabled(), "Fallback should be enabled");
         assert_eq!(pool.len(), 2, "Pool should have 2 providers");
+    }
+
+    /// Helper: build a minimal target with the requested trace flags.
+    fn target_with_trace_flags(
+        trusted: Option<bool>,
+        propagate_trace_context: Option<bool>,
+    ) -> Target {
+        Target {
+            url: "https://api.example.com/".parse().unwrap(),
+            keys: None,
+            onwards_key: None,
+            onwards_model: None,
+            limiter: None,
+            upstream_auth_header_name: None,
+            upstream_auth_header_prefix: None,
+            response_headers: None,
+            sanitize_response: false,
+            open_responses: None,
+            request_timeout_secs: None,
+            trusted,
+            propagate_trace_context,
+        }
+    }
+
+    #[test]
+    fn resolve_trace_propagation_explicit_true_overrides_untrusted_pool() {
+        let target = target_with_trace_flags(Some(false), Some(true));
+        assert!(resolve_trace_propagation(&target, false));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_explicit_false_overrides_trusted_pool() {
+        let target = target_with_trace_flags(Some(true), Some(false));
+        assert!(!resolve_trace_propagation(&target, true));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_inherits_from_target_trusted_when_unset() {
+        let target = target_with_trace_flags(Some(true), None);
+        assert!(resolve_trace_propagation(&target, false));
+
+        let target = target_with_trace_flags(Some(false), None);
+        assert!(!resolve_trace_propagation(&target, true));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_inherits_from_pool_when_target_unset() {
+        let target = target_with_trace_flags(None, None);
+        assert!(resolve_trace_propagation(&target, true));
+        assert!(!resolve_trace_propagation(&target, false));
     }
 }
