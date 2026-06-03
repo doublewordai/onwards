@@ -362,7 +362,11 @@ impl TargetSpecOrList {
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
                         trusted: None, // pool-level trusted handles this for legacy format
-                        propagate_trace_context: None, // inherits from resolved trusted
+                        // Carry each provider's explicit override. Unlike `trusted`
+                        // (which is forced uniform to the pool level in legacy list
+                        // format), per-provider trace-context overrides are honoured;
+                        // an unset value still inherits the resolved trusted value.
+                        propagate_trace_context: t.propagate_trace_context,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -2234,6 +2238,29 @@ mod tests {
             "Error message should mention trusted value mismatch, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_legacy_list_carries_per_provider_propagate_trace_context() {
+        // Regression: the legacy list format must carry each provider's
+        // explicit `propagate_trace_context` through to the ProviderSpec
+        // (the `trusted` field is forced uniform in this format, but
+        // trace-context overrides are honoured per-provider). Previously
+        // this was dropped to None, silently ignoring operator config.
+        let list: TargetSpecOrList = serde_json::from_str(
+            r#"[
+                { "url": "https://provider1.example.com", "propagate_trace_context": true },
+                { "url": "https://provider2.example.com", "propagate_trace_context": false },
+                { "url": "https://provider3.example.com" }
+            ]"#,
+        )
+        .unwrap();
+
+        let pool_config = list.into_pool_config().unwrap();
+        assert_eq!(pool_config.providers.len(), 3);
+        assert_eq!(pool_config.providers[0].propagate_trace_context, Some(true), "explicit true must survive");
+        assert_eq!(pool_config.providers[1].propagate_trace_context, Some(false), "explicit false must survive");
+        assert_eq!(pool_config.providers[2].propagate_trace_context, None, "unset stays None (inherits resolved trusted)");
     }
 
     #[test]
