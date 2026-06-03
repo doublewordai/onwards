@@ -99,12 +99,16 @@ back to whatever URL the caller supplied).
 
 > **Migration note.** Prior to onwards v0.28, `traceparent` was
 > propagated to every upstream unconditionally. After this change,
-> non-trusted pools no longer propagate by default. If you rely on
-> trace continuity across `onwards → upstream` and your upstream
-> isn't marked `trusted: true`, add `propagate_trace_context: true`
-> at the provider or pool level (the field is honoured in both
-> `PoolSpec.providers` entries and the legacy single-provider
-> `TargetSpec` shape).
+> non-trusted upstreams no longer propagate by default (and any inbound
+> trace context is stripped before forwarding to them). If you rely on
+> trace continuity across `onwards → upstream` and the upstream isn't
+> marked `trusted: true`, set `propagate_trace_context: true` on that
+> provider. The field is **provider-scoped**: set it on each relevant
+> entry of a pool's `providers` array, or on a legacy single-provider
+> target. There is no pool-level `propagate_trace_context` key — for a
+> whole pool, mark the pool `trusted: true` (which both bypasses
+> error sanitization and enables propagation) or set the field on each
+> provider entry.
 
 ## Examples
 

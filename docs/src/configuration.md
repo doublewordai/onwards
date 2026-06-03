@@ -24,7 +24,7 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `upstream_auth_header_prefix` | string | No | Custom prefix for upstream auth header value (default: `Bearer `) |
 | `response_headers` | object | No | Key-value pairs to add or override in the response headers |
 | `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance for responses only (see [Sanitization](sanitization.md)) |
-| `propagate_trace_context` | bool | No | Inject W3C `traceparent` / `tracestate` headers on outbound requests. Omit to inherit from resolved `trusted`. See [Trace context propagation](load-balancing.md#trace-context-propagation). |
+| `propagate_trace_context` | optional bool | No | Inject W3C `traceparent` / `tracestate` headers on outbound requests; omit to inherit from the resolved `trusted` value. **Provider-scoped:** valid on a single-provider target and on each entry of a pool's `providers` array — *not* as a top-level key on a pool that uses `providers`. See [Trace context propagation](load-balancing.md#trace-context-propagation). |
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |
