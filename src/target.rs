@@ -88,6 +88,15 @@ pub struct ProviderSpec {
     /// When None (default), inherits the pool-level `trusted` setting.
     #[serde(default)]
     pub trusted: Option<bool>,
+
+    /// Propagate W3C trace context (traceparent / tracestate) on outbound
+    /// requests to this provider. When unset, defaults to the resolved
+    /// `trusted` value — providers participating in our distributed tracing
+    /// fabric (typically self-hosted upstreams marked `trusted: true`) receive
+    /// trace context; external providers do not. Explicit `Some(true)` /
+    /// `Some(false)` overrides the inherited value.
+    #[serde(default)]
+    pub propagate_trace_context: Option<bool>,
 }
 
 /// Configuration for Open Responses API behavior
@@ -357,6 +366,13 @@ pub struct TargetSpec {
     #[builder(default)]
     pub trusted: bool,
 
+    /// Propagate W3C trace context (traceparent / tracestate) on outbound
+    /// requests to this provider. Same semantics as `ProviderSpec`'s
+    /// equivalent field — when unset, defaults to the resolved trusted
+    /// value. Honoured for the legacy single-provider config format.
+    #[serde(default)]
+    pub propagate_trace_context: Option<bool>,
+
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
     /// If fallback is enabled, the next provider will be tried.
@@ -445,6 +461,11 @@ impl TargetSpecOrList {
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
                         trusted: None, // pool-level trusted handles this for legacy format
+                        // Carry each provider's explicit override. Unlike `trusted`
+                        // (which is forced uniform to the pool level in legacy list
+                        // format), per-provider trace-context overrides are honoured;
+                        // an unset value still inherits the resolved trusted value.
+                        propagate_trace_context: t.propagate_trace_context,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -481,6 +502,10 @@ impl TargetSpecOrList {
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
                     trusted: None, // pool-level trusted handles this for single-provider format
+                    // Carry the legacy spec's explicit override (if any). Without
+                    // this, setting propagate_trace_context on the single-provider
+                    // YAML form would be silently dropped.
+                    propagate_trace_context: spec.propagate_trace_context,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -534,6 +559,7 @@ impl From<TargetSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
+            propagate_trace_context: value.propagate_trace_context,
         }
     }
 }
@@ -558,6 +584,7 @@ impl From<ProviderSpec> for Target {
             open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
+            propagate_trace_context: value.propagate_trace_context,
         }
     }
 }
@@ -703,6 +730,9 @@ pub struct Target {
     /// Per-provider override for strict mode error sanitization trust.
     /// None means inherit from the pool-level trusted setting.
     pub trusted: Option<bool>,
+    /// Per-provider override for W3C trace context propagation on outbound
+    /// requests. None means inherit from the resolved trusted value.
+    pub propagate_trace_context: Option<bool>,
 }
 
 impl Target {
@@ -2243,6 +2273,7 @@ mod tests {
                 open_responses: None,
                 request_timeout_secs: None,
                 trusted: None,
+                propagate_trace_context: None,
             }],
         };
 
@@ -2306,6 +2337,29 @@ mod tests {
             "Error message should mention trusted value mismatch, got: {}",
             err_msg
         );
+    }
+
+    #[test]
+    fn test_legacy_list_carries_per_provider_propagate_trace_context() {
+        // Regression: the legacy list format must carry each provider's
+        // explicit `propagate_trace_context` through to the ProviderSpec
+        // (the `trusted` field is forced uniform in this format, but
+        // trace-context overrides are honoured per-provider). Previously
+        // this was dropped to None, silently ignoring operator config.
+        let list: TargetSpecOrList = serde_json::from_str(
+            r#"[
+                { "url": "https://provider1.example.com", "propagate_trace_context": true },
+                { "url": "https://provider2.example.com", "propagate_trace_context": false },
+                { "url": "https://provider3.example.com" }
+            ]"#,
+        )
+        .unwrap();
+
+        let pool_config = list.into_pool_config().unwrap();
+        assert_eq!(pool_config.providers.len(), 3);
+        assert_eq!(pool_config.providers[0].propagate_trace_context, Some(true), "explicit true must survive");
+        assert_eq!(pool_config.providers[1].propagate_trace_context, Some(false), "explicit false must survive");
+        assert_eq!(pool_config.providers[2].propagate_trace_context, None, "unset stays None (inherits resolved trusted)");
     }
 
     #[test]

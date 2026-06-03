@@ -74,6 +74,41 @@ Settings specific to each provider:
 | `concurrency_limit` | Provider-specific concurrency limit |
 | `response_headers` | Provider-specific headers |
 | `trusted` | Override pool-level trust for strict mode error sanitization (`true`/`false`; omit to inherit from pool) |
+| `propagate_trace_context` | Whether to inject W3C `traceparent` / `tracestate` headers on outbound requests to this provider (`true`/`false`; omit to inherit from the resolved `trusted` value). Useful for preventing trace IDs from leaking to third-party providers whose downstream HTTP fetches would re-emit them. See [Trace context propagation](#trace-context-propagation) below. |
+
+## Trace context propagation
+
+`onwards` forwards W3C trace context (`traceparent` and `tracestate`
+headers) on outbound requests to upstream providers, so a downstream
+service that participates in your distributed tracing fabric can stitch
+its spans into the calling trace.
+
+Whether the headers are sent is controlled by `propagate_trace_context`:
+
+- `propagate_trace_context: true` — always propagate
+- `propagate_trace_context: false` — never propagate
+- *omitted* (default) — inherit from the resolved `trusted` value:
+  - per-provider `trusted: true|false` overrides
+  - falling back to the pool-level `trusted` (default `false`)
+
+In effect: **trusted upstreams receive trace context by default;
+untrusted upstreams do not**. This prevents trace IDs from leaking to
+third-party services that may re-emit them on their own outbound
+calls (e.g., a provider's image fetcher echoing your `traceparent`
+back to whatever URL the caller supplied).
+
+> **Migration note.** Prior to onwards v0.28, `traceparent` was
+> propagated to every upstream unconditionally. After this change,
+> non-trusted upstreams no longer propagate by default (and any inbound
+> trace context is stripped before forwarding to them). If you rely on
+> trace continuity across `onwards → upstream` and the upstream isn't
+> marked `trusted: true`, set `propagate_trace_context: true` on that
+> provider. The field is **provider-scoped**: set it on each relevant
+> entry of a pool's `providers` array, or on a legacy single-provider
+> target. There is no pool-level `propagate_trace_context` key — for a
+> whole pool, mark the pool `trusted: true` (which both bypasses
+> error sanitization and enables propagation) or set the field on each
+> provider entry.
 
 ## Examples
 

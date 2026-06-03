@@ -104,6 +104,27 @@ struct OriginalModel(String);
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTrust(pub(crate) bool);
 
+/// Resolve whether W3C trace context headers should be propagated to an
+/// upstream provider. The per-provider `propagate_trace_context` overrides;
+/// when unset, defaults to the resolved trusted value (per-provider `trusted`
+/// falling back to the pool-level setting). Extracted as a pure function for
+/// unit testing.
+fn resolve_trace_propagation(target: &Target, pool_trusted: bool) -> bool {
+    target
+        .propagate_trace_context
+        .unwrap_or_else(|| target.trusted.unwrap_or(pool_trusted))
+}
+
+/// Remove W3C trace-context headers (`traceparent`, `tracestate`) from the
+/// outbound header set. Used when trace propagation is disabled for an
+/// upstream, so an inbound trace context from the caller is not forwarded to
+/// (and re-emitted by) an untrusted third party. Extracted as a pure
+/// function for unit testing.
+fn withhold_trace_context(headers: &mut HeaderMap) {
+    headers.remove("traceparent");
+    headers.remove("tracestate");
+}
+
 /// Filters and modifies headers before forwarding to upstream
 ///
 /// This function implements RFC 7230 compliant proxy behavior by:
@@ -615,14 +636,28 @@ pub async fn target_message_handler<T: HttpClient>(
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
 
-        // Inject W3C traceparent + tracestate headers for distributed tracing.
-        // This propagates the current span context to upstream services (e.g. vLLM),
-        // creating a continuous trace: fusillade → dwctl → onwards → vLLM
-        {
+        // Apply W3C trace-context policy for this upstream, gated on the
+        // per-target propagate_trace_context flag (defaults to the resolved
+        // trusted value).
+        //
+        // - Enabled: inject the current span context, propagating the trace to
+        //   upstreams that participate in our distributed tracing fabric
+        //   (typically self-hosted, marked trusted). inject_context overwrites
+        //   any inbound traceparent/tracestate.
+        // - Disabled: strip any *inbound* traceparent/tracestate so they are
+        //   not forwarded to an untrusted third party. These headers are not
+        //   in HEADERS_TO_STRIP (they're handled here, next to the inject
+        //   decision), so without this branch an inbound trace context from
+        //   the caller would pass straight through, defeating the opt-out and
+        //   letting the third party re-emit our trace IDs on its own outbound
+        //   calls.
+        if resolve_trace_propagation(target, pool.is_trusted()) {
             use tracing_opentelemetry::OpenTelemetrySpanExt;
             let ctx = tracing::Span::current().context();
             let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
             propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
+        } else {
+            withhold_trace_context(&mut attempt_headers);
         }
 
         // Build the request
@@ -1895,5 +1930,80 @@ mod tests {
 
         assert!(pool.fallback_enabled(), "Fallback should be enabled");
         assert_eq!(pool.len(), 2, "Pool should have 2 providers");
+    }
+
+    /// Helper: build a minimal target with the requested trace flags.
+    fn target_with_trace_flags(
+        trusted: Option<bool>,
+        propagate_trace_context: Option<bool>,
+    ) -> Target {
+        Target {
+            url: "https://api.example.com/".parse().unwrap(),
+            keys: None,
+            onwards_key: None,
+            onwards_model: None,
+            limiter: None,
+            upstream_auth_header_name: None,
+            upstream_auth_header_prefix: None,
+            response_headers: None,
+            sanitize_response: false,
+            open_responses: None,
+            request_timeout_secs: None,
+            trusted,
+            propagate_trace_context,
+        }
+    }
+
+    #[test]
+    fn resolve_trace_propagation_explicit_true_overrides_untrusted_pool() {
+        let target = target_with_trace_flags(Some(false), Some(true));
+        assert!(resolve_trace_propagation(&target, false));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_explicit_false_overrides_trusted_pool() {
+        let target = target_with_trace_flags(Some(true), Some(false));
+        assert!(!resolve_trace_propagation(&target, true));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_inherits_from_target_trusted_when_unset() {
+        let target = target_with_trace_flags(Some(true), None);
+        assert!(resolve_trace_propagation(&target, false));
+
+        let target = target_with_trace_flags(Some(false), None);
+        assert!(!resolve_trace_propagation(&target, true));
+    }
+
+    #[test]
+    fn resolve_trace_propagation_inherits_from_pool_when_target_unset() {
+        let target = target_with_trace_flags(None, None);
+        assert!(resolve_trace_propagation(&target, true));
+        assert!(!resolve_trace_propagation(&target, false));
+    }
+
+    #[test]
+    fn withhold_trace_context_strips_inbound_trace_headers() {
+        // When propagation is disabled for an upstream, an inbound trace
+        // context (e.g. from the caller) must not be forwarded.
+        let mut headers = HeaderMap::new();
+        headers.insert("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap());
+        headers.insert("tracestate", "vendor=value".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        withhold_trace_context(&mut headers);
+
+        assert!(!headers.contains_key("traceparent"), "traceparent must be stripped");
+        assert!(!headers.contains_key("tracestate"), "tracestate must be stripped");
+        // Unrelated headers are left untouched.
+        assert!(headers.contains_key("content-type"), "non-trace headers must be preserved");
+    }
+
+    #[test]
+    fn withhold_trace_context_is_noop_when_absent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        withhold_trace_context(&mut headers);
+        assert_eq!(headers.len(), 1);
     }
 }
