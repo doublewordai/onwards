@@ -1012,6 +1012,136 @@ mod tests {
         assert!(requests[1].uri.contains("api.anthropic.com"));
     }
 
+    /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
+    /// identical providers (all hit the shared mock client), configured to
+    /// retry on an upstream 429. Used by the embedded-error tests below.
+    fn embedded_error_targets(alias: &str, n: usize) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+
+        let providers = (0..n)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            on_status: vec![429],
+            ..Default::default()
+        });
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(alias.to_string(), pool);
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    // OpenRouter returns HTTP 200 and puts the real error in the body. These
+    // tests exercise the embedded-error detection + retry in target_message_handler.
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+        // 200 stream whose first frame is a `429` error envelope. onwards must
+        // retry across providers and, when exhausted, return a sanitized 503 —
+        // never the upstream 429.
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![error_frame]);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted retries must surface a sanitized 503, not the upstream 429"
+        );
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_succeeds() {
+        // First provider returns the 200+error frame; the retry succeeds and the
+        // user is served the successful stream — the throttle stays invisible.
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let ok_chunk = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n".to_string();
+        let done = "data: [DONE]\n\n".to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![ok_chunk, done]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            200,
+            "a successful retry must be served transparently"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "first attempt errored, second succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unary_embedded_error_collapses_to_503() {
+        // The same envelope on a non-streaming 200 body collapses to a 503.
+        let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
+        let mock = MockHttpClient::new(StatusCode::OK, body);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 503);
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+    }
+
     #[tokio::test]
     async fn test_request_and_response_details() {
         // Create a target
