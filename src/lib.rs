@@ -34,6 +34,7 @@
 //!
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::routing::{any, get};
 use axum_prometheus::{
@@ -225,7 +226,19 @@ pub struct AppState<T: HttpClient> {
     pub response_id_header: Option<String>,
     pub tool_executor: Arc<dyn ToolExecutor>,
     pub response_store: Arc<dyn ResponseStore>,
+    /// Maximum request body size in bytes, enforced by both routers. Without
+    /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
+    /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
+    /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
+    pub body_limit: usize,
 }
+
+/// Default maximum request body size (32 MB).
+///
+/// Deliberately larger than Axum's 2 MB default so that long-context and
+/// vision payloads are not rejected out of the box. Override with
+/// [`AppState::with_body_limit`].
+pub const DEFAULT_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 impl<T: HttpClient> std::fmt::Debug for AppState<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -244,6 +257,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("response_id_header", &self.response_id_header)
             .field("tool_executor", &"<dyn ToolExecutor>")
             .field("response_store", &"<dyn ResponseStore>")
+            .field("body_limit", &self.body_limit)
             .finish()
     }
 }
@@ -267,6 +281,7 @@ impl AppState<HyperClient> {
             response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
+            body_limit: DEFAULT_BODY_LIMIT,
         }
     }
 
@@ -288,6 +303,7 @@ impl AppState<HyperClient> {
             response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
+            body_limit: DEFAULT_BODY_LIMIT,
         }
     }
 }
@@ -304,6 +320,7 @@ impl<T: HttpClient> AppState<T> {
             response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
+            body_limit: DEFAULT_BODY_LIMIT,
         }
     }
 
@@ -322,6 +339,7 @@ impl<T: HttpClient> AppState<T> {
             response_id_header: None,
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
+            body_limit: DEFAULT_BODY_LIMIT,
         }
     }
 
@@ -353,6 +371,13 @@ impl<T: HttpClient> AppState<T> {
     /// Set the response store for stateful conversations (builder pattern)
     pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
         self.response_store = store;
+        self
+    }
+
+    /// Set the maximum request body size in bytes (builder pattern).
+    /// Applies to both the strict and non-strict routers.
+    pub fn with_body_limit(mut self, limit: usize) -> Self {
+        self.body_limit = limit;
         self
     }
 }
@@ -497,6 +522,10 @@ pub fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(state: AppSta
         .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
         .route("/{*path}", any(target_message_handler))
+        // The wildcard handler buffers the body itself (bounded by
+        // `state.body_limit`), but raise the extractor-level default too so
+        // any extractor-based route added later shares the same limit.
+        .layer(DefaultBodyLimit::max(state.body_limit))
         .with_state(state)
 }
 
@@ -928,6 +957,51 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 404);
+    }
+
+    #[tokio::test]
+    async fn test_non_strict_router_rejects_body_over_configured_limit() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .build(),
+            ),
+        );
+
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client).with_body_limit(1024);
+        let router = build_router(app_state);
+        let server = TestServer::new(router).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "x".repeat(2048)}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "payload_too_large");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("1024 bytes")
+        );
     }
 
     #[tokio::test]

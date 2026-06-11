@@ -253,10 +253,12 @@ pub async fn target_message_handler<T: HttpClient>(
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
     let mut body_bytes =
-        match axum::body::to_bytes(std::mem::take(req.body_mut()), usize::MAX).await {
+        match axum::body::to_bytes(std::mem::take(req.body_mut()), state.body_limit).await {
             Ok(bytes) => bytes,
-            Err(_) => return Err(OnwardsErrorResponse::internal()), // since there's no body limit,
-                                                                    // this should never fail.
+            // to_bytes only fails when the body exceeds the limit (or the
+            // connection drops mid-body); report it as an explicit 413 rather
+            // than an opaque 500.
+            Err(_) => return Err(OnwardsErrorResponse::payload_too_large(state.body_limit)),
         };
 
     // Apply body transformation if provided
@@ -1869,6 +1871,7 @@ mod tests {
             response_id_header: None,
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
+            body_limit: crate::DEFAULT_BODY_LIMIT,
         };
 
         // Create a simple POST request
