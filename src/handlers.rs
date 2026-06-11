@@ -76,39 +76,32 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
     (400..600).contains(&status).then_some(status)
 }
 
-/// Build a sanitized error response that carries a real upstream status, used
-/// when an embedded provider error ([`embedded_error_status`]) is surfaced to
-/// the client. The status is preserved — so an upstream rate limit stays a `429`
-/// rather than becoming a coercion-failure `5xx` — while the message stays
-/// generic to avoid leaking upstream provider details.
-fn embedded_error_to_response(status: u16) -> OnwardsErrorResponse {
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let body = if status == 429 {
-        ErrorResponseBody {
-            message: "The upstream provider is rate limiting requests. Please retry.".to_string(),
-            r#type: "rate_limit_error".to_string(),
-            param: None,
-            code: "rate_limit_exceeded".to_string(),
+/// Extract an embedded provider error status from a single SSE event.
+///
+/// The streaming variant of [`embedded_error_status`]: providers like OpenRouter
+/// open a `200 OK` stream and then send the error as the first `data:` frame
+/// (`data: {"error":{"code":429,...}}`) rather than a content chunk. `chunk` is a
+/// complete SSE event (already reassembled by [`SseBufferedStream`]); the JSON
+/// payload of each `data:` line is parsed and run through
+/// [`embedded_error_status`]. Returns `None` for normal chunks, `[DONE]`, and
+/// comment/keep-alive lines.
+fn sse_chunk_error_status(chunk: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            continue;
         }
-    } else if (400..500).contains(&status) {
-        ErrorResponseBody {
-            message: "The upstream provider rejected the request.".to_string(),
-            r#type: "invalid_request_error".to_string(),
-            param: None,
-            code: "upstream_error".to_string(),
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data)
+            && let Some(status) = embedded_error_status(&value)
+        {
+            return Some(status);
         }
-    } else {
-        ErrorResponseBody {
-            message: "An internal error occurred. Please try again later.".to_string(),
-            r#type: "internal_error".to_string(),
-            param: None,
-            code: "internal_error".to_string(),
-        }
-    };
-    OnwardsErrorResponse::builder()
-        .body(body)
-        .status(code)
-        .build()
+    }
+    None
 }
 
 /// Internal enum to distinguish timeout from network error in upstream requests
@@ -867,65 +860,125 @@ pub async fn target_message_handler<T: HttpClient>(
         let is_sse = content_type.contains("text/event-stream");
 
         // Some upstreams (notably OpenRouter) return HTTP 200 while embedding the
-        // real error in the body — `{"error":{"code":429,...}}` — instead of using
-        // the status line. The status-based fallback (`should_fallback_on_status`
+        // real error in the body — `{"error":{"code":429,...}}` for a unary
+        // response, or as the first `data:` frame of an SSE stream — instead of
+        // using the status line. The status-based fallback (`should_fallback_on_status`
         // above) and the rate-limit retry machinery only ever see the `200`, so a
         // retryable upstream error (e.g. a 429 rate limit) is silently bypassed and
-        // later mis-surfaced as a 5xx by strict sanitization. For non-streaming 2xx
-        // bodies, scan for such an envelope and feed its embedded status into the
-        // SAME fallback/retry decision as a real HTTP status.
+        // a transient throttle surfaces as a user-visible failure.
         //
-        // Gated to strict_mode / sanitize_response targets — the only places the
-        // body is already buffered downstream — so the pure-passthrough path adds
-        // no work. SSE responses are left to the streaming sanitizer (which already
-        // forwards embedded error frames); retrying a stream mid-flight is out of
-        // scope here.
-        if (200..300).contains(&status)
-            && !is_sse
+        // Detect such an envelope and feed its embedded status into the SAME
+        // fallback/retry decision as a real HTTP status. Gated to
+        // strict_mode / sanitize_response targets — the only places the body is
+        // already inspected downstream — so the pure-passthrough path is untouched.
+        let embedded_status: Option<u16> = if (200..300).contains(&status)
             && (state.targets.strict_mode || target.sanitize_response)
         {
-            let (parts, body) = response.into_parts();
-            let buffered = match axum::body::to_bytes(body, usize::MAX).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("Failed to buffer response body for embedded-error scan: {}", e);
-                    return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+            if is_sse {
+                // Peek the first SSE event. The provider error frame arrives
+                // before any content (0 tokens), so one event is enough to
+                // distinguish an error from a real stream. Holding the `200`
+                // headers until the first event costs nothing in time-to-first-
+                // *token* (onwards must receive that event to forward it anyway).
+                // Bounded by the target timeout so a `200`-then-stall can't pin
+                // the request here; on timeout we forward the stream unchanged.
+                use futures_util::StreamExt;
+                let (parts, body) = response.into_parts();
+                let mut events = SseBufferedStream::new(body.into_data_stream());
+                let peek_timeout =
+                    std::time::Duration::from_secs(target.request_timeout_secs.unwrap_or(60));
+                match tokio::time::timeout(peek_timeout, events.next()).await {
+                    Ok(first_event) => {
+                        let embedded = first_event
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .and_then(|chunk| sse_chunk_error_status(chunk));
+                        // Rebuild the stream (first event + remainder) so a clean
+                        // stream is forwarded intact; on the error path below the
+                        // rebuilt `response` is simply dropped when we return.
+                        let rest = futures_util::stream::iter(first_event).chain(events);
+                        response =
+                            Response::from_parts(parts, axum::body::Body::from_stream(rest));
+                        embedded
+                    }
+                    Err(_) => {
+                        debug!("Timed out peeking first SSE event; forwarding stream unmodified");
+                        response =
+                            Response::from_parts(parts, axum::body::Body::from_stream(events));
+                        None
+                    }
                 }
-            };
-            // Cheap guard: only parse when an `error` key could be present, so
-            // normal completions/embeddings aren't deserialized an extra time.
-            const ERROR_KEY: &[u8] = b"\"error\"";
-            let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
-                serde_json::from_slice::<serde_json::Value>(&buffered)
-                    .ok()
-                    .as_ref()
-                    .and_then(embedded_error_status)
             } else {
-                None
-            };
-            if let Some(embedded) = embedded {
-                warn!(
-                    http_status = status,
-                    embedded_status = embedded,
-                    upstream = %target.url,
-                    "Upstream returned 200 with an embedded provider error; treating it as status {embedded}"
-                );
-                upstream_span.record("http.response.status_code", embedded);
-                tracing::Span::current().record("http.response.status_code", embedded);
-                if pool.should_fallback_on_status(embedded) {
-                    tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    return LoopAction::Continue(Some(embedded_error_to_response(embedded)));
-                }
-                record_response_status(embedded);
-                return LoopAction::Done(Err(embedded_error_to_response(embedded)));
+                let (parts, body) = response.into_parts();
+                let buffered = match axum::body::to_bytes(body, usize::MAX).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to buffer response body for embedded-error scan: {}", e);
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+                    }
+                };
+                // Cheap guard: only parse when an `error` key could be present, so
+                // normal completions/embeddings aren't deserialized an extra time.
+                const ERROR_KEY: &[u8] = b"\"error\"";
+                let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
+                    serde_json::from_slice::<serde_json::Value>(&buffered)
+                        .ok()
+                        .as_ref()
+                        .and_then(embedded_error_status)
+                } else {
+                    None
+                };
+                // Re-attach the buffered body so downstream sees an intact response.
+                let len = buffered.len();
+                response = Response::from_parts(parts, axum::body::Body::from(buffered));
+                response.headers_mut().remove(TRANSFER_ENCODING);
+                response
+                    .headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from(len));
+                embedded
             }
-            // Not an error envelope — re-attach the buffered body and carry on.
-            let len = buffered.len();
-            response = Response::from_parts(parts, axum::body::Body::from(buffered));
-            response.headers_mut().remove(TRANSFER_ENCODING);
-            response
-                .headers_mut()
-                .insert(CONTENT_LENGTH, HeaderValue::from(len));
+        } else {
+            None
+        };
+
+        if let Some(embedded) = embedded_status {
+            warn!(
+                http_status = status,
+                embedded_status = embedded,
+                upstream = %target.url,
+                "Upstream returned 2xx with an embedded provider error; treating it as status {embedded}"
+            );
+            upstream_span.record("http.response.status_code", embedded);
+            tracing::Span::current().record("http.response.status_code", embedded);
+
+            let retryable = pool.should_fallback_on_status(embedded)
+                || (embedded == 429 && pool.should_fallback_on_rate_limit());
+            if retryable {
+                tracing::Span::current().record("onwards.fallback", "embedded_error");
+                // Retry internally. If every attempt / provider fallback is
+                // exhausted the caller gets a sanitized 503 — never OpenRouter's
+                // rate limit (see the non-retryable arm below).
+                return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+            }
+
+            record_response_status(embedded);
+            // Don't leak an upstream rate limit: a 429 (and any 5xx) collapses to a
+            // generic 503. Genuine client errors (other 4xx) are surfaced, sanitized,
+            // so the caller can fix the request.
+            let err = if embedded == 429 || embedded >= 500 {
+                OnwardsErrorResponse::service_unavailable()
+            } else {
+                OnwardsErrorResponse::builder()
+                    .body(ErrorResponseBody {
+                        message: "The upstream provider rejected the request.".to_string(),
+                        r#type: "invalid_request_error".to_string(),
+                        param: None,
+                        code: "upstream_error".to_string(),
+                    })
+                    .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                    .build()
+            };
+            return LoopAction::Done(Err(err));
         }
 
         // Determine if SSE buffering is needed for non-strict sanitization
@@ -1296,22 +1349,21 @@ mod tests {
     }
 
     #[test]
-    fn embedded_error_to_response_preserves_real_status() {
-        // 429 stays a 429 (retryable, not a fake 5xx).
-        assert_eq!(
-            embedded_error_to_response(429).into_response().status(),
-            StatusCode::TOO_MANY_REQUESTS
-        );
-        // Other 4xx surface as the real client-error status.
-        assert_eq!(
-            embedded_error_to_response(400).into_response().status(),
-            StatusCode::BAD_REQUEST
-        );
-        // 5xx surfaces as the real server-error status.
-        assert_eq!(
-            embedded_error_to_response(502).into_response().status(),
-            StatusCode::BAD_GATEWAY
-        );
+    fn sse_chunk_error_status_detects_error_frame() {
+        // OpenRouter's first-frame error on a 200 stream.
+        let frame = b"data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n";
+        assert_eq!(sse_chunk_error_status(frame), Some(429));
+
+        // Error alongside otherwise-valid chunk fields (OpenRouter shape).
+        let frame = b"data: {\"id\":\"gen-x\",\"choices\":[],\"error\":{\"code\":502}}\n\n";
+        assert_eq!(sse_chunk_error_status(frame), Some(502));
+
+        // Normal content chunk, the [DONE] marker, and comment/keep-alive lines
+        // must not be flagged.
+        let frame = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        assert_eq!(sse_chunk_error_status(frame), None);
+        assert_eq!(sse_chunk_error_status(b"data: [DONE]\n\n"), None);
+        assert_eq!(sse_chunk_error_status(b": keep-alive\n\n"), None);
     }
 
     #[test]
