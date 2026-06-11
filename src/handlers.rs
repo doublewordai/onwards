@@ -896,11 +896,18 @@ pub async fn target_message_handler<T: HttpClient>(
         // Detect such an envelope and feed its embedded status into the SAME
         // fallback/retry decision as a real HTTP status. Only 2xx responses are
         // scanned — a non-2xx already carries a correct status and is handled by
-        // the status-based fallback above. Gated to strict_mode / sanitize_response
-        // targets — the only places the body is already inspected downstream — so
-        // the pure-passthrough path is untouched.
+        // the status-based fallback above.
+        //
+        // Gated to strict_mode: the only mode where the body is *already* buffered
+        // (unary) or routed through `SseBufferedStream` (streaming) by the strict
+        // sanitizer downstream. So this adds no new buffering and no change to
+        // streaming behaviour — it just inspects the body a little earlier so a
+        // retry stays possible. Pure-passthrough / sanitize-without-transform
+        // targets are deliberately left untouched, to avoid forcing buffering (and
+        // SSE re-framing) onto streams that would otherwise pass straight through.
+        // OpenRouter, the motivating case, runs in strict mode.
         let embedded_status: Option<u16> = if (200..300).contains(&status)
-            && (state.targets.strict_mode || target.sanitize_response)
+            && state.targets.strict_mode
         {
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
@@ -1419,7 +1426,9 @@ mod tests {
             classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
             Error(503)
         );
-        // Multi-line `data:` fields are joined before parsing (SSE spec).
+        // Multi-line `data:` fields are concatenated with `\n` before parsing
+        // (SSE spec): the two `data:` lines here join to the valid JSON
+        // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
         assert_eq!(
             classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
             Error(429)

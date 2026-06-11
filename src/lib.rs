@@ -1171,68 +1171,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_embedded_error_detected_in_sanitize_response_mode() {
-        // Detection also runs on non-strict targets that opt into
-        // sanitize_response, not just under global strict_mode.
-        use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
-
-        let providers = (0..2)
-            .map(|i| {
-                let t = Target::builder()
-                    .url(format!("https://p{i}.example.com/").parse().unwrap())
-                    .request_timeout_secs(5)
-                    .sanitize_response(true)
-                    .build();
-                Provider::new(t, 1)
-            })
-            .collect();
-        let fallback = Some(FallbackConfig {
-            enabled: true,
-            on_status: vec![429],
-            ..Default::default()
-        });
-        let pool = ProviderPool::with_config(
-            providers,
-            None,
-            None,
-            None,
-            fallback,
-            LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert("gpt-4".to_string(), pool);
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        let mock = MockHttpClient::new(
-            StatusCode::OK,
-            r#"{"error":{"code":429,"message":"Provider returned error"}}"#,
-        );
-        let app_state = AppState::with_client(targets, mock.clone());
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2);
-    }
-
-    #[tokio::test]
     async fn test_request_and_response_details() {
         // Create a target
         let targets_map = Arc::new(DashMap::new());
