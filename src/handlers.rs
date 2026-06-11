@@ -22,7 +22,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -51,6 +51,64 @@ impl Injector for HeaderInjector<'_> {
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
+}
+
+/// Detect a provider error envelope embedded in an HTTP 200 body.
+///
+/// Some upstreams — notably OpenRouter — return `200 OK` with the real error in
+/// the response body instead of using the HTTP status line, e.g.
+/// `{"error":{"code":429,"message":"Provider returned error"}}`. The error may
+/// be the whole body or sit alongside otherwise-valid fields
+/// (`{"id":...,"choices":[],"error":{...}}`). When the embedded `error.code` is
+/// a numeric HTTP status in the 4xx/5xx range, return it so the caller can treat
+/// the "200" as that status.
+///
+/// Returns `None` for normal responses — no `error` object, or a non-numeric /
+/// out-of-range code (e.g. OpenAI-style string codes like `"rate_limit_exceeded"`,
+/// which always arrive with a correct HTTP status anyway) — so well-formed
+/// completions are never disturbed.
+fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
+    let code = body.get("error")?.get("code")?;
+    let status = code
+        .as_u64()
+        .or_else(|| code.as_str().and_then(|s| s.parse::<u64>().ok()))?;
+    let status = u16::try_from(status).ok()?;
+    (400..600).contains(&status).then_some(status)
+}
+
+/// Build a sanitized error response that carries a real upstream status, used
+/// when an embedded provider error ([`embedded_error_status`]) is surfaced to
+/// the client. The status is preserved — so an upstream rate limit stays a `429`
+/// rather than becoming a coercion-failure `5xx` — while the message stays
+/// generic to avoid leaking upstream provider details.
+fn embedded_error_to_response(status: u16) -> OnwardsErrorResponse {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = if status == 429 {
+        ErrorResponseBody {
+            message: "The upstream provider is rate limiting requests. Please retry.".to_string(),
+            r#type: "rate_limit_error".to_string(),
+            param: None,
+            code: "rate_limit_exceeded".to_string(),
+        }
+    } else if (400..500).contains(&status) {
+        ErrorResponseBody {
+            message: "The upstream provider rejected the request.".to_string(),
+            r#type: "invalid_request_error".to_string(),
+            param: None,
+            code: "upstream_error".to_string(),
+        }
+    } else {
+        ErrorResponseBody {
+            message: "An internal error occurred. Please try again later.".to_string(),
+            r#type: "internal_error".to_string(),
+            param: None,
+            code: "internal_error".to_string(),
+        }
+    };
+    OnwardsErrorResponse::builder()
+        .body(body)
+        .status(code)
+        .build()
 }
 
 /// Internal enum to distinguish timeout from network error in upstream requests
@@ -808,6 +866,68 @@ pub async fn target_message_handler<T: HttpClient>(
             .to_string();
         let is_sse = content_type.contains("text/event-stream");
 
+        // Some upstreams (notably OpenRouter) return HTTP 200 while embedding the
+        // real error in the body — `{"error":{"code":429,...}}` — instead of using
+        // the status line. The status-based fallback (`should_fallback_on_status`
+        // above) and the rate-limit retry machinery only ever see the `200`, so a
+        // retryable upstream error (e.g. a 429 rate limit) is silently bypassed and
+        // later mis-surfaced as a 5xx by strict sanitization. For non-streaming 2xx
+        // bodies, scan for such an envelope and feed its embedded status into the
+        // SAME fallback/retry decision as a real HTTP status.
+        //
+        // Gated to strict_mode / sanitize_response targets — the only places the
+        // body is already buffered downstream — so the pure-passthrough path adds
+        // no work. SSE responses are left to the streaming sanitizer (which already
+        // forwards embedded error frames); retrying a stream mid-flight is out of
+        // scope here.
+        if (200..300).contains(&status)
+            && !is_sse
+            && (state.targets.strict_mode || target.sanitize_response)
+        {
+            let (parts, body) = response.into_parts();
+            let buffered = match axum::body::to_bytes(body, usize::MAX).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to buffer response body for embedded-error scan: {}", e);
+                    return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+                }
+            };
+            // Cheap guard: only parse when an `error` key could be present, so
+            // normal completions/embeddings aren't deserialized an extra time.
+            const ERROR_KEY: &[u8] = b"\"error\"";
+            let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
+                serde_json::from_slice::<serde_json::Value>(&buffered)
+                    .ok()
+                    .as_ref()
+                    .and_then(embedded_error_status)
+            } else {
+                None
+            };
+            if let Some(embedded) = embedded {
+                warn!(
+                    http_status = status,
+                    embedded_status = embedded,
+                    upstream = %target.url,
+                    "Upstream returned 200 with an embedded provider error; treating it as status {embedded}"
+                );
+                upstream_span.record("http.response.status_code", embedded);
+                tracing::Span::current().record("http.response.status_code", embedded);
+                if pool.should_fallback_on_status(embedded) {
+                    tracing::Span::current().record("onwards.fallback", "embedded_error");
+                    return LoopAction::Continue(Some(embedded_error_to_response(embedded)));
+                }
+                record_response_status(embedded);
+                return LoopAction::Done(Err(embedded_error_to_response(embedded)));
+            }
+            // Not an error envelope — re-attach the buffered body and carry on.
+            let len = buffered.len();
+            response = Response::from_parts(parts, axum::body::Body::from(buffered));
+            response.headers_mut().remove(TRANSFER_ENCODING);
+            response
+                .headers_mut()
+                .insert(CONTENT_LENGTH, HeaderValue::from(len));
+        }
+
         // Determine if SSE buffering is needed for non-strict sanitization
         // Note: Strict mode handlers apply their own buffering before their sanitizers,
         // so we skip buffering here to avoid double-wrapping
@@ -1121,6 +1241,78 @@ pub async fn models<T: HttpClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_error_status_detects_openrouter_envelope() {
+        // Whole-body error envelope (OpenRouter's 200-with-error pattern).
+        let body =
+            serde_json::json!({"error": {"code": 429, "message": "Provider returned error"}});
+        assert_eq!(embedded_error_status(&body), Some(429));
+
+        // Error alongside otherwise-valid fields (OpenRouter reassembled-stream shape).
+        let body = serde_json::json!({
+            "id": "gen-x", "object": "chat.completion.chunk", "choices": [],
+            "error": {"code": 503, "message": "upstream"}
+        });
+        assert_eq!(embedded_error_status(&body), Some(503));
+
+        // Stringified numeric code.
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": "502"}})),
+            Some(502)
+        );
+    }
+
+    #[test]
+    fn embedded_error_status_ignores_normal_and_ambiguous_bodies() {
+        // A well-formed completion must never be disturbed.
+        let ok = serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]
+        });
+        assert_eq!(embedded_error_status(&ok), None);
+
+        // No code / null code / non-numeric (OpenAI-style) code / out-of-range code.
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"message": "x"}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": null}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": "rate_limit_exceeded"}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": 200}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": 999}})),
+            None
+        );
+    }
+
+    #[test]
+    fn embedded_error_to_response_preserves_real_status() {
+        // 429 stays a 429 (retryable, not a fake 5xx).
+        assert_eq!(
+            embedded_error_to_response(429).into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Other 4xx surface as the real client-error status.
+        assert_eq!(
+            embedded_error_to_response(400).into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+        // 5xx surfaces as the real server-error status.
+        assert_eq!(
+            embedded_error_to_response(502).into_response().status(),
+            StatusCode::BAD_GATEWAY
+        );
+    }
 
     #[test]
     fn test_filter_headers_strips_hop_by_hop_headers() {
