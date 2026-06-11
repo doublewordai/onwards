@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.31.0](https://github.com/doublewordai/onwards/compare/v0.30.0...v0.31.0) - 2026-06-11
+
+### Added
+
+- configure max body size ([#210](https://github.com/doublewordai/onwards/pull/210))
+
 ## [0.30.0](https://github.com/doublewordai/onwards/compare/v0.29.1...v0.30.0) - 2026-06-03
 
 ### Added
