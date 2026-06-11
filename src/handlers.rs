@@ -76,32 +76,58 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
     (400..600).contains(&status).then_some(status)
 }
 
-/// Extract an embedded provider error status from a single SSE event.
+/// Classification of a single SSE event for the streaming embedded-error peek.
+#[derive(Debug, PartialEq, Eq)]
+enum SseEventKind {
+    /// A `data:` frame carrying an embedded provider error — the contained
+    /// `error.code`, per [`embedded_error_status`].
+    Error(u16),
+    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    Data,
+    /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
+    /// the caller peeks past to reach the first real frame.
+    Comment,
+}
+
+/// Classify a single SSE event (a complete frame already reassembled by
+/// [`SseBufferedStream`]).
 ///
-/// The streaming variant of [`embedded_error_status`]: providers like OpenRouter
-/// open a `200 OK` stream and then send the error as the first `data:` frame
-/// (`data: {"error":{"code":429,...}}`) rather than a content chunk. `chunk` is a
-/// complete SSE event (already reassembled by [`SseBufferedStream`]); the JSON
-/// payload of each `data:` line is parsed and run through
-/// [`embedded_error_status`]. Returns `None` for normal chunks, `[DONE]`, and
-/// comment/keep-alive lines.
-fn sse_chunk_error_status(chunk: &[u8]) -> Option<u16> {
-    let text = std::str::from_utf8(chunk).ok()?;
+/// Providers like OpenRouter open a `200 OK` stream and send the error as the
+/// first `data:` frame (`data: {"error":{"code":429,...}}`) rather than content.
+/// Per the SSE spec an event's `data:` lines are concatenated with `\n` (with at
+/// most one space after the colon stripped) and parsed once — so compact,
+/// multi-line, and non-spaced (`data:{...}`) framing are all handled. A frame
+/// with no `data:` field is a comment/keep-alive.
+fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        // Non-UTF-8 can't be an error envelope we understand — forward as-is.
+        return SseEventKind::Data;
+    };
+    let mut data = String::new();
+    let mut has_data = false;
     for line in text.lines() {
-        let Some(data) = line.strip_prefix("data: ") else {
-            continue;
-        };
-        let data = data.trim();
-        if data == "[DONE]" {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data)
-            && let Some(status) = embedded_error_status(&value)
-        {
-            return Some(status);
+        if let Some(rest) = line.strip_prefix("data:") {
+            has_data = true;
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
         }
     }
-    None
+    if !has_data {
+        return SseEventKind::Comment;
+    }
+    if data.trim() == "[DONE]" {
+        return SseEventKind::Data;
+    }
+    match serde_json::from_str::<serde_json::Value>(data.trim())
+        .ok()
+        .as_ref()
+        .and_then(embedded_error_status)
+    {
+        Some(status) => SseEventKind::Error(status),
+        None => SseEventKind::Data,
+    }
 }
 
 /// Internal enum to distinguish timeout from network error in upstream requests
@@ -868,46 +894,69 @@ pub async fn target_message_handler<T: HttpClient>(
         // a transient throttle surfaces as a user-visible failure.
         //
         // Detect such an envelope and feed its embedded status into the SAME
-        // fallback/retry decision as a real HTTP status. Gated to
-        // strict_mode / sanitize_response targets — the only places the body is
-        // already inspected downstream — so the pure-passthrough path is untouched.
+        // fallback/retry decision as a real HTTP status. Only 2xx responses are
+        // scanned — a non-2xx already carries a correct status and is handled by
+        // the status-based fallback above. Gated to strict_mode / sanitize_response
+        // targets — the only places the body is already inspected downstream — so
+        // the pure-passthrough path is untouched.
         let embedded_status: Option<u16> = if (200..300).contains(&status)
             && (state.targets.strict_mode || target.sanitize_response)
         {
             if is_sse {
-                // Peek the first SSE event. The provider error frame arrives
-                // before any content (0 tokens), so one event is enough to
-                // distinguish an error from a real stream. Holding the `200`
-                // headers until the first event costs nothing in time-to-first-
-                // *token* (onwards must receive that event to forward it anyway).
-                // Bounded by the target timeout so a `200`-then-stall can't pin
-                // the request here; on timeout we forward the stream unchanged.
+                // Peek the leading SSE events to find the first *real* frame,
+                // skipping any keep-alive/comment frames a provider may send
+                // first. OpenRouter puts the error in that first frame (before any
+                // token), so this is enough to tell an error stream from a normal
+                // one. Holding the `200` headers until the first frame costs
+                // nothing in time-to-first-*token* (onwards must receive it to
+                // forward it anyway). The whole peek is bounded by a short fixed
+                // budget — NOT the request timeout, which governs header receipt —
+                // so a `200`-then-idle stream isn't withheld from the client; on
+                // timeout we forward whatever we have, unmodified (no retry).
                 use futures_util::StreamExt;
+                const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+                const SSE_PEEK_MAX_EVENTS: usize = 4;
+
                 let (parts, body) = response.into_parts();
                 let mut events = SseBufferedStream::new(body.into_data_stream());
-                let peek_timeout =
-                    std::time::Duration::from_secs(target.request_timeout_secs.unwrap_or(60));
-                match tokio::time::timeout(peek_timeout, events.next()).await {
-                    Ok(first_event) => {
-                        let embedded = first_event
-                            .as_ref()
-                            .and_then(|r| r.as_ref().ok())
-                            .and_then(|chunk| sse_chunk_error_status(chunk));
-                        // Rebuild the stream (first event + remainder) so a clean
-                        // stream is forwarded intact; on the error path below the
-                        // rebuilt `response` is simply dropped when we return.
-                        let rest = futures_util::stream::iter(first_event).chain(events);
-                        response =
-                            Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                        embedded
+                // `peeked` / `embedded` live outside the peek future so a partial
+                // peek survives a budget timeout (consumed frames are not lost).
+                let mut peeked = Vec::new();
+                let mut embedded = None;
+                let peek = async {
+                    for _ in 0..SSE_PEEK_MAX_EVENTS {
+                        match events.next().await {
+                            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                                SseEventKind::Error(status) => {
+                                    embedded = Some(status);
+                                    peeked.push(Ok(chunk));
+                                    break;
+                                }
+                                // First real data frame is normal content — stop.
+                                SseEventKind::Data => {
+                                    peeked.push(Ok(chunk));
+                                    break;
+                                }
+                                // Keep-alive / comment — keep looking.
+                                SseEventKind::Comment => peeked.push(Ok(chunk)),
+                            },
+                            Some(Err(e)) => {
+                                peeked.push(Err(e));
+                                break;
+                            }
+                            None => break,
+                        }
                     }
-                    Err(_) => {
-                        debug!("Timed out peeking first SSE event; forwarding stream unmodified");
-                        response =
-                            Response::from_parts(parts, axum::body::Body::from_stream(events));
-                        None
-                    }
+                };
+                if tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err() {
+                    debug!("Timed out peeking SSE lead frames; forwarding stream unmodified");
                 }
+                // Forward the consumed frames followed by the remainder, so a clean
+                // stream is intact; on the error path below this `response` is
+                // dropped when we return.
+                let rest = futures_util::stream::iter(peeked).chain(events);
+                response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
+                embedded
             } else {
                 let (parts, body) = response.into_parts();
                 let buffered = match axum::body::to_bytes(body, usize::MAX).await {
@@ -962,9 +1011,12 @@ pub async fn target_message_handler<T: HttpClient>(
             }
 
             record_response_status(embedded);
-            // Don't leak an upstream rate limit: a 429 (and any 5xx) collapses to a
-            // generic 503. Genuine client errors (other 4xx) are surfaced, sanitized,
-            // so the caller can fix the request.
+            // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
+            // non-retryable ones like 501/505 — collapses to a generic 503. This is
+            // deliberately more opaque than the non-embedded error path: a
+            // 200-with-error body is already anomalous, so we hide the specifics.
+            // Genuine client errors (other 4xx) are surfaced, sanitized, so the
+            // caller can fix the request.
             let err = if embedded == 429 || embedded >= 500 {
                 OnwardsErrorResponse::service_unavailable()
             } else {
@@ -1349,21 +1401,43 @@ mod tests {
     }
 
     #[test]
-    fn sse_chunk_error_status_detects_error_frame() {
+    fn classify_sse_event_distinguishes_error_data_and_comment() {
+        use SseEventKind::{Comment, Data, Error};
+
         // OpenRouter's first-frame error on a 200 stream.
-        let frame = b"data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n";
-        assert_eq!(sse_chunk_error_status(frame), Some(429));
-
+        assert_eq!(
+            classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
+            Error(429)
+        );
         // Error alongside otherwise-valid chunk fields (OpenRouter shape).
-        let frame = b"data: {\"id\":\"gen-x\",\"choices\":[],\"error\":{\"code\":502}}\n\n";
-        assert_eq!(sse_chunk_error_status(frame), Some(502));
+        assert_eq!(
+            classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
+            Error(502)
+        );
+        // Tolerant of `data:` with no space after the colon.
+        assert_eq!(
+            classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
+            Error(503)
+        );
+        // Multi-line `data:` fields are joined before parsing (SSE spec).
+        assert_eq!(
+            classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
+            Error(429)
+        );
 
-        // Normal content chunk, the [DONE] marker, and comment/keep-alive lines
-        // must not be flagged.
-        let frame = b"data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
-        assert_eq!(sse_chunk_error_status(frame), None);
-        assert_eq!(sse_chunk_error_status(b"data: [DONE]\n\n"), None);
-        assert_eq!(sse_chunk_error_status(b": keep-alive\n\n"), None);
+        // Normal content and the [DONE] sentinel are data frames, not errors.
+        assert_eq!(
+            classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            Data
+        );
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+
+        // Comment / keep-alive frames carry no `data:` field.
+        assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
+        assert_eq!(classify_sse_event(b": ping\n\n"), Comment);
+
+        // Non-UTF-8 is treated as opaque data (forwarded, never flagged).
+        assert_eq!(classify_sse_event(&[0xFF, 0xFE]), Data);
     }
 
     #[test]

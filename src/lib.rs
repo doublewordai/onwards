@@ -1143,6 +1143,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_streaming_keepalive_before_error_is_still_detected() {
+        // A keep-alive comment precedes the error frame; the peek must skip it
+        // and still detect the 429, retry, and exhaust to 503.
+        let keepalive = ": keep-alive\n\n".to_string();
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![keepalive, error_frame]);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "an error after a keep-alive frame must still be detected"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_embedded_error_detected_in_sanitize_response_mode() {
+        // Detection also runs on non-strict targets that opt into
+        // sanitize_response, not just under global strict_mode.
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+
+        let providers = (0..2)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .sanitize_response(true)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            on_status: vec![429],
+            ..Default::default()
+        });
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert("gpt-4".to_string(), pool);
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+
+        let mock = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"error":{"code":429,"message":"Provider returned error"}}"#,
+        );
+        let app_state = AppState::with_client(targets, mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 503);
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_request_and_response_details() {
         // Create a target
         let targets_map = Arc::new(DashMap::new());
