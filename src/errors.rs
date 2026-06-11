@@ -113,6 +113,20 @@ impl OnwardsErrorResponse {
         }
     }
 
+    pub fn payload_too_large(limit: usize) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: format!(
+                    "Request body too large: the maximum allowed size is {limit} bytes."
+                ),
+                r#type: "invalid_request_error".to_string(),
+                param: None,
+                code: "payload_too_large".to_string(),
+            }),
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+        }
+    }
+
     pub fn unprocessable_request(message: &str, param: Option<&str>) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {

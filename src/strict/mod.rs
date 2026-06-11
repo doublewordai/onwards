@@ -127,6 +127,7 @@ pub(crate) fn merge_usage_details(
 use crate::AppState;
 use crate::client::HttpClient;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 use tracing::info;
 
@@ -179,6 +180,9 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .route("/responses", post(handlers::responses_handler::<T>))
         // Embeddings
         .route("/embeddings", post(handlers::embeddings_handler::<T>))
+        // Without this layer the `Json` extractors above fall back to Axum's
+        // 2 MB default and reject larger payloads with a 413.
+        .layer(DefaultBodyLimit::max(state.body_limit))
         .with_state(state)
 }
 
@@ -293,6 +297,79 @@ mod tests {
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Build a valid chat completions body padded to at least `size` bytes.
+    fn padded_chat_completions_body(size: usize) -> String {
+        let padding = "x".repeat(size);
+        format!(r#"{{"model": "gpt-4", "messages": [{{"role": "user", "content": "{padding}"}}]}}"#)
+    }
+
+    #[tokio::test]
+    async fn test_strict_router_accepts_body_over_axum_2mb_default() {
+        // Regression test: without an explicit DefaultBodyLimit layer the Json
+        // extractors fall back to Axum's 2 MB default and 413 anything larger.
+        let state = create_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(padded_chat_completions_body(3 * 1024 * 1024)))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_strict_router_accepts_base64_image_over_axum_2mb_default() {
+        // The prod failure mode for COR-440: a vision request whose base64
+        // data URL pushes the body past Axum's old 2 MB extractor default.
+        // Also exercises the image_url content-part schema with a large URL.
+        let state = create_test_app_state();
+        let router = build_strict_router(state);
+
+        // ~3 MB of valid base64 (must be a multiple of 4 chars).
+        let base64_data = "QUJD".repeat(3 * 1024 * 1024 / 4);
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{base64_data}")}}
+                ]
+            }]
+        });
+        assert!(body.to_string().len() > 2 * 1024 * 1024);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_strict_router_rejects_body_over_configured_limit() {
+        let state = create_test_app_state().with_body_limit(1024);
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(padded_chat_completions_body(2048)))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
