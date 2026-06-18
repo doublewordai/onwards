@@ -196,8 +196,8 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
             .unwrap_or("Bearer ");
         let header_value = format!("{}{}", prefix, key);
         debug!(
-            "Adding {} header for upstream {}: {}",
-            header_name_str, target.url, header_value
+            "Adding {} header for upstream {}",
+            header_name_str, target.url
         );
         headers.insert(header_name, header_value.parse().unwrap());
     } else {
