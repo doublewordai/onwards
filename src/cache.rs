@@ -48,7 +48,7 @@ pub const DEFAULT_CLASSIFY_DEADLINE: Duration = Duration::from_secs(5);
 /// **virtual** model string (the user-facing alias / `OriginalModel`, *not*
 /// the rewritten underlying `model_name` — see `handlers.rs`), and the request
 /// body it must parse for `cache_control` markers. Kept minimal but real.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ClassifyInput {
     /// The virtual model string the client sent (the cache key dimension).
@@ -68,6 +68,20 @@ pub struct ClassifyInput {
     /// per customer. `None` when the request carried no bearer token, in which
     /// case the request is un-scopable and a classifier should not cache it.
     pub api_key: Option<String>,
+}
+
+// Manual Debug that REDACTS `api_key`: it is a raw credential secret, and a derived
+// Debug would leak it into any `{:?}` log/error line. Presence/absence is preserved
+// (useful for debugging) but never the value.
+impl std::fmt::Debug for ClassifyInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassifyInput")
+            .field("virtual_model", &self.virtual_model)
+            .field("path", &self.path)
+            .field("body", &self.body)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The paradigm-neutral result of classification: the read/write token split.
@@ -183,5 +197,28 @@ mod tests {
         let stats = classifier.classify(&input).await;
         assert_eq!(stats, CacheStats::default());
         assert!(stats.is_zero());
+    }
+
+    #[test]
+    fn classify_input_debug_redacts_api_key() {
+        let input = ClassifyInput {
+            virtual_model: "m".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: bytes::Bytes::from_static(b"{}"),
+            api_key: Some("sk-super-secret-token".to_string()),
+        };
+        let dbg = format!("{input:?}");
+        assert!(
+            !dbg.contains("sk-super-secret-token"),
+            "Debug leaked the api_key: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "Debug should redact: {dbg}");
+
+        // None renders without a redaction marker.
+        let none_input = ClassifyInput {
+            api_key: None,
+            ..input
+        };
+        assert!(format!("{none_input:?}").contains("api_key: None"));
     }
 }
