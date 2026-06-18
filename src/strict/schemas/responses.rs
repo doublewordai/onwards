@@ -268,11 +268,16 @@ impl<'de> serde::Deserialize<'de> for Item {
         // First deserialize to a generic Value
         let value = serde_json::Value::deserialize(deserializer)?;
 
-        // Check the "type" field
+        // The item `type` is the discriminator (message / function_call /
+        // function_call_output / reasoning). Per the Open Responses spec a
+        // bare message may omit it: the `EasyInputMessage` shape defaults
+        // `type` to "message", so `{"role":"user","content":"hi"}` is valid
+        // input. Mirror that default rather than requiring the discriminator
+        // — the same default dwctl's own input translator already applies.
         let item_type = value
             .get("type")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| serde::de::Error::missing_field("type"))?;
+            .unwrap_or("message");
 
         // Match against known types
         match item_type {
@@ -902,6 +907,45 @@ mod tests {
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
         assert!(matches!(request.input, Input::Items(_)));
+    }
+
+    #[test]
+    fn test_message_item_defaults_type_to_message() {
+        // Open Responses `EasyInputMessage`: a bare message may omit the
+        // item `type` discriminator, which defaults to "message". A client
+        // sending only role + content must parse as a message, not be
+        // rejected for a missing `type` field.
+        let json = r#"{
+            "role": "user",
+            "content": "What's the weather?"
+        }"#;
+
+        let item: Item = serde_json::from_str(json).unwrap();
+        let Item::Message(msg) = item else {
+            panic!("expected Item::Message, got {item:?}");
+        };
+        assert_eq!(msg.role, "user");
+        assert!(matches!(msg.content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn test_request_with_typeless_message_items_parses() {
+        // The same default applies inside a full request's input array:
+        // omitting `type` on each message must still yield message items.
+        let json = r#"{
+            "model": "gpt-4o",
+            "input": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "Hi"}
+            ]
+        }"#;
+
+        let request: ResponsesRequest = serde_json::from_str(json).unwrap();
+        let Input::Items(items) = request.input else {
+            panic!("expected Input::Items");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| matches!(i, Item::Message(_))));
     }
 
     #[test]
