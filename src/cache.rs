@@ -48,7 +48,8 @@ pub const DEFAULT_CLASSIFY_DEADLINE: Duration = Duration::from_secs(5);
 /// **virtual** model string (the user-facing alias / `OriginalModel`, *not*
 /// the rewritten underlying `model_name` — see `handlers.rs`), and the request
 /// body it must parse for `cache_control` markers. Kept minimal but real.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[non_exhaustive]
 pub struct ClassifyInput {
     /// The virtual model string the client sent (the cache key dimension).
     /// This is the `OriginalModel` retained in request extensions, before
@@ -61,6 +62,29 @@ pub struct ClassifyInput {
     /// parses for `cache_control` markers). This is the *pre-strip* body, so
     /// the markers are still present for the classifier to read.
     pub body: bytes::Bytes,
+    /// The bearer token the request authenticated with — the API key secret in
+    /// this system — but **only when it validated against the pool serving the
+    /// request**. onwards holds no notion of users; the classifier resolves this
+    /// to a billing principal (e.g. `user_id`/`org_id`) to scope the cache per
+    /// customer. `None` whenever the request did not authenticate via a validated
+    /// bearer token (missing/invalid `Authorization` header, or an open pool with
+    /// no key set) — the request is then un-scopable and must not be cached.
+    pub api_key: Option<String>,
+}
+
+// Manual Debug that REDACTS `api_key`: it is a raw credential secret, and a derived
+// Debug would leak it into any `{:?}` log/error line. Presence/absence is preserved
+// (useful for debugging) but never the value.
+impl std::fmt::Debug for ClassifyInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClassifyInput")
+            .field("virtual_model", &self.virtual_model)
+            .field("path", &self.path)
+            // length only: the body can be large and carry sensitive prompt content.
+            .field("body_len", &self.body.len())
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// The paradigm-neutral result of classification: the read/write token split.
@@ -171,9 +195,31 @@ mod tests {
             body: bytes::Bytes::from_static(
                 br#"{"model":"my-virtual-model","messages":[{"role":"user","content":"hi"}]}"#,
             ),
+            api_key: Some("test-token".to_string()),
         };
         let stats = classifier.classify(&input).await;
         assert_eq!(stats, CacheStats::default());
         assert!(stats.is_zero());
+    }
+
+    #[test]
+    fn classify_input_debug_redacts_api_key() {
+        let secret = "totally-not-a-real-token";
+        let input = ClassifyInput {
+            virtual_model: "m".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: bytes::Bytes::from_static(b"{}"),
+            api_key: Some(secret.to_string()),
+        };
+        let dbg = format!("{input:?}");
+        assert!(!dbg.contains(secret), "Debug leaked the api_key: {dbg}");
+        assert!(dbg.contains("<redacted>"), "Debug should redact: {dbg}");
+
+        // None renders without a redaction marker.
+        let none_input = ClassifyInput {
+            api_key: None,
+            ..input
+        };
+        assert!(format!("{none_input:?}").contains("api_key: None"));
     }
 }

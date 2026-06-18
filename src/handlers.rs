@@ -524,6 +524,21 @@ pub async fn target_message_handler<T: HttpClient>(
                 virtual_model: model_name.clone(),
                 path,
                 body: body_bytes.clone(),
+                // onwards is identity-agnostic: hand the raw bearer token to the
+                // classifier, which resolves it to a billing principal (user/org) to
+                // scope the cache per customer. RE-VALIDATE it here against the pool
+                // actually serving the request: `pool` may have been reassigned by a
+                // routing-rule redirect since the initial auth check, so gating on
+                // `pool.keys().is_some()` alone could pass an unvalidated token (an
+                // open pool redirected to a keyed one). Only a token that validates
+                // against the serving pool becomes the principal — never an
+                // unauthenticated caller (cross-tenant / billing-isolation safety).
+                api_key: match (pool.keys(), bearer_token) {
+                    (Some(keys), Some(token)) if auth::validate_bearer_token(keys, token) => {
+                        Some(token.to_string())
+                    }
+                    _ => None,
+                },
             };
             let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
 
