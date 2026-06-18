@@ -49,6 +49,7 @@ pub const DEFAULT_CLASSIFY_DEADLINE: Duration = Duration::from_secs(5);
 /// the rewritten underlying `model_name` — see `handlers.rs`), and the request
 /// body it must parse for `cache_control` markers. Kept minimal but real.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ClassifyInput {
     /// The virtual model string the client sent (the cache key dimension).
     /// This is the `OriginalModel` retained in request extensions, before
@@ -61,6 +62,12 @@ pub struct ClassifyInput {
     /// parses for `cache_control` markers). This is the *pre-strip* body, so
     /// the markers are still present for the classifier to read.
     pub body: bytes::Bytes,
+    /// The raw bearer token the request authenticated with — the API key secret
+    /// in this system. onwards holds no notion of users; the classifier resolves
+    /// this to a billing principal (e.g. `user_id`/`org_id`) to scope the cache
+    /// per customer. `None` when the request carried no bearer token, in which
+    /// case the request is un-scopable and a classifier should not cache it.
+    pub api_key: Option<String>,
 }
 
 /// The paradigm-neutral result of classification: the read/write token split.
@@ -171,6 +178,7 @@ mod tests {
             body: bytes::Bytes::from_static(
                 br#"{"model":"my-virtual-model","messages":[{"role":"user","content":"hi"}]}"#,
             ),
+            api_key: Some("sk-test".to_string()),
         };
         let stats = classifier.classify(&input).await;
         assert_eq!(stats, CacheStats::default());

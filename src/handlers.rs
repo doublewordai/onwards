@@ -524,6 +524,10 @@ pub async fn target_message_handler<T: HttpClient>(
                 virtual_model: model_name.clone(),
                 path,
                 body: body_bytes.clone(),
+                // onwards is identity-agnostic: hand the raw bearer token to the
+                // classifier, which resolves it to a billing principal (user/org)
+                // to scope the cache per customer.
+                api_key: bearer_token.map(|t| t.to_string()),
             };
             let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
 
