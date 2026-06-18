@@ -274,10 +274,17 @@ impl<'de> serde::Deserialize<'de> for Item {
         // `type` to "message", so `{"role":"user","content":"hi"}` is valid
         // input. Mirror that default rather than requiring the discriminator
         // — the same default dwctl's own input translator already applies.
-        let item_type = value
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
+        //
+        // The default applies only when `type` is absent. A `type` that is
+        // present but not a string (null, number, object) is malformed input,
+        // not an omitted field, so surface a deserialization error rather than
+        // silently misclassifying the item as a message.
+        let item_type = match value.get("type") {
+            None => "message",
+            Some(v) => v.as_str().ok_or_else(|| {
+                serde::de::Error::custom("Responses input item `type` must be a string")
+            })?,
+        };
 
         // Match against known types
         match item_type {
@@ -926,6 +933,24 @@ mod tests {
         };
         assert_eq!(msg.role, "user");
         assert!(matches!(msg.content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn test_non_string_item_type_is_rejected() {
+        // A `type` that is present but not a string is malformed input, not
+        // an omitted discriminator. It must error rather than defaulting to
+        // a message (which would misclassify the item).
+        for raw in [
+            r#"{"type": 123, "role": "user", "content": "hi"}"#,
+            r#"{"type": null, "role": "user", "content": "hi"}"#,
+            r#"{"type": {"x": 1}, "role": "user", "content": "hi"}"#,
+        ] {
+            let err = serde_json::from_str::<Item>(raw).unwrap_err();
+            assert!(
+                err.to_string().contains("`type` must be a string"),
+                "expected type-must-be-string error for {raw}, got: {err}"
+            );
+        }
     }
 
     #[test]
