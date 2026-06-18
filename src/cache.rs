@@ -25,7 +25,11 @@
 //! returns all-zero stats, so even with the classifier wired the injected fields
 //! are zero and downstream billing is unaffected.
 //!
-//! See `input-token-cache-classification.md` §5.3, §6.1, §6.2, §6.3 for the design.
+//! The seam lives in `target_message_handler`, which both the regular and the strict
+//! routers route through — so strict-mode requests get the same treatment
+//! automatically, with no extra wiring.
+//!
+//! See `input-token-cache-pricing.md` §5.3, §6.1, §6.2, §6.3 for the design.
 
 use async_trait::async_trait;
 use std::time::Duration;

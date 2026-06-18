@@ -283,17 +283,34 @@ pub async fn inject_cache_stats_into_response(
             }
         };
 
+        // In both arms the body has been fully buffered, so any chunked
+        // Transfer-Encoding no longer applies — drop it and set the real
+        // Content-Length so the framing is consistent.
         match inject_into_usage_json(&body_bytes, stats) {
             Some(rewritten) => {
                 let len = rewritten.len();
                 parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+                // We emit plain (uncompressed) JSON — `inject_into_usage_json` only
+                // succeeds on a body it could parse as JSON — so drop any stale
+                // Content-Encoding that would tell the client to decode it again.
+                parts.headers.remove(axum::http::header::CONTENT_ENCODING);
                 parts.headers.insert(
                     axum::http::header::CONTENT_LENGTH,
                     axum::http::HeaderValue::from(len),
                 );
                 Response::from_parts(parts, axum::body::Body::from(rewritten))
             }
-            None => Response::from_parts(parts, axum::body::Body::from(body_bytes)),
+            None => {
+                // No usage to edit: the bytes are returned untouched, so KEEP any
+                // Content-Encoding (they may still be compressed). Only fix framing.
+                let len = body_bytes.len();
+                parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+                parts.headers.insert(
+                    axum::http::header::CONTENT_LENGTH,
+                    axum::http::HeaderValue::from(len),
+                );
+                Response::from_parts(parts, axum::body::Body::from(body_bytes))
+            }
         }
     }
 }

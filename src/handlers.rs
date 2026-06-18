@@ -299,8 +299,9 @@ pub async fn target_message_handler<T: HttpClient>(
         .insert(OriginalModel(model_name.clone()));
 
     // Cached-input-classification fork (§5.3 / §6.3). Gated on a wired classifier: when
-    // `cache_classifier` is None the whole block is skipped and onwards behaviour
-    // is byte-identical to today. When Some:
+    // `cache_classifier` is None the whole block is skipped — no fork, no `cache_control`
+    // stripping, and no usage injection — so onwards behaviour is byte-identical to
+    // today (the strip is NOT independent of the gate). When Some:
     //   - branch B: spawn `classify` on the pre-strip body (markers intact) so
     //     it runs concurrently with the upstream call (branch A). The deadline
     //     join happens on the response path.
@@ -1053,16 +1054,32 @@ pub async fn target_message_handler<T: HttpClient>(
             .insert(ResolvedTrust(resolved_trust));
 
         // Cached-input-classification JOIN (§5.3 / §6.3). Only when a classifier was
-        // wired (handle is Some). Take the handle (consumed once on this
-        // success path), await it under the configured deadline, and inject
-        // the resulting CacheStats into the response usage. On deadline miss
-        // or task failure, fall back to all-zero stats (best-effort,
-        // un-cached). With the no-op classifier the stats are zero.
+        // wired (handle is Some). The classify task has been running in parallel with
+        // the upstream call since the request was forked, so in the normal case it is
+        // already complete here and this await returns immediately. The bounded wait
+        // (cache_classify_deadline) is only hit on a classifier/index/tokenizer outage,
+        // where we fall back to all-zero (best-effort un-cached) stats and let
+        // reconciliation correct any overcharge. With the no-op classifier stats are zero.
+        //
+        // NOTE (streaming): for SSE this await currently precedes returning the body, so
+        // a slow classify (outage only) could delay first-byte by up to the deadline.
+        // The stats are only needed for the terminal usage frame, so deferring the await
+        // into the SSE rewrite stream (resolving lazily at that frame) is a possible
+        // future optimisation — left out for now as classify normally completes well
+        // before time-to-first-token.
         if let Some(handle) = cache_classify_handle.take() {
             let stats = match tokio::time::timeout(state.cache_classify_deadline, handle).await {
                 Ok(Ok(stats)) => stats,
                 Ok(Err(join_err)) => {
-                    error!("Cache classify task failed: {}", join_err);
+                    // Distinguish a real bug (panic) from expected operational
+                    // cancellation, for cleaner log analysis.
+                    if join_err.is_panic() {
+                        error!("Cache classify task panicked: {}", join_err);
+                    } else if join_err.is_cancelled() {
+                        debug!("Cache classify task was cancelled");
+                    } else {
+                        error!("Cache classify task failed: {}", join_err);
+                    }
                     crate::cache::CacheStats::default()
                 }
                 Err(_) => {
