@@ -62,11 +62,13 @@ pub struct ClassifyInput {
     /// parses for `cache_control` markers). This is the *pre-strip* body, so
     /// the markers are still present for the classifier to read.
     pub body: bytes::Bytes,
-    /// The raw bearer token the request authenticated with — the API key secret
-    /// in this system. onwards holds no notion of users; the classifier resolves
-    /// this to a billing principal (e.g. `user_id`/`org_id`) to scope the cache
-    /// per customer. `None` when the request carried no bearer token, in which
-    /// case the request is un-scopable and a classifier should not cache it.
+    /// The bearer token the request authenticated with — the API key secret in
+    /// this system — but **only when it validated against the pool serving the
+    /// request**. onwards holds no notion of users; the classifier resolves this
+    /// to a billing principal (e.g. `user_id`/`org_id`) to scope the cache per
+    /// customer. `None` whenever the request did not authenticate via a validated
+    /// bearer token (missing/invalid `Authorization` header, or an open pool with
+    /// no key set) — the request is then un-scopable and must not be cached.
     pub api_key: Option<String>,
 }
 
