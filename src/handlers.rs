@@ -298,15 +298,15 @@ pub async fn target_message_handler<T: HttpClient>(
     req.extensions_mut()
         .insert(OriginalModel(model_name.clone()));
 
-    // Cached-input-pricing fork (§5.3 / §6.3). Gated on a wired pricer: when
-    // `cache_pricer` is None the whole block is skipped and onwards behaviour
+    // Cached-input-classification fork (§5.3 / §6.3). Gated on a wired classifier: when
+    // `cache_classifier` is None the whole block is skipped and onwards behaviour
     // is byte-identical to today. When Some:
     //   - branch B: spawn `classify` on the pre-strip body (markers intact) so
     //     it runs concurrently with the upstream call (branch A). The deadline
     //     join happens on the response path.
     //   - branch A sanitisation: strip ALL `cache_control` markers from the
     //     outbound body (and ensure include_usage for streaming) before
-    //     forwarding. Independent of the pricer, so it never blocks the model
+    //     forwarding. Independent of the classifier, so it never blocks the model
     //     call.
     // Aborts the cache-classify task on drop unless it has been taken. Any
     // error / early-return path drops the guard and aborts the now-useless
@@ -330,7 +330,7 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     let mut cache_classify_handle: AbortOnDrop =
-        AbortOnDrop(if let Some(pricer) = state.cache_pricer.clone() {
+        AbortOnDrop(if let Some(classifier) = state.cache_classifier.clone() {
             let path = req.uri().path().to_string();
             let classify_input = crate::cache::ClassifyInput {
                 // Cache key is the VIRTUAL model (the OriginalModel/alias), not
@@ -340,7 +340,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 body: body_bytes.clone(),
             };
             let handle =
-                tokio::spawn(async move { pricer.classify(&classify_input).await });
+                tokio::spawn(async move { classifier.classify(&classify_input).await });
 
             // Sanitise the outbound request: strip markers + ensure include_usage.
             if let Some(stripped) = crate::cache_usage::strip_cache_control(&body_bytes) {
@@ -1052,12 +1052,12 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
 
-        // Cached-input-pricing JOIN (§5.3 / §6.3). Only when a pricer was
+        // Cached-input-classification JOIN (§5.3 / §6.3). Only when a classifier was
         // wired (handle is Some). Take the handle (consumed once on this
         // success path), await it under the configured deadline, and inject
         // the resulting CacheStats into the response usage. On deadline miss
         // or task failure, fall back to all-zero stats (best-effort,
-        // un-cached). With the no-op pricer the stats are zero.
+        // un-cached). With the no-op classifier the stats are zero.
         if let Some(handle) = cache_classify_handle.take() {
             let stats = match tokio::time::timeout(state.cache_classify_deadline, handle).await {
                 Ok(Ok(stats)) => stats,
@@ -1949,7 +1949,7 @@ mod tests {
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
-            cache_pricer: None,
+            cache_classifier: None,
             cache_classify_deadline: crate::cache::DEFAULT_CLASSIFY_DEADLINE,
         };
 

@@ -1,8 +1,8 @@
 //! OpenAI-shaped request sanitisation and response usage injection for the
-//! cached-input-pricing seam.
+//! cache-classification seam.
 //!
 //! This is the §4 "adapter at the edge" for OpenAI-compatible endpoints,
-//! realised as onwards helpers. It does two jobs, both gated on a wired pricer
+//! realised as onwards helpers. It does two jobs, both gated on a wired classifier
 //! in [`crate::handlers`]:
 //!
 //! 1. **Outbound request sanitisation** ([`strip_cache_control`]): recursively
@@ -19,7 +19,7 @@
 //!    streaming edits *only* the terminal usage frame before `[DONE]`, leaving
 //!    every delta chunk untouched and never buffering the whole stream.
 //!
-//! With the no-op pricer every injected field is zero.
+//! With the no-op classifier every injected field is zero.
 
 use crate::cache::CacheStats;
 use axum::response::Response;
@@ -64,7 +64,7 @@ fn remove_cache_control(value: &mut Value) -> bool {
 /// `None` to leave the original body untouched (so the caller can cheaply
 /// skip re-serialisation when there was no marker and usage was already set).
 ///
-/// This is independent of the pricer result and runs on the request pass, so
+/// This is independent of the classifier result and runs on the request pass, so
 /// it never reintroduces blocking on the model call.
 pub fn strip_cache_control(body: &[u8]) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
@@ -139,8 +139,8 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
 /// Returns the rewritten body, or `None` if the body could not be parsed or
 /// has no `usage` object to edit (in which case the caller leaves it
 /// untouched). When `stats.is_zero()` this still injects the zeroed fields so
-/// the response shape is consistent for a wired pricer — callers gate the
-/// whole cache path on `Some(pricer)`, so a dormant onwards never reaches here.
+/// the response shape is consistent for a wired classifier — callers gate the
+/// whole cache path on `Some(classifier)`, so a dormant onwards never reaches here.
 pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;

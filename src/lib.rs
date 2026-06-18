@@ -67,7 +67,7 @@ pub mod telemetry;
 pub mod traits;
 
 pub use cache::{
-    CachePricer, CacheStats, ClassifyInput, DEFAULT_CLASSIFY_DEADLINE, NoopCachePricer,
+    CacheClassifier, CacheStats, ClassifyInput, DEFAULT_CLASSIFY_DEADLINE, NoopCacheClassifier,
 };
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
@@ -236,21 +236,21 @@ pub struct AppState<T: HttpClient> {
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
-    /// Optional cached-input-pricing hook (the onwards ↔ dwctl seam, §6.2).
+    /// Optional cached-input-classification hook (the onwards ↔ dwctl seam, §6.2).
     ///
     /// Defaults to `None`, in which case the entire cache path is dormant and
     /// onwards behaviour is byte-identical to today (no fork, no
     /// `cache_control` stripping, no usage injection). When set via
-    /// [`AppState::with_cache_pricer`], onwards forks each request to the
-    /// pricer in parallel with the upstream call and injects the resulting
+    /// [`AppState::with_cache_classifier`], onwards forks each request to the
+    /// classifier in parallel with the upstream call and injects the resulting
     /// [`cache::CacheStats`] into the response `usage`. The default
-    /// [`cache::NoopCachePricer`] returns all-zero stats, so even when wired
+    /// [`cache::NoopCacheClassifier`] returns all-zero stats, so even when wired
     /// the injected fields are zero and downstream billing is unaffected.
-    pub cache_pricer: Option<Arc<dyn cache::CachePricer>>,
+    pub cache_classifier: Option<Arc<dyn cache::CacheClassifier>>,
     /// Deadline for the parallel classify branch. The response join waits at
-    /// most this long for [`cache::CachePricer::classify`] before falling back
+    /// most this long for [`cache::CacheClassifier::classify`] before falling back
     /// to all-zero stats (best-effort, billed as un-cached). Only consulted
-    /// when `cache_pricer` is `Some`. Defaults to
+    /// when `cache_classifier` is `Some`. Defaults to
     /// [`cache::DEFAULT_CLASSIFY_DEADLINE`].
     pub cache_classify_deadline: std::time::Duration,
 }
@@ -281,8 +281,11 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
             .field(
-                "cache_pricer",
-                &self.cache_pricer.as_ref().map(|_| "<dyn CachePricer>"),
+                "cache_classifier",
+                &self
+                    .cache_classifier
+                    .as_ref()
+                    .map(|_| "<dyn CacheClassifier>"),
             )
             .field("cache_classify_deadline", &self.cache_classify_deadline)
             .finish()
@@ -309,7 +312,7 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_pricer: None,
+            cache_classifier: None,
             cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
@@ -333,7 +336,7 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_pricer: None,
+            cache_classifier: None,
             cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
@@ -352,7 +355,7 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_pricer: None,
+            cache_classifier: None,
             cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
@@ -373,7 +376,7 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_pricer: None,
+            cache_classifier: None,
             cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
@@ -416,20 +419,20 @@ impl<T: HttpClient> AppState<T> {
         self
     }
 
-    /// Inject a cached-input-pricing hook (builder pattern, §6.2).
+    /// Inject a cached-input-classification hook (builder pattern, §6.2).
     ///
-    /// This is the **additive, optional** seam: wiring a pricer activates the
+    /// This is the **additive, optional** seam: wiring a classifier activates the
     /// request fork, `cache_control` stripping, and response usage injection.
     /// Leaving it unset (the default) keeps onwards byte-identical to today.
-    /// Pass [`cache::NoopCachePricer`] for an all-zero, behaviour-preserving
+    /// Pass [`cache::NoopCacheClassifier`] for an all-zero, behaviour-preserving
     /// activation (used for local end-to-end validation of the spine).
-    pub fn with_cache_pricer(mut self, pricer: Arc<dyn cache::CachePricer>) -> Self {
-        self.cache_pricer = Some(pricer);
+    pub fn with_cache_classifier(mut self, classifier: Arc<dyn cache::CacheClassifier>) -> Self {
+        self.cache_classifier = Some(classifier);
         self
     }
 
     /// Override the deadline for the parallel classify branch (builder pattern).
-    /// Only consulted when a pricer is wired.
+    /// Only consulted when a classifier is wired.
     pub fn with_cache_classify_deadline(mut self, deadline: std::time::Duration) -> Self {
         self.cache_classify_deadline = deadline;
         self
@@ -1253,7 +1256,7 @@ mod tests {
         }
     }
 
-    /// With NO pricer wired (the dormant default), the cache path is invisible:
+    /// With NO classifier wired (the dormant default), the cache path is invisible:
     /// `cache_control` markers pass through to the upstream untouched and the
     /// response carries no synthetic cache fields. This guards the
     /// non-breaking, behaviour-preserving contract for standalone onwards.
@@ -1262,7 +1265,7 @@ mod tests {
         let targets = single_target("test-model");
         let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        // No .with_cache_pricer() — dormant.
+        // No .with_cache_classifier() — dormant.
         let app_state = AppState::with_client(targets, mock_client.clone());
         let server = TestServer::new(build_router(app_state)).unwrap();
 
@@ -1293,7 +1296,7 @@ mod tests {
         assert!(body["usage"].get("prompt_tokens_details").is_none());
     }
 
-    /// With the no-op pricer wired, the spine activates: the outbound request
+    /// With the no-op classifier wired, the spine activates: the outbound request
     /// has all `cache_control` stripped, and the (non-streaming) response usage
     /// carries the zeroed cache fields. Billing-relevant `prompt_tokens` is
     /// untouched.
@@ -1303,7 +1306,7 @@ mod tests {
         let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
         let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
         let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_pricer(Arc::new(crate::cache::NoopCachePricer));
+            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
         let server = TestServer::new(build_router(app_state)).unwrap();
 
         let response = server
@@ -1342,7 +1345,45 @@ mod tests {
         assert_eq!(usage["cache_creation"]["ephemeral_24h_input_tokens"], 0);
     }
 
-    /// Streaming path: with the no-op pricer wired, the terminal usage frame
+    /// A NORMAL request (no `cache_control` markers) with the no-op classifier
+    /// wired must pass straight through: content forwarded unchanged, the
+    /// (zeroed) cache fields injected, `prompt_tokens` untouched, no error. This
+    /// is the common case — the classifier is active but the request opts out —
+    /// and proves the active path doesn't disturb ordinary traffic.
+    #[tokio::test]
+    async fn test_cache_seam_no_markers_wires_through_cleanly() {
+        let targets = single_target("test-model");
+        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let app_state = AppState::with_client(targets, mock_client.clone())
+            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "what's the weather?"}]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200);
+
+        // Outbound request forwarded unchanged (nothing to strip).
+        let forwarded: serde_json::Value =
+            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
+        assert_eq!(forwarded["messages"][0]["content"], "what's the weather?");
+
+        // Response usage: zeroed cache fields injected, original counts untouched.
+        let body: serde_json::Value = response.json();
+        let usage = &body["usage"];
+        assert_eq!(usage["prompt_tokens"], 7);
+        assert_eq!(usage["completion_tokens"], 3);
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["cache_creation_input_tokens"], 0);
+    }
+
+    /// Streaming path: with the no-op classifier wired, the terminal usage frame
     /// gets the zeroed cache fields injected while delta chunks and `[DONE]`
     /// pass through untouched.
     #[tokio::test]
@@ -1355,7 +1396,7 @@ mod tests {
         ];
         let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
         let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_pricer(Arc::new(crate::cache::NoopCachePricer));
+            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
         let server = TestServer::new(build_router(app_state)).unwrap();
 
         let response = server
