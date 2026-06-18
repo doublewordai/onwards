@@ -126,8 +126,8 @@ pub async fn patch_response_body_id(response: &mut Response<Body>, override_id: 
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use flate2::write::GzEncoder;
     use flate2::Compression;
+    use flate2::write::GzEncoder;
     use std::io::Write as _;
 
     // --- extract_override_id ---
@@ -181,7 +181,9 @@ mod tests {
 
     #[test]
     fn path_supports_id_override_with_query_string() {
-        assert!(path_supports_id_override("/v1/chat/completions?stream=true"));
+        assert!(path_supports_id_override(
+            "/v1/chat/completions?stream=true"
+        ));
         assert!(path_supports_id_override("/v1/responses?foo=bar"));
     }
 
@@ -240,7 +242,9 @@ mod tests {
 
         patch_response_body_id(&mut response, "resp_override".to_string()).await;
 
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(json["id"], "resp_override");
         assert_eq!(json["model"], "gpt-4");
@@ -261,7 +265,9 @@ mod tests {
 
         // Should be decompressed after patching
         assert!(response.headers().get("content-encoding").is_none());
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(json["id"], "resp_patched");
     }
@@ -280,7 +286,9 @@ mod tests {
         patch_response_body_id(&mut response, "resp_br_patched".to_string()).await;
 
         assert!(response.headers().get("content-encoding").is_none());
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(json["id"], "resp_br_patched");
     }
@@ -292,7 +300,9 @@ mod tests {
 
         patch_response_body_id(&mut response, "resp_ignored".to_string()).await;
 
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(result.as_ref(), b"not json");
     }
 
@@ -303,7 +313,9 @@ mod tests {
 
         patch_response_body_id(&mut response, "resp_noop".to_string()).await;
 
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert!(json.get("id").is_none());
     }
@@ -315,8 +327,17 @@ mod tests {
 
         patch_response_body_id(&mut response, "resp_much-longer-id-value".to_string()).await;
 
-        let cl: usize = response.headers().get("content-length").unwrap().to_str().unwrap().parse().unwrap();
-        let result = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let cl: usize = response
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let result = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(cl, result.len());
     }
 }
