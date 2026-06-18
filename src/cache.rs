@@ -89,9 +89,13 @@ impl CacheStats {
             .saturating_add(self.creation_24h)
     }
 
-    /// True when every count is zero — the dormant / no-op case. Used to skip
-    /// usage injection entirely so a no-op classifier leaves the response shape
-    /// untouched beyond what was already there.
+    /// True when every count is zero (the no-op / "no cached tokens" case).
+    ///
+    /// A convenience predicate only. The injection path deliberately still writes
+    /// the zeroed cache fields when a classifier is wired — the usage shape is kept
+    /// consistent with Anthropic/OpenAI, which always include the cache fields when
+    /// caching is active (see [`crate::cache_usage`]). The dormant case (no
+    /// classifier wired) is what leaves the response untouched, not a zero result.
     pub fn is_zero(&self) -> bool {
         *self == CacheStats::default()
     }

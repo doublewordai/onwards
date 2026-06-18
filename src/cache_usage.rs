@@ -224,11 +224,16 @@ pub async fn inject_cache_stats_into_response(
 
         let stats = *stats;
         // `edited` flips true after the terminal usage frame is rewritten, so
-        // we only ever touch one frame and skip the JSON parse on every other
-        // chunk. State is moved into the stream closure.
+        // we only ever touch one event and skip the JSON parse on every other.
+        // State is moved into the stream closure.
         let mut edited = false;
         let body_stream = BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-        let transformed = body_stream.map(move |chunk_result| match chunk_result {
+        // Providers can split a single SSE event across body chunks (HTTP framing
+        // is not aligned to `\n\n` event boundaries). SseBufferedStream re-aggregates
+        // so each item we inspect is a complete event — otherwise a split terminal
+        // usage frame would be missed and injection silently skipped.
+        let buffered = crate::sse::SseBufferedStream::new(body_stream);
+        let transformed = buffered.map(move |chunk_result| match chunk_result {
             Ok(chunk) => {
                 if edited {
                     return Ok::<_, std::io::Error>(chunk);
@@ -245,8 +250,26 @@ pub async fn inject_cache_stats_into_response(
         });
 
         *response.body_mut() = axum::body::Body::from_stream(transformed);
+        // The body is now a streaming body of unknown length; drop any stale
+        // Content-Length so it can't mismatch the rewritten stream.
+        response
+            .headers_mut()
+            .remove(axum::http::header::CONTENT_LENGTH);
         response
     } else {
+        // Only JSON bodies can carry a chat-completion `usage`. If Content-Type is
+        // explicitly non-JSON (e.g. a file download), don't buffer it — return as-is
+        // to preserve pass-through performance. Missing/unknown CT falls through to
+        // the JSON attempt (chat completions are JSON).
+        let is_json = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("application/json"))
+            .unwrap_or(true);
+        if !is_json {
+            return response;
+        }
         // Non-streaming: buffer the complete JSON body and splice.
         let (mut parts, body) = response.into_parts();
         let body_bytes = match BodyExt::collect(body).await {
@@ -407,5 +430,37 @@ mod tests {
         let out_str = std::str::from_utf8(&out).unwrap();
         // exactly one injected cached_tokens.
         assert_eq!(out_str.matches("cached_tokens").count(), 1);
+    }
+
+    /// Robustness: providers can split a single SSE event across body chunks.
+    /// `inject_cache_stats_into_response` wraps the stream in `SseBufferedStream`,
+    /// which re-aggregates to complete `\n\n`-delimited events, so the terminal
+    /// usage frame is still found and injected even when split mid-JSON.
+    #[tokio::test]
+    async fn inject_sse_handles_event_split_across_body_chunks() {
+        use futures_util::stream;
+        let chunk1 = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[],\"usage\":{\"prompt_to";
+        let chunk2 = "kens\":1100,\"completion_tokens\":5,\"total_tokens\":1105}}\n\n";
+        let chunk3 = "data: [DONE]\n\n";
+        let body = axum::body::Body::from_stream(stream::iter(vec![
+            Ok::<_, std::io::Error>(Bytes::from(chunk1)),
+            Ok(Bytes::from(chunk2)),
+            Ok(Bytes::from(chunk3)),
+        ]));
+        let response = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(body)
+            .unwrap();
+
+        let out = inject_cache_stats_into_response(response, &stats()).await;
+        let collected = BodyExt::collect(out.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&collected).unwrap();
+        // The split usage frame was re-aggregated and injected.
+        assert!(
+            s.contains("\"cached_tokens\":1024"),
+            "usage frame should be injected across split chunks: {s}"
+        );
+        assert!(s.contains("\"cache_read_input_tokens\":1024"));
+        assert!(s.contains("data: [DONE]"));
     }
 }
