@@ -298,61 +298,9 @@ pub async fn target_message_handler<T: HttpClient>(
     req.extensions_mut()
         .insert(OriginalModel(model_name.clone()));
 
-    // Cached-input-classification fork (§5.3 / §6.3). Gated on a wired classifier: when
-    // `cache_classifier` is None the whole block is skipped — no fork, no `cache_control`
-    // stripping, and no usage injection — so onwards behaviour is byte-identical to
-    // today (the strip is NOT independent of the gate). When Some:
-    //   - branch B: spawn `classify` on the pre-strip body (markers intact) so
-    //     it runs concurrently with the upstream call (branch A). The deadline
-    //     join happens on the response path.
-    //   - branch A sanitisation: strip ALL `cache_control` markers from the
-    //     outbound body (and ensure include_usage for streaming) before
-    //     forwarding. Independent of the classifier, so it never blocks the model
-    //     call.
-    // Aborts the cache-classify task on drop unless it has been taken. Any
-    // error / early-return path drops the guard and aborts the now-useless
-    // classify — safe because index writes are success-gated, so a half-done
-    // classify has written nothing and cannot pollute the cache. The success
-    // path takes the handle out (so it is NOT aborted) and awaits it under the
-    // deadline; a deadline miss then drops the raw JoinHandle, which *detaches*
-    // (not aborts) so the task finishes and its index write still lands.
-    struct AbortOnDrop(Option<tokio::task::JoinHandle<crate::cache::CacheStats>>);
-    impl AbortOnDrop {
-        fn take(&mut self) -> Option<tokio::task::JoinHandle<crate::cache::CacheStats>> {
-            self.0.take()
-        }
-    }
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            if let Some(handle) = self.0.take() {
-                handle.abort();
-            }
-        }
-    }
-
-    let mut cache_classify_handle: AbortOnDrop =
-        AbortOnDrop(if let Some(classifier) = state.cache_classifier.clone() {
-            let path = req.uri().path().to_string();
-            let classify_input = crate::cache::ClassifyInput {
-                // Cache key is the VIRTUAL model (the OriginalModel/alias), not
-                // the underlying name onwards rewrites to downstream.
-                virtual_model: model_name.clone(),
-                path,
-                body: body_bytes.clone(),
-            };
-            let handle =
-                tokio::spawn(async move { classifier.classify(&classify_input).await });
-
-            // Sanitise the outbound request: strip markers + ensure include_usage.
-            if let Some(stripped) = crate::cache_usage::strip_cache_control(&body_bytes) {
-                debug!("Stripped cache_control markers from outbound request");
-                body_bytes = stripped;
-            }
-
-            Some(handle)
-        } else {
-            None
-        });
+    // (The cached-input-classification fork is placed lower down — after auth/routing/
+    // rate-limit/concurrency have all passed, just before dispatch — so invalid,
+    // forbidden, or rate-limited requests never trigger classification work. See §5.3/§6.3.)
 
     trace!("Received request for model: {}", model_name);
     trace!(
@@ -542,6 +490,56 @@ pub async fn target_message_handler<T: HttpClient>(
     // select_iter() uses weighted least connections: picks the provider with the
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
+    // Cached-input-classification fork (§5.3 / §6.3) — placed HERE, after auth/routing/
+    // rate-limit/concurrency have all passed, so invalid / forbidden / rate-limited
+    // requests never trigger (potentially expensive) classification. It still runs
+    // concurrently with the upstream dispatch below, so it adds no latency. Gated on a
+    // wired classifier: with `cache_classifier == None` there is no fork, no
+    // `cache_control` stripping, and no usage injection — byte-identical to today.
+    //
+    // AbortOnDrop aborts the classify task on any error / early-return path (safe: index
+    // writes are success-gated, so a half-done classify has written nothing). The success
+    // path takes the handle out and awaits it under the deadline; a deadline miss detaches
+    // (not aborts) so the task finishes and its index write still lands.
+    struct AbortOnDrop(Option<tokio::task::JoinHandle<crate::cache::CacheStats>>);
+    impl AbortOnDrop {
+        fn take(&mut self) -> Option<tokio::task::JoinHandle<crate::cache::CacheStats>> {
+            self.0.take()
+        }
+    }
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    let mut cache_classify_handle: AbortOnDrop =
+        AbortOnDrop(if let Some(classifier) = state.cache_classifier.clone() {
+            let path = req.uri().path().to_string();
+            let classify_input = crate::cache::ClassifyInput {
+                // Cache key is the VIRTUAL model (the OriginalModel/alias), not the
+                // underlying name onwards rewrites to downstream.
+                virtual_model: model_name.clone(),
+                path,
+                body: body_bytes.clone(),
+            };
+            let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
+
+            // Sanitise the outbound request: strip markers + ensure include_usage.
+            if let Some(stripped) = crate::cache_usage::strip_cache_control(&body_bytes) {
+                debug!(
+                    "Sanitised outbound request for cache path (cache_control stripped and/or include_usage set)"
+                );
+                body_bytes = stripped;
+            }
+
+            Some(handle)
+        } else {
+            None
+        });
+
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;

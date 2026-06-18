@@ -159,7 +159,14 @@ pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> 
 ///
 /// Returns the rewritten body, or `None` if no usage-bearing frame was found
 /// (so the caller forwards the original).
+///
+/// Assumes **uncompressed UTF-8** `text/event-stream` (which is what AI-provider SSE
+/// always is). If the bytes are non-UTF-8 or compressed (`Content-Encoding: gzip`/`br`),
+/// the `from_utf8` parse below returns `None` and injection is skipped — a graceful
+/// no-op: that response just carries no cache fields. We don't decompress here
+/// (streaming gzip would defeat the point of editing one frame in flight).
 pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
+    // Non-UTF-8 / compressed body → skip injection (graceful no-op; see doc above).
     let body_str = std::str::from_utf8(body).ok()?;
 
     let mut out = String::with_capacity(body_str.len() + 256);
