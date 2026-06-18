@@ -240,7 +240,8 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request, extensions, effective_response_id).await;
+        return handle_adapter_request(state, headers, request, extensions, effective_response_id)
+            .await;
     }
 
     // Passthrough mode: forward request as-is
@@ -294,7 +295,13 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let response_is_sse = response_is_sse(&response);
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_responses_response(response, resolved_model, trusted, response_id_override).await
+            sanitize_streaming_responses_response(
+                response,
+                resolved_model,
+                trusted,
+                response_id_override,
+            )
+            .await
         } else {
             sanitize_responses_response(response, resolved_model, response_id_override).await
         }
@@ -311,18 +318,26 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         // extract the body without consuming it, so we store the response_id mapping only.
         // The provider's response already contains its own ID; downstream consumers
         // (GET /v1/responses/{id}) will use the fusillade row.
-        if let Err(e) = state.response_store.complete(
-            &response_id,
-            &serde_json::json!({"passthrough": true}),
-            final_response.status().as_u16(),
-        ).await {
+        if let Err(e) = state
+            .response_store
+            .complete(
+                &response_id,
+                &serde_json::json!({"passthrough": true}),
+                final_response.status().as_u16(),
+            )
+            .await
+        {
             warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
         }
     } else {
-        if let Err(e) = state.response_store.fail(
-            &response_id,
-            &format!("Upstream returned {}", final_response.status()),
-        ).await {
+        if let Err(e) = state
+            .response_store
+            .fail(
+                &response_id,
+                &format!("Upstream returned {}", final_response.status()),
+            )
+            .await
+        {
             warn!(error = %e, response_id = %response_id, "Failed to mark response as failed");
         }
     }
@@ -709,10 +724,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         // Check if the response is successful
         if !response.status().is_success() {
             // Mark as failed in the response store
-            if let Err(e) = state.response_store.fail(
-                &response_id,
-                &format!("Upstream returned {}", response.status()),
-            ).await {
+            if let Err(e) = state
+                .response_store
+                .fail(
+                    &response_id,
+                    &format!("Upstream returned {}", response.status()),
+                )
+                .await
+            {
                 warn!(error = %e, response_id = %response_id, "Failed to mark response as failed");
             }
             // Pass through error responses
@@ -867,11 +886,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
         // Mark as completed in the response store
         if let Ok(response_value) = serde_json::to_value(&responses_response) {
-            if let Err(e) = state.response_store.complete(
-                &response_id,
-                &response_value,
-                parts.status.as_u16(),
-            ).await {
+            if let Err(e) = state
+                .response_store
+                .complete(&response_id, &response_value, parts.status.as_u16())
+                .await
+            {
                 warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
             }
         }
@@ -1826,7 +1845,11 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
 ///
 /// Deserializes the response through our strict schema (drops extra fields),
 /// rewrites the model field, and re-serializes.
-async fn sanitize_responses_response(mut response: Response, original_model: String, response_id_override: Option<String>) -> Response {
+async fn sanitize_responses_response(
+    mut response: Response,
+    original_model: String,
+    response_id_override: Option<String>,
+) -> Response {
     let body_bytes =
         match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
@@ -1926,7 +1949,9 @@ async fn sanitize_streaming_responses_response(
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
     let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
     let response_id_override = response_id_override.clone();
-    let stream_fallback_response_id = response_id_override.clone().unwrap_or_else(generated_response_id);
+    let stream_fallback_response_id = response_id_override
+        .clone()
+        .unwrap_or_else(generated_response_id);
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
         match chunk_result {
@@ -3931,7 +3956,8 @@ mod tests {
             .unwrap();
 
         let result =
-            sanitize_streaming_responses_response(response, "test-model".to_string(), true, None).await;
+            sanitize_streaming_responses_response(response, "test-model".to_string(), true, None)
+                .await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)

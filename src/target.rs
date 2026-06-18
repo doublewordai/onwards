@@ -2357,9 +2357,20 @@ mod tests {
 
         let pool_config = list.into_pool_config().unwrap();
         assert_eq!(pool_config.providers.len(), 3);
-        assert_eq!(pool_config.providers[0].propagate_trace_context, Some(true), "explicit true must survive");
-        assert_eq!(pool_config.providers[1].propagate_trace_context, Some(false), "explicit false must survive");
-        assert_eq!(pool_config.providers[2].propagate_trace_context, None, "unset stays None (inherits resolved trusted)");
+        assert_eq!(
+            pool_config.providers[0].propagate_trace_context,
+            Some(true),
+            "explicit true must survive"
+        );
+        assert_eq!(
+            pool_config.providers[1].propagate_trace_context,
+            Some(false),
+            "explicit false must survive"
+        );
+        assert_eq!(
+            pool_config.providers[2].propagate_trace_context, None,
+            "unset stays None (inherits resolved trusted)"
+        );
     }
 
     #[test]
