@@ -524,10 +524,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 virtual_model: model_name.clone(),
                 path,
                 body: body_bytes.clone(),
-                // onwards is identity-agnostic: hand the raw bearer token to the
-                // classifier, which resolves it to a billing principal (user/org)
-                // to scope the cache per customer.
-                api_key: bearer_token.map(|t| t.to_string()),
+                // onwards is identity-agnostic: hand the raw *validated* bearer token
+                // to the classifier, which resolves it to a billing principal
+                // (user/org) to scope the cache per customer. Only pass it when the
+                // pool actually has keys to validate against — an open pool never
+                // authenticated the token, so it must not influence cache scoping.
+                api_key: if pool.keys().is_some() {
+                    bearer_token.map(|t| t.to_string())
+                } else {
+                    None
+                },
             };
             let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
 

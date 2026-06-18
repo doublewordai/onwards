@@ -78,7 +78,8 @@ impl std::fmt::Debug for ClassifyInput {
         f.debug_struct("ClassifyInput")
             .field("virtual_model", &self.virtual_model)
             .field("path", &self.path)
-            .field("body", &self.body)
+            // length only: the body can be large and carry sensitive prompt content.
+            .field("body_len", &self.body.len())
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -192,7 +193,7 @@ mod tests {
             body: bytes::Bytes::from_static(
                 br#"{"model":"my-virtual-model","messages":[{"role":"user","content":"hi"}]}"#,
             ),
-            api_key: Some("sk-test".to_string()),
+            api_key: Some("test-token".to_string()),
         };
         let stats = classifier.classify(&input).await;
         assert_eq!(stats, CacheStats::default());
@@ -201,17 +202,15 @@ mod tests {
 
     #[test]
     fn classify_input_debug_redacts_api_key() {
+        let secret = "totally-not-a-real-token";
         let input = ClassifyInput {
             virtual_model: "m".to_string(),
             path: "/v1/chat/completions".to_string(),
             body: bytes::Bytes::from_static(b"{}"),
-            api_key: Some("sk-super-secret-token".to_string()),
+            api_key: Some(secret.to_string()),
         };
         let dbg = format!("{input:?}");
-        assert!(
-            !dbg.contains("sk-super-secret-token"),
-            "Debug leaked the api_key: {dbg}"
-        );
+        assert!(!dbg.contains(secret), "Debug leaked the api_key: {dbg}");
         assert!(dbg.contains("<redacted>"), "Debug should redact: {dbg}");
 
         // None renders without a redaction marker.
