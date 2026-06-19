@@ -978,9 +978,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade"
-version = "18.0.0"
+version = "19.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a159b6aaa3c49930fe3688c87821bd49900c88d7981506e0785d484e8d42b38"
+checksum = "57dce5742d2d6c717c89407c7c75d6d5e4fe45180b0859b6bc187c1c503bc668"
 dependencies = [
  "anyhow",
  "async-trait",
