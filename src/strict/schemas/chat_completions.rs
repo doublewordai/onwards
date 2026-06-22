@@ -268,6 +268,8 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    #[serde(rename = "file")]
+    File { file: FileContent },
 }
 
 /// Image URL specification
@@ -276,6 +278,20 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// File content for a `file` content part (e.g. a PDF for document understanding)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileContent {
+    /// Identifier of a previously uploaded file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// Original filename, used by some providers to infer the content type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// Base64-encoded file bytes, typically as a `data:` URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
 }
 
 /// Stream options

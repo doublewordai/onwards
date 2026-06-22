@@ -471,7 +471,7 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
             Item::Message(msg) => {
                 messages.push(ChatMessage {
                     role: msg.role.clone(),
-                    content: Some(convert_message_content(&msg.content)),
+                    content: Some(convert_message_content(&msg.content)?),
                     name: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -546,52 +546,79 @@ fn items_to_messages(items: &[Item]) -> Result<Vec<ChatMessage>, AdapterError> {
 }
 
 /// Convert Responses message content to Chat Completions message content
-fn convert_message_content(content: &ResponseMessageContent) -> MessageContent {
+fn convert_message_content(
+    content: &ResponseMessageContent,
+) -> Result<MessageContent, AdapterError> {
+    use super::schemas::chat_completions::{
+        ContentPart as ChatPart, FileContent, ImageUrl as ChatImageUrl,
+    };
     match content {
-        ResponseMessageContent::Text(text) => MessageContent::Text(text.clone()),
+        ResponseMessageContent::Text(text) => Ok(MessageContent::Text(text.clone())),
         ResponseMessageContent::Parts(parts) => {
             // Convert content parts
-            let chat_parts: Vec<super::schemas::chat_completions::ContentPart> = parts
-                .iter()
-                .filter_map(|part| match part {
+            let mut chat_parts: Vec<ChatPart> = Vec::with_capacity(parts.len());
+            for part in parts {
+                match part {
                     ContentPart::InputText { text } => {
-                        Some(super::schemas::chat_completions::ContentPart::Text {
-                            text: text.clone(),
-                        })
+                        chat_parts.push(ChatPart::Text { text: text.clone() });
                     }
                     ContentPart::OutputText { text, .. } => {
-                        Some(super::schemas::chat_completions::ContentPart::Text {
-                            text: text.clone(),
-                        })
+                        chat_parts.push(ChatPart::Text { text: text.clone() });
                     }
                     ContentPart::InputImage { image_url, detail } => {
-                        image_url.as_ref().map(|url| {
-                            super::schemas::chat_completions::ContentPart::ImageUrl {
-                                image_url: super::schemas::chat_completions::ImageUrl {
+                        if let Some(url) = image_url {
+                            chat_parts.push(ChatPart::ImageUrl {
+                                image_url: ChatImageUrl {
                                     url: url.clone(),
                                     detail: detail.clone(),
                                 },
-                            }
-                        })
+                            });
+                        }
                     }
-                    ContentPart::InputFile { .. } => {
-                        // Files can't be directly converted to Chat Completions
-                        warn!("File input cannot be converted to Chat Completions format");
-                        None
+                    ContentPart::InputFile {
+                        file_id,
+                        filename,
+                        file_data,
+                        file_url,
+                    } => {
+                        // Chat Completions has a `file` content part that carries
+                        // `file_data` (base64) or `file_id`, but no URL form. Map what we
+                        // can and refuse the rest explicitly rather than dropping it
+                        // silently (the historic behaviour that silently lost documents).
+                        if file_data.is_some() || file_id.is_some() {
+                            chat_parts.push(ChatPart::File {
+                                file: FileContent {
+                                    file_id: file_id.clone(),
+                                    filename: filename.clone(),
+                                    file_data: file_data.clone(),
+                                },
+                            });
+                        } else if file_url.is_some() {
+                            return Err(AdapterError::ConversionError(
+                                "input_file.file_url is not supported when converting to Chat \
+                                 Completions; supply file_data (base64) or file_id instead"
+                                    .to_string(),
+                            ));
+                        } else {
+                            return Err(AdapterError::ConversionError(
+                                "input_file must provide one of file_data, file_id, or file_url"
+                                    .to_string(),
+                            ));
+                        }
                     }
                     ContentPart::Refusal { refusal } => {
                         // Refusals become text for now
-                        Some(super::schemas::chat_completions::ContentPart::Text {
+                        chat_parts.push(ChatPart::Text {
                             text: refusal.clone(),
-                        })
+                        });
                     }
-                })
-                .collect();
+                }
+            }
 
             if chat_parts.is_empty() {
-                MessageContent::Text(String::new())
+                Ok(MessageContent::Text(String::new()))
             } else {
-                MessageContent::Parts(chat_parts)
+                Ok(MessageContent::Parts(chat_parts))
             }
         }
     }
@@ -818,6 +845,125 @@ mod tests {
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(messages[2].role, "tool");
         assert_eq!(messages[2].tool_call_id, Some("call_123".to_string()));
+    }
+
+    fn input_file_message(part: ContentPart) -> Vec<Item> {
+        vec![Item::Message(MessageItem {
+            id: None,
+            role: "user".to_string(),
+            content: ResponseMessageContent::Parts(vec![
+                ContentPart::InputText {
+                    text: "Summarise this document".to_string(),
+                },
+                part,
+            ]),
+            status: None,
+        })]
+    }
+
+    #[test]
+    fn test_input_file_with_file_data_maps_to_chat_file_part() {
+        use super::super::schemas::chat_completions::ContentPart as ChatPart;
+
+        let items = input_file_message(ContentPart::InputFile {
+            file_id: None,
+            filename: Some("draft.pdf".to_string()),
+            file_data: Some("data:application/pdf;base64,QUJD".to_string()),
+            file_url: None,
+        });
+        let messages = items_to_messages(&items).unwrap();
+
+        let parts = match messages[0].content {
+            Some(MessageContent::Parts(ref p)) => p,
+            _ => panic!("expected parts content"),
+        };
+        assert!(matches!(parts[0], ChatPart::Text { .. }));
+        match &parts[1] {
+            ChatPart::File { file } => {
+                assert_eq!(file.filename.as_deref(), Some("draft.pdf"));
+                assert_eq!(
+                    file.file_data.as_deref(),
+                    Some("data:application/pdf;base64,QUJD")
+                );
+                assert!(file.file_id.is_none());
+            }
+            other => panic!("expected file part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_input_file_with_file_id_maps_to_chat_file_part() {
+        use super::super::schemas::chat_completions::ContentPart as ChatPart;
+
+        let items = input_file_message(ContentPart::InputFile {
+            file_id: Some("file-abc".to_string()),
+            filename: None,
+            file_data: None,
+            file_url: None,
+        });
+        let messages = items_to_messages(&items).unwrap();
+
+        let parts = match messages[0].content {
+            Some(MessageContent::Parts(ref p)) => p,
+            _ => panic!("expected parts content"),
+        };
+        match &parts[1] {
+            ChatPart::File { file } => assert_eq!(file.file_id.as_deref(), Some("file-abc")),
+            other => panic!("expected file part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_input_file_with_only_file_url_is_rejected() {
+        let items = input_file_message(ContentPart::InputFile {
+            file_id: None,
+            filename: None,
+            file_data: None,
+            file_url: Some("https://example.com/doc.pdf".to_string()),
+        });
+        let err = items_to_messages(&items).unwrap_err();
+        assert!(
+            matches!(err, AdapterError::ConversionError(ref m) if m.contains("file_url")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_input_file_with_no_payload_is_rejected() {
+        let items = input_file_message(ContentPart::InputFile {
+            file_id: None,
+            filename: Some("empty.pdf".to_string()),
+            file_data: None,
+            file_url: None,
+        });
+        let err = items_to_messages(&items).unwrap_err();
+        assert!(matches!(err, AdapterError::ConversionError(_)));
+    }
+
+    #[test]
+    fn test_input_file_payload_survives_deserialization() {
+        // Passthrough path: file_data / file_url must not be discarded at parse time.
+        let json = r#"{
+            "type": "input_file",
+            "filename": "draft.pdf",
+            "file_data": "data:application/pdf;base64,QUJD",
+            "file_url": "https://example.com/doc.pdf"
+        }"#;
+        let part: ContentPart = serde_json::from_str(json).unwrap();
+        match part {
+            ContentPart::InputFile {
+                file_data,
+                file_url,
+                filename,
+                file_id,
+            } => {
+                assert_eq!(file_data.as_deref(), Some("data:application/pdf;base64,QUJD"));
+                assert_eq!(file_url.as_deref(), Some("https://example.com/doc.pdf"));
+                assert_eq!(filename.as_deref(), Some("draft.pdf"));
+                assert!(file_id.is_none());
+            }
+            other => panic!("expected input_file, got {other:?}"),
+        }
     }
 
     #[test]

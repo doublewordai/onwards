@@ -429,13 +429,19 @@ pub enum ContentPart {
         detail: Option<String>,
     },
 
-    /// Input file content
+    /// Input file content (e.g. a PDF) per OpenResponses `InputFileContentParam`.
     #[serde(rename = "input_file")]
     InputFile {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         filename: Option<String>,
+        /// Base64-encoded file bytes, typically as a `data:` URL.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<String>,
+        /// URL pointing at the file bytes.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<String>,
     },
 
     /// Refusal content
