@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.2](https://github.com/doublewordai/onwards/compare/v0.33.1...v0.33.2) - 2026-06-22
+
+### Fixed
+
+- default omitted Responses message type and redact upstream auth header ([#220](https://github.com/doublewordai/onwards/pull/220))
+
 ## [0.33.1](https://github.com/doublewordai/onwards/compare/v0.33.0...v0.33.1) - 2026-06-19
 
 ### Fixed
