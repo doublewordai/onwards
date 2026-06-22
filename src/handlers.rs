@@ -196,8 +196,8 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
             .unwrap_or("Bearer ");
         let header_value = format!("{}{}", prefix, key);
         debug!(
-            "Adding {} header for upstream {}: {}",
-            header_name_str, target.url, header_value
+            "Adding {} header for upstream {}",
+            header_name_str, target.url
         );
         headers.insert(header_name, header_value.parse().unwrap());
     } else {
@@ -272,10 +272,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Log full incoming request details for debugging
     trace!(
-        "Incoming request details:\n  Method: {}\n  URI: {}\n  Headers: {:?}\n  Body: {}",
+        "Incoming request details:\n  Method: {}\n  URI: {}\n  Body: {}",
         req.method(),
         req.uri(),
-        req.headers(),
         String::from_utf8_lossy(&body_bytes)
     );
 
@@ -742,9 +741,8 @@ pub async fn target_message_handler<T: HttpClient>(
         let attempt_req = axum::extract::Request::from_parts(parts, body);
 
         trace!(
-            "Outgoing request to provider:\n  URI: {}\n  Headers: {:?}",
-            upstream_uri,
-            attempt_req.headers()
+            "Outgoing request to provider:\n  URI: {}",
+            upstream_uri
         );
 
         // Make the request with optional timeout
