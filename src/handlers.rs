@@ -489,71 +489,6 @@ pub async fn target_message_handler<T: HttpClient>(
     // select_iter() uses weighted least connections: picks the provider with the
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
-    // Cached-input-classification fork (§5.3 / §6.3) — placed HERE, after auth/routing/
-    // rate-limit/concurrency have all passed, so invalid / forbidden / rate-limited
-    // requests never trigger (potentially expensive) classification. It still runs
-    // concurrently with the upstream dispatch below, so it adds no latency. Gated on a
-    // wired classifier: with `cache_classifier == None` there is no fork, no
-    // `cache_control` stripping, and no usage injection — byte-identical to today.
-    //
-    // AbortOnDrop aborts the classify task on any error / early-return path (safe: index
-    // writes are success-gated, so a half-done classify has written nothing). The success
-    // path takes the handle out and awaits it under the deadline; a deadline miss detaches
-    // (not aborts) so the task finishes and its index write still lands.
-    struct AbortOnDrop(Option<tokio::task::JoinHandle<crate::cache::CacheStats>>);
-    impl AbortOnDrop {
-        fn take(&mut self) -> Option<tokio::task::JoinHandle<crate::cache::CacheStats>> {
-            self.0.take()
-        }
-    }
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            if let Some(handle) = self.0.take() {
-                handle.abort();
-            }
-        }
-    }
-
-    let mut cache_classify_handle: AbortOnDrop =
-        AbortOnDrop(if let Some(classifier) = state.cache_classifier.clone() {
-            let path = req.uri().path().to_string();
-            let classify_input = crate::cache::ClassifyInput {
-                // Cache key is the VIRTUAL model (the OriginalModel/alias), not the
-                // underlying name onwards rewrites to downstream.
-                virtual_model: model_name.clone(),
-                path,
-                body: body_bytes.clone(),
-                // onwards is identity-agnostic: hand the raw bearer token to the
-                // classifier, which resolves it to a billing principal (user/org) to
-                // scope the cache per customer. RE-VALIDATE it here against the pool
-                // actually serving the request: `pool` may have been reassigned by a
-                // routing-rule redirect since the initial auth check, so gating on
-                // `pool.keys().is_some()` alone could pass an unvalidated token (an
-                // open pool redirected to a keyed one). Only a token that validates
-                // against the serving pool becomes the principal — never an
-                // unauthenticated caller (cross-tenant / billing-isolation safety).
-                api_key: match (pool.keys(), bearer_token) {
-                    (Some(keys), Some(token)) if auth::validate_bearer_token(keys, token) => {
-                        Some(token.to_string())
-                    }
-                    _ => None,
-                },
-            };
-            let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
-
-            // Sanitise the outbound request: strip markers + ensure include_usage.
-            if let Some(stripped) = crate::cache_usage::strip_cache_control(&body_bytes) {
-                debug!(
-                    "Sanitised outbound request for cache path (cache_control stripped and/or include_usage set)"
-                );
-                body_bytes = stripped;
-            }
-
-            Some(handle)
-        } else {
-            None
-        });
-
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
@@ -1063,44 +998,6 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
-
-        // Cached-input-classification JOIN (§5.3 / §6.3). Only when a classifier was
-        // wired (handle is Some). The classify task has been running in parallel with
-        // the upstream call since the request was forked, so in the normal case it is
-        // already complete here and this await returns immediately. The bounded wait
-        // (cache_classify_deadline) is only hit on a classifier/index/tokenizer outage,
-        // where we fall back to all-zero (best-effort un-cached) stats and let
-        // reconciliation correct any overcharge. With the no-op classifier stats are zero.
-        //
-        // NOTE (streaming): for SSE this await currently precedes returning the body, so
-        // a slow classify (outage only) could delay first-byte by up to the deadline.
-        // The stats are only needed for the terminal usage frame, so deferring the await
-        // into the SSE rewrite stream (resolving lazily at that frame) is a possible
-        // future optimisation — left out for now as classify normally completes well
-        // before time-to-first-token.
-        if let Some(handle) = cache_classify_handle.take() {
-            let stats = match tokio::time::timeout(state.cache_classify_deadline, handle).await {
-                Ok(Ok(stats)) => stats,
-                Ok(Err(join_err)) => {
-                    // Distinguish a real bug (panic) from expected operational
-                    // cancellation, for cleaner log analysis.
-                    if join_err.is_panic() {
-                        error!("Cache classify task panicked: {}", join_err);
-                    } else if join_err.is_cancelled() {
-                        debug!("Cache classify task was cancelled");
-                    } else {
-                        error!("Cache classify task failed: {}", join_err);
-                    }
-                    crate::cache::CacheStats::default()
-                }
-                Err(_) => {
-                    debug!("Cache classify deadline missed, injecting zero cache stats");
-                    crate::cache::CacheStats::default()
-                }
-            };
-            response =
-                crate::cache_usage::inject_cache_stats_into_response(response, &stats).await;
-        }
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
@@ -1977,8 +1874,6 @@ mod tests {
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: crate::cache::DEFAULT_CLASSIFY_DEADLINE,
         };
 
         // Create a simple POST request

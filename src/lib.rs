@@ -46,8 +46,6 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub mod auth;
-pub mod cache;
-pub mod cache_usage;
 pub mod client;
 pub mod config;
 pub mod errors;
@@ -66,9 +64,6 @@ pub mod target;
 pub mod telemetry;
 pub mod traits;
 
-pub use cache::{
-    CacheClassifier, CacheStats, ClassifyInput, DEFAULT_CLASSIFY_DEADLINE, NoopCacheClassifier,
-};
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
@@ -236,23 +231,6 @@ pub struct AppState<T: HttpClient> {
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
-    /// Optional cached-input-classification hook (the onwards ↔ dwctl seam, §6.2).
-    ///
-    /// Defaults to `None`, in which case the entire cache path is dormant and
-    /// onwards behaviour is byte-identical to today (no fork, no
-    /// `cache_control` stripping, no usage injection). When set via
-    /// [`AppState::with_cache_classifier`], onwards forks each request to the
-    /// classifier in parallel with the upstream call and injects the resulting
-    /// [`cache::CacheStats`] into the response `usage`. The default
-    /// [`cache::NoopCacheClassifier`] returns all-zero stats, so even when wired
-    /// the injected fields are zero and downstream billing is unaffected.
-    pub cache_classifier: Option<Arc<dyn cache::CacheClassifier>>,
-    /// Deadline for the parallel classify branch. The response join waits at
-    /// most this long for [`cache::CacheClassifier::classify`] before falling back
-    /// to all-zero stats (best-effort, billed as un-cached). Only consulted
-    /// when `cache_classifier` is `Some`. Defaults to
-    /// [`cache::DEFAULT_CLASSIFY_DEADLINE`].
-    pub cache_classify_deadline: std::time::Duration,
 }
 
 /// Default maximum request body size (32 MB).
@@ -280,14 +258,6 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("tool_executor", &"<dyn ToolExecutor>")
             .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
-            .field(
-                "cache_classifier",
-                &self
-                    .cache_classifier
-                    .as_ref()
-                    .map(|_| "<dyn CacheClassifier>"),
-            )
-            .field("cache_classify_deadline", &self.cache_classify_deadline)
             .finish()
     }
 }
@@ -312,8 +282,6 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -336,8 +304,6 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 }
@@ -355,8 +321,6 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -376,8 +340,6 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -416,25 +378,6 @@ impl<T: HttpClient> AppState<T> {
     /// Applies to both the strict and non-strict routers.
     pub fn with_body_limit(mut self, limit: usize) -> Self {
         self.body_limit = limit;
-        self
-    }
-
-    /// Inject a cached-input-classification hook (builder pattern, §6.2).
-    ///
-    /// This is the **additive, optional** seam: wiring a classifier activates the
-    /// request fork, `cache_control` stripping, and response usage injection.
-    /// Leaving it unset (the default) keeps onwards byte-identical to today.
-    /// Pass [`cache::NoopCacheClassifier`] for an all-zero, behaviour-preserving
-    /// activation (used for local end-to-end validation of the spine).
-    pub fn with_cache_classifier(mut self, classifier: Arc<dyn cache::CacheClassifier>) -> Self {
-        self.cache_classifier = Some(classifier);
-        self
-    }
-
-    /// Override the deadline for the parallel classify branch (builder pattern).
-    /// Only consulted when a classifier is wired.
-    pub fn with_cache_classify_deadline(mut self, deadline: std::time::Duration) -> Self {
-        self.cache_classify_deadline = deadline;
         self
     }
 }
@@ -1232,192 +1175,6 @@ mod tests {
         assert_eq!(forwarded_body["model"], "test-model");
         assert_eq!(forwarded_body["messages"][0]["content"], "Hello!");
         assert_eq!(forwarded_body["temperature"], 0.7);
-    }
-
-    /// Helper: a single-target Targets for the cache-seam tests.
-    fn single_target(model: &str) -> Targets {
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            model.to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .onwards_key("test-api-key".to_string())
-                    .build(),
-            ),
-        );
-        Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        }
-    }
-
-    /// With NO classifier wired (the dormant default), the cache path is invisible:
-    /// `cache_control` markers pass through to the upstream untouched and the
-    /// response carries no synthetic cache fields. This guards the
-    /// non-breaking, behaviour-preserving contract for standalone onwards.
-    #[tokio::test]
-    async fn test_cache_seam_dormant_by_default() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        // No .with_cache_classifier() — dormant.
-        let app_state = AppState::with_client(targets, mock_client.clone());
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
-                ]}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // cache_control reached the upstream untouched (no stripping).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert!(
-            forwarded["messages"][0]["content"][0]
-                .get("cache_control")
-                .is_some(),
-            "dormant onwards must NOT strip cache_control"
-        );
-
-        // Response usage carries no synthetic cache fields.
-        let body: serde_json::Value = response.json();
-        assert!(body["usage"].get("cache_read_input_tokens").is_none());
-        assert!(body["usage"].get("prompt_tokens_details").is_none());
-    }
-
-    /// With the no-op classifier wired, the spine activates: the outbound request
-    /// has all `cache_control` stripped, and the (non-streaming) response usage
-    /// carries the zeroed cache fields. Billing-relevant `prompt_tokens` is
-    /// untouched.
-    #[tokio::test]
-    async fn test_cache_seam_noop_strips_and_injects_non_streaming() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-                ]}],
-                "cache_control": {"type": "ephemeral"}
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // Outbound request: every cache_control stripped (recursively).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert!(forwarded.get("cache_control").is_none());
-        assert!(
-            forwarded["messages"][0]["content"][0]
-                .get("cache_control")
-                .is_none()
-        );
-        // Content otherwise intact.
-        assert_eq!(forwarded["messages"][0]["content"][0]["text"], "hi");
-
-        // Response usage: zeroed cache fields present, prompt_tokens untouched.
-        let body: serde_json::Value = response.json();
-        let usage = &body["usage"];
-        assert_eq!(usage["prompt_tokens"], 9);
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
-        assert_eq!(usage["cache_creation_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_24h_input_tokens"], 0);
-    }
-
-    /// A NORMAL request (no `cache_control` markers) with the no-op classifier
-    /// wired must pass straight through: content forwarded unchanged, the
-    /// (zeroed) cache fields injected, `prompt_tokens` untouched, no error. This
-    /// is the common case — the classifier is active but the request opts out —
-    /// and proves the active path doesn't disturb ordinary traffic.
-    #[tokio::test]
-    async fn test_cache_seam_no_markers_wires_through_cleanly() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "what's the weather?"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // Outbound request forwarded unchanged (nothing to strip).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert_eq!(forwarded["messages"][0]["content"], "what's the weather?");
-
-        // Response usage: zeroed cache fields injected, original counts untouched.
-        let body: serde_json::Value = response.json();
-        let usage = &body["usage"];
-        assert_eq!(usage["prompt_tokens"], 7);
-        assert_eq!(usage["completion_tokens"], 3);
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
-        assert_eq!(usage["cache_creation_input_tokens"], 0);
-    }
-
-    /// Streaming path: with the no-op classifier wired, the terminal usage frame
-    /// gets the zeroed cache fields injected while delta chunks and `[DONE]`
-    /// pass through untouched.
-    #[tokio::test]
-    async fn test_cache_seam_noop_injects_streaming_terminal_frame() {
-        let targets = single_target("test-model");
-        let chunks = vec![
-            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
-            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n".to_string(),
-            "data: [DONE]\n\n".to_string(),
-        ];
-        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "stream": true,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        let text = response.text();
-        // Delta chunk untouched.
-        assert!(text.contains("\"delta\":{\"content\":\"hi\"}"));
-        // Terminal usage frame got zeroed cache fields.
-        assert!(text.contains("\"cache_read_input_tokens\":0"));
-        assert!(text.contains("\"cached_tokens\":0"));
-        assert!(text.contains("\"cache_creation_input_tokens\":0"));
-        // [DONE] preserved.
-        assert!(text.contains("data: [DONE]"));
     }
 
     #[tokio::test]
