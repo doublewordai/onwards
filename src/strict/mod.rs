@@ -174,6 +174,13 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
             "/chat/completions",
             post(handlers::chat_completions_handler::<T>),
         )
+        // Anthropic Messages ingress alias. Foreign-protocol translation happens
+        // at the dwctl edge (the request body is already Chat Completions and the
+        // path is normalised to `/chat/completions` by the time it reaches here);
+        // this alias only exists so strict-mode routing matches `/messages` and
+        // dispatches to the chat-completions handler. No Anthropic logic lives in
+        // onwards. Non-strict mode needs no alias (its catch-all already matches).
+        .route("/messages", post(handlers::chat_completions_handler::<T>))
         // Legacy text completions
         .route("/completions", post(handlers::completions_handler::<T>))
         // Open Responses
@@ -317,6 +324,27 @@ mod tests {
             .uri("/chat/completions")
             .header("content-type", "application/json")
             .body(Body::from(padded_chat_completions_body(3 * 1024 * 1024)))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_strict_router_messages_alias_routes_to_chat_completions() {
+        // The Anthropic ingress alias: a (already edge-translated) Chat
+        // Completions body posted to `/messages` must route to the
+        // chat-completions handler, exactly like `/chat/completions`. Foreign
+        // translation and path normalisation happen upstream at the dwctl edge;
+        // onwards just needs the route to match.
+        let state = create_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(padded_chat_completions_body(16)))
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
