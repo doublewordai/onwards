@@ -428,18 +428,24 @@ impl<'a> Iterator for SelectIter<'a> {
         }
         self.attempts += 1;
 
-        // Ask the LB strategy for the next provider not yet tried in this pass.
-        // If the strategy has exhausted its options for this pass (every provider
-        // already excluded) but the attempt budget still allows it, start a fresh
-        // pass: clear the exclusions and cascade through the strategy's options
-        // again. This is what puts the configured retry budget *above* the LB
-        // strategy — every strategy (including a single-provider Priority pool)
-        // keeps retrying until `max_attempts` is spent, rather than stopping after
-        // one cascade. `select_excluding` still returns `None` when the pool is
-        // empty or every provider is at its concurrency limit, which ends the
-        // iterator without spinning.
+        // Ask the LB strategy for the next eligible provider for the current
+        // exclusions. `select_excluding` returns `None` when no provider is
+        // eligible — either every provider has been tried in this pass, or the
+        // untried ones are all at their concurrency limit.
+        //
+        // If that happens but the attempt budget still allows it, start a fresh
+        // pass: clear the exclusions (re-including already-tried providers) and
+        // cascade through the strategy's options again. This is what puts the
+        // configured retry budget *above* the LB strategy — every strategy
+        // (including a single-provider Priority pool) keeps retrying until
+        // `max_attempts` is spent, rather than stopping after one cascade.
+        //
+        // When `excluded` is already empty there is nothing to re-include, so a
+        // `None` there means an empty pool or every provider at capacity: end the
+        // iterator rather than re-running the same scan.
         let result = match self.pool.select_excluding(&self.excluded) {
             Some(result) => result,
+            None if self.excluded.is_empty() => return None,
             None => {
                 self.excluded.clear();
                 self.pool.select_excluding(&self.excluded)?

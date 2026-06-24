@@ -144,7 +144,10 @@ pub struct FallbackConfig {
     pub with_replacement: bool,
 
     /// Maximum number of failover attempts. Defaults to provider count.
-    /// Most useful with `with_replacement: true` to allow more attempts than providers.
+    /// This is an attempt budget above the LB strategy: values larger than the
+    /// provider count retry across additional passes through the pool (the
+    /// cascade restarts), so it is useful for every strategy — including a
+    /// single-provider `Priority` pool — not only with `with_replacement: true`.
     #[serde(default)]
     pub max_attempts: Option<usize>,
 
