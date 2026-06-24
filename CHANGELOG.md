@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.4](https://github.com/doublewordai/onwards/compare/v0.33.3...v0.33.4) - 2026-06-24
+
+### Added
+
+- strict /messages alias and preserve choices[].stop_reason ([#229](https://github.com/doublewordai/onwards/pull/229))
+
 ## [0.33.3](https://github.com/doublewordai/onwards/compare/v0.33.2...v0.33.3) - 2026-06-24
 
 ### Added
