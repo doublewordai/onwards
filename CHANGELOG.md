@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.3](https://github.com/doublewordai/onwards/compare/v0.33.2...v0.33.3) - 2026-06-24
+
+### Added
+
+- *(fallback)* apply the retry budget above the LB strategy ([#227](https://github.com/doublewordai/onwards/pull/227))
+
+### Fixed
+
+- retry loop triggered for stream when no data returned yet ([#207](https://github.com/doublewordai/onwards/pull/207))
+
 ## [0.33.2](https://github.com/doublewordai/onwards/compare/v0.33.1...v0.33.2) - 2026-06-22
 
 ### Fixed
