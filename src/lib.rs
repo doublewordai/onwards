@@ -1060,7 +1060,7 @@ mod tests {
         fallback_targets(alias, n, vec![429])
     }
 
-    // OpenRouter returns HTTP 200 and puts the real error in the body. These
+    // Some upstreams return HTTP 200 and put the real error in the body. These
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
     #[tokio::test]
@@ -1175,7 +1175,7 @@ mod tests {
         assert_eq!(mock.get_requests().len(), 2);
     }
 
-    // OpenRouter also fails by returning a `200 OK` with an *empty* body (no
+    // Some upstreams also fail by returning a `200 OK` with an *empty* body (no
     // tokens, no error envelope — just EOF). These tests exercise the
     // empty-body ("Mode C") detection + retry, and crucially that a valid stream
     // which simply hasn't produced a token yet is NOT mistaken for empty.

@@ -55,7 +55,7 @@ fn record_response_status(status_code: u16) {
 
 /// Detect a provider error envelope embedded in an HTTP 200 body.
 ///
-/// Some upstreams — notably OpenRouter — return `200 OK` with the real error in
+/// Some upstreams return `200 OK` with the real error in
 /// the response body instead of using the HTTP status line, e.g.
 /// `{"error":{"code":429,"message":"Provider returned error"}}`. The error may
 /// be the whole body or sit alongside otherwise-valid fields
@@ -64,7 +64,7 @@ fn record_response_status(status_code: u16) {
 /// the "200" as that status.
 ///
 /// Returns `None` for normal responses — no `error` object, or a non-numeric /
-/// out-of-range code (e.g. OpenAI-style string codes like `"rate_limit_exceeded"`,
+/// out-of-range code (e.g. string codes like `"rate_limit_exceeded"`,
 /// which always arrive with a correct HTTP status anyway) — so well-formed
 /// completions are never disturbed.
 fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
@@ -92,7 +92,7 @@ enum SseEventKind {
 /// Classify a single SSE event (a complete frame already reassembled by
 /// [`SseBufferedStream`]).
 ///
-/// Providers like OpenRouter open a `200 OK` stream and send the error as the
+/// Some providers open a `200 OK` stream and send the error as the
 /// first `data:` frame (`data: {"error":{"code":429,...}}`) rather than content.
 /// Per the SSE spec an event's `data:` lines are concatenated with `\n` (with at
 /// most one space after the colon stripped) and parsed once — so compact,
@@ -885,7 +885,7 @@ pub async fn target_message_handler<T: HttpClient>(
             .to_string();
         let is_sse = content_type.contains("text/event-stream");
 
-        // Some upstreams (notably OpenRouter) return HTTP 200 while embedding the
+        // Some upstreams return HTTP 200 while embedding the
         // real error in the body — `{"error":{"code":429,...}}` for a unary
         // response, or as the first `data:` frame of an SSE stream — instead of
         // using the status line. The status-based fallback (`should_fallback_on_status`
@@ -905,7 +905,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // retry stays possible. Pure-passthrough / sanitize-without-transform
         // targets are deliberately left untouched, to avoid forcing buffering (and
         // SSE re-framing) onto streams that would otherwise pass straight through.
-        // OpenRouter, the motivating case, runs in strict mode.
+        // The motivating upstreams run in strict mode.
         // Classification of a 2xx response that should be treated as an upstream
         // failure and fed into the retry loop. `Clean` forwards `response` as-is.
         enum Scan2xx {
@@ -914,7 +914,7 @@ pub async fn target_message_handler<T: HttpClient>(
             /// (`{"error":{"code":N}}`).
             Embedded(u16),
             /// 2xx whose body *terminated* empty before any content frame — e.g.
-            /// OpenRouter's `200 OK` with an empty body. Treated as a retryable
+            /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
             /// valid-but-slow stream is forwarded (Clean), not retried.
             EmptyBody,
@@ -925,8 +925,8 @@ pub async fn target_message_handler<T: HttpClient>(
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
                 // skipping any keep-alive/comment frames a provider may send
-                // first. OpenRouter puts the error in that first frame (before any
-                // token), so this is enough to tell an error stream from a normal
+                // first. Such providers put the error in that first frame (before
+                // any token), so this is enough to tell an error stream from a normal
                 // one. Holding the `200` headers until the first frame costs
                 // nothing in time-to-first-*token* (onwards must receive it to
                 // forward it anyway). The whole peek is bounded by a short fixed
@@ -1007,8 +1007,8 @@ pub async fn target_message_handler<T: HttpClient>(
                         return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
                     }
                 };
-                // A 2xx whose body terminated empty is the unary form of the
-                // OpenRouter failure (`bytes_read: 0`, deserialize EOF downstream).
+                // A 2xx whose body terminated empty is the unary form of the same
+                // upstream failure (`bytes_read: 0`, deserialize EOF downstream).
                 // `to_bytes` already awaited end-of-body, so empty is terminal —
                 // there is no "not yet" — and nothing was forwarded, so retry.
                 if buffered.is_empty() {
@@ -1059,8 +1059,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
                     // Retry internally. If every attempt / provider fallback is
-                    // exhausted the caller gets a sanitized 503 — never OpenRouter's
-                    // rate limit (see the non-retryable arm below).
+                    // exhausted the caller gets a sanitized 503 — never the
+                    // upstream's rate limit (see the non-retryable arm below).
                     return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
                 }
 
@@ -1425,13 +1425,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_error_status_detects_openrouter_envelope() {
-        // Whole-body error envelope (OpenRouter's 200-with-error pattern).
+    fn embedded_error_status_detects_provider_envelope() {
+        // Whole-body error envelope (the 200-with-error pattern).
         let body =
             serde_json::json!({"error": {"code": 429, "message": "Provider returned error"}});
         assert_eq!(embedded_error_status(&body), Some(429));
 
-        // Error alongside otherwise-valid fields (OpenRouter reassembled-stream shape).
+        // Error alongside otherwise-valid fields (reassembled-stream shape).
         let body = serde_json::json!({
             "id": "gen-x", "object": "chat.completion.chunk", "choices": [],
             "error": {"code": 503, "message": "upstream"}
@@ -1454,7 +1454,7 @@ mod tests {
         });
         assert_eq!(embedded_error_status(&ok), None);
 
-        // No code / null code / non-numeric (OpenAI-style) code / out-of-range code.
+        // No code / null code / non-numeric (string) code / out-of-range code.
         assert_eq!(
             embedded_error_status(&serde_json::json!({"error": {"message": "x"}})),
             None
@@ -1481,12 +1481,12 @@ mod tests {
     fn classify_sse_event_distinguishes_error_data_and_comment() {
         use SseEventKind::{Comment, Data, Error};
 
-        // OpenRouter's first-frame error on a 200 stream.
+        // A provider's first-frame error on a 200 stream.
         assert_eq!(
             classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
             Error(429)
         );
-        // Error alongside otherwise-valid chunk fields (OpenRouter shape).
+        // Error alongside otherwise-valid chunk fields (provider shape).
         assert_eq!(
             classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
             Error(502)
