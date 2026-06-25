@@ -374,10 +374,6 @@ pub async fn target_message_handler<T: HttpClient>(
     req.extensions_mut()
         .insert(OriginalModel(model_name.clone()));
 
-    // (The cached-input-classification fork is placed lower down — after auth/routing/
-    // rate-limit/concurrency have all passed, just before dispatch — so invalid,
-    // forbidden, or rate-limited requests never trigger classification work. See §5.3/§6.3.)
-
     trace!("Received request for model: {}", model_name);
     trace!(
         "Available targets: {:?}",
