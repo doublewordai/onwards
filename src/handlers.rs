@@ -22,7 +22,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -51,6 +51,83 @@ impl Injector for HeaderInjector<'_> {
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
+}
+
+/// Detect a provider error envelope embedded in an HTTP 200 body.
+///
+/// Some upstreams return `200 OK` with the real error in
+/// the response body instead of using the HTTP status line, e.g.
+/// `{"error":{"code":429,"message":"Provider returned error"}}`. The error may
+/// be the whole body or sit alongside otherwise-valid fields
+/// (`{"id":...,"choices":[],"error":{...}}`). When the embedded `error.code` is
+/// a numeric HTTP status in the 4xx/5xx range, return it so the caller can treat
+/// the "200" as that status.
+///
+/// Returns `None` for normal responses — no `error` object, or a non-numeric /
+/// out-of-range code (e.g. string codes like `"rate_limit_exceeded"`,
+/// which always arrive with a correct HTTP status anyway) — so well-formed
+/// completions are never disturbed.
+fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
+    let code = body.get("error")?.get("code")?;
+    let status = code
+        .as_u64()
+        .or_else(|| code.as_str().and_then(|s| s.parse::<u64>().ok()))?;
+    let status = u16::try_from(status).ok()?;
+    (400..600).contains(&status).then_some(status)
+}
+
+/// Classification of a single SSE event for the streaming embedded-error peek.
+#[derive(Debug, PartialEq, Eq)]
+enum SseEventKind {
+    /// A `data:` frame carrying an embedded provider error — the contained
+    /// `error.code`, per [`embedded_error_status`].
+    Error(u16),
+    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    Data,
+    /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
+    /// the caller peeks past to reach the first real frame.
+    Comment,
+}
+
+/// Classify a single SSE event (a complete frame already reassembled by
+/// [`SseBufferedStream`]).
+///
+/// Some providers open a `200 OK` stream and send the error as the
+/// first `data:` frame (`data: {"error":{"code":429,...}}`) rather than content.
+/// Per the SSE spec an event's `data:` lines are concatenated with `\n` (with at
+/// most one space after the colon stripped) and parsed once — so compact,
+/// multi-line, and non-spaced (`data:{...}`) framing are all handled. A frame
+/// with no `data:` field is a comment/keep-alive.
+fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
+    let Ok(text) = std::str::from_utf8(chunk) else {
+        // Non-UTF-8 can't be an error envelope we understand — forward as-is.
+        return SseEventKind::Data;
+    };
+    let mut data = String::new();
+    let mut has_data = false;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("data:") {
+            has_data = true;
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+        }
+    }
+    if !has_data {
+        return SseEventKind::Comment;
+    }
+    if data.trim() == "[DONE]" {
+        return SseEventKind::Data;
+    }
+    match serde_json::from_str::<serde_json::Value>(data.trim())
+        .ok()
+        .as_ref()
+        .and_then(embedded_error_status)
+    {
+        Some(status) => SseEventKind::Error(status),
+        None => SseEventKind::Data,
+    }
 }
 
 /// Internal enum to distinguish timeout from network error in upstream requests
@@ -297,10 +374,6 @@ pub async fn target_message_handler<T: HttpClient>(
     req.extensions_mut()
         .insert(OriginalModel(model_name.clone()));
 
-    // (The cached-input-classification fork is placed lower down — after auth/routing/
-    // rate-limit/concurrency have all passed, just before dispatch — so invalid,
-    // forbidden, or rate-limited requests never trigger classification work. See §5.3/§6.3.)
-
     trace!("Received request for model: {}", model_name);
     trace!(
         "Available targets: {:?}",
@@ -489,71 +562,6 @@ pub async fn target_message_handler<T: HttpClient>(
     // select_iter() uses weighted least connections: picks the provider with the
     // lowest active_connections/weight ratio, skipping providers at their
     // concurrency limit. The returned guard tracks the active connection.
-    // Cached-input-classification fork (§5.3 / §6.3) — placed HERE, after auth/routing/
-    // rate-limit/concurrency have all passed, so invalid / forbidden / rate-limited
-    // requests never trigger (potentially expensive) classification. It still runs
-    // concurrently with the upstream dispatch below, so it adds no latency. Gated on a
-    // wired classifier: with `cache_classifier == None` there is no fork, no
-    // `cache_control` stripping, and no usage injection — byte-identical to today.
-    //
-    // AbortOnDrop aborts the classify task on any error / early-return path (safe: index
-    // writes are success-gated, so a half-done classify has written nothing). The success
-    // path takes the handle out and awaits it under the deadline; a deadline miss detaches
-    // (not aborts) so the task finishes and its index write still lands.
-    struct AbortOnDrop(Option<tokio::task::JoinHandle<crate::cache::CacheStats>>);
-    impl AbortOnDrop {
-        fn take(&mut self) -> Option<tokio::task::JoinHandle<crate::cache::CacheStats>> {
-            self.0.take()
-        }
-    }
-    impl Drop for AbortOnDrop {
-        fn drop(&mut self) {
-            if let Some(handle) = self.0.take() {
-                handle.abort();
-            }
-        }
-    }
-
-    let mut cache_classify_handle: AbortOnDrop =
-        AbortOnDrop(if let Some(classifier) = state.cache_classifier.clone() {
-            let path = req.uri().path().to_string();
-            let classify_input = crate::cache::ClassifyInput {
-                // Cache key is the VIRTUAL model (the OriginalModel/alias), not the
-                // underlying name onwards rewrites to downstream.
-                virtual_model: model_name.clone(),
-                path,
-                body: body_bytes.clone(),
-                // onwards is identity-agnostic: hand the raw bearer token to the
-                // classifier, which resolves it to a billing principal (user/org) to
-                // scope the cache per customer. RE-VALIDATE it here against the pool
-                // actually serving the request: `pool` may have been reassigned by a
-                // routing-rule redirect since the initial auth check, so gating on
-                // `pool.keys().is_some()` alone could pass an unvalidated token (an
-                // open pool redirected to a keyed one). Only a token that validates
-                // against the serving pool becomes the principal — never an
-                // unauthenticated caller (cross-tenant / billing-isolation safety).
-                api_key: match (pool.keys(), bearer_token) {
-                    (Some(keys), Some(token)) if auth::validate_bearer_token(keys, token) => {
-                        Some(token.to_string())
-                    }
-                    _ => None,
-                },
-            };
-            let handle = tokio::spawn(async move { classifier.classify(&classify_input).await });
-
-            // Sanitise the outbound request: strip markers + ensure include_usage.
-            if let Some(stripped) = crate::cache_usage::strip_cache_control(&body_bytes) {
-                debug!(
-                    "Sanitised outbound request for cache path (cache_control stripped and/or include_usage set)"
-                );
-                body_bytes = stripped;
-            }
-
-            Some(handle)
-        } else {
-            None
-        });
-
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
@@ -877,6 +885,231 @@ pub async fn target_message_handler<T: HttpClient>(
             .to_string();
         let is_sse = content_type.contains("text/event-stream");
 
+        // Some upstreams return HTTP 200 while embedding the
+        // real error in the body — `{"error":{"code":429,...}}` for a unary
+        // response, or as the first `data:` frame of an SSE stream — instead of
+        // using the status line. The status-based fallback (`should_fallback_on_status`
+        // above) and the rate-limit retry machinery only ever see the `200`, so a
+        // retryable upstream error (e.g. a 429 rate limit) is silently bypassed and
+        // a transient throttle surfaces as a user-visible failure.
+        //
+        // Detect such an envelope and feed its embedded status into the SAME
+        // fallback/retry decision as a real HTTP status. Only 2xx responses are
+        // scanned — a non-2xx already carries a correct status and is handled by
+        // the status-based fallback above.
+        //
+        // Gated to strict_mode: the only mode where the body is *already* buffered
+        // (unary) or routed through `SseBufferedStream` (streaming) by the strict
+        // sanitizer downstream. So this adds no new buffering and no change to
+        // streaming behaviour — it just inspects the body a little earlier so a
+        // retry stays possible. Pure-passthrough / sanitize-without-transform
+        // targets are deliberately left untouched, to avoid forcing buffering (and
+        // SSE re-framing) onto streams that would otherwise pass straight through.
+        // The motivating upstreams run in strict mode.
+        // Classification of a 2xx response that should be treated as an upstream
+        // failure and fed into the retry loop. `Clean` forwards `response` as-is.
+        enum Scan2xx {
+            Clean,
+            /// Provider embedded an error status in the 2xx body
+            /// (`{"error":{"code":N}}`).
+            Embedded(u16),
+            /// 2xx whose body *terminated* empty before any content frame — e.g.
+            /// an upstream `200 OK` with an empty body. Treated as a retryable
+            /// 502. Keyed on stream termination, never a time budget, so a
+            /// valid-but-slow stream is forwarded (Clean), not retried.
+            EmptyBody,
+        }
+        let scan: Scan2xx = if (200..300).contains(&status)
+            && state.targets.strict_mode
+        {
+            if is_sse {
+                // Peek the leading SSE events to find the first *real* frame,
+                // skipping any keep-alive/comment frames a provider may send
+                // first. Such providers put the error in that first frame (before
+                // any token), so this is enough to tell an error stream from a normal
+                // one. Holding the `200` headers until the first frame costs
+                // nothing in time-to-first-*token* (onwards must receive it to
+                // forward it anyway). The whole peek is bounded by a short fixed
+                // budget — NOT the request timeout, which governs header receipt —
+                // so a `200`-then-idle stream isn't withheld from the client; on
+                // timeout we forward whatever we have, unmodified (no retry).
+                use futures_util::StreamExt;
+                const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+                const SSE_PEEK_MAX_EVENTS: usize = 4;
+
+                let (parts, body) = response.into_parts();
+                let mut events = SseBufferedStream::new(body.into_data_stream());
+                // `peeked` / `embedded` live outside the peek future so a partial
+                // peek survives a budget timeout (consumed frames are not lost).
+                let mut peeked = Vec::new();
+                let mut embedded = None;
+                // `saw_data` = a real content frame arrived (definitely not empty).
+                // `stream_ended` = the stream closed (`None`) or errored (`Err`)
+                // before any content — a *terminal* empty, safe to retry.
+                let mut saw_data = false;
+                let mut stream_ended = false;
+                let peek = async {
+                    for _ in 0..SSE_PEEK_MAX_EVENTS {
+                        match events.next().await {
+                            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                                SseEventKind::Error(status) => {
+                                    embedded = Some(status);
+                                    peeked.push(Ok(chunk));
+                                    break;
+                                }
+                                // First real data frame is normal content — stop.
+                                SseEventKind::Data => {
+                                    saw_data = true;
+                                    peeked.push(Ok(chunk));
+                                    break;
+                                }
+                                // Keep-alive / comment — keep looking.
+                                SseEventKind::Comment => peeked.push(Ok(chunk)),
+                            },
+                            Some(Err(e)) => {
+                                stream_ended = true;
+                                peeked.push(Err(e));
+                                break;
+                            }
+                            None => {
+                                stream_ended = true;
+                                break;
+                            }
+                        }
+                    }
+                };
+                let timed_out = tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err();
+                if timed_out {
+                    debug!("Timed out peeking SSE lead frames; forwarding stream unmodified");
+                }
+                // Forward the consumed frames followed by the remainder, so a clean
+                // (or slow) stream is intact; on a retry path below this `response`
+                // is dropped when we return.
+                let rest = futures_util::stream::iter(peeked).chain(events);
+                response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
+                if let Some(status) = embedded {
+                    Scan2xx::Embedded(status)
+                } else if !timed_out && stream_ended && !saw_data {
+                    // Stream closed/errored before any content frame: nothing was
+                    // forwarded, so retrying is safe. A *timeout* (stream still open,
+                    // just slow to first token) deliberately falls through to `Clean`
+                    // — that's the valid-but-slow case we must never retry.
+                    Scan2xx::EmptyBody
+                } else {
+                    Scan2xx::Clean
+                }
+            } else {
+                let (parts, body) = response.into_parts();
+                let buffered = match axum::body::to_bytes(body, usize::MAX).await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to buffer response body for embedded-error scan: {}", e);
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
+                    }
+                };
+                // A 2xx whose body terminated empty is the unary form of the same
+                // upstream failure (`bytes_read: 0`, deserialize EOF downstream).
+                // `to_bytes` already awaited end-of-body, so empty is terminal —
+                // there is no "not yet" — and nothing was forwarded, so retry.
+                if buffered.is_empty() {
+                    response = Response::from_parts(parts, axum::body::Body::empty());
+                    Scan2xx::EmptyBody
+                } else {
+                    // Cheap guard: only parse when an `error` key could be present, so
+                    // normal completions/embeddings aren't deserialized an extra time.
+                    const ERROR_KEY: &[u8] = b"\"error\"";
+                    let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
+                        serde_json::from_slice::<serde_json::Value>(&buffered)
+                            .ok()
+                            .as_ref()
+                            .and_then(embedded_error_status)
+                    } else {
+                        None
+                    };
+                    // Re-attach the buffered body so downstream sees an intact response.
+                    let len = buffered.len();
+                    response = Response::from_parts(parts, axum::body::Body::from(buffered));
+                    response.headers_mut().remove(TRANSFER_ENCODING);
+                    response
+                        .headers_mut()
+                        .insert(CONTENT_LENGTH, HeaderValue::from(len));
+                    match embedded {
+                        Some(status) => Scan2xx::Embedded(status),
+                        None => Scan2xx::Clean,
+                    }
+                }
+            }
+        } else {
+            Scan2xx::Clean
+        };
+
+        match scan {
+            Scan2xx::Embedded(embedded) => {
+                warn!(
+                    http_status = status,
+                    embedded_status = embedded,
+                    upstream = %target.url,
+                    "Upstream returned 2xx with an embedded provider error; treating it as status {embedded}"
+                );
+                upstream_span.record("http.response.status_code", embedded);
+                tracing::Span::current().record("http.response.status_code", embedded);
+
+                let retryable = pool.should_fallback_on_status(embedded)
+                    || (embedded == 429 && pool.should_fallback_on_rate_limit());
+                if retryable {
+                    tracing::Span::current().record("onwards.fallback", "embedded_error");
+                    // Retry internally. If every attempt / provider fallback is
+                    // exhausted the caller gets a sanitized 503 — never the
+                    // upstream's rate limit (see the non-retryable arm below).
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                }
+
+                record_response_status(embedded);
+                // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
+                // non-retryable ones like 501/505 — collapses to a generic 503. This is
+                // deliberately more opaque than the non-embedded error path: a
+                // 200-with-error body is already anomalous, so we hide the specifics.
+                // Genuine client errors (other 4xx) are surfaced, sanitized, so the
+                // caller can fix the request.
+                let err = if embedded == 429 || embedded >= 500 {
+                    OnwardsErrorResponse::service_unavailable()
+                } else {
+                    OnwardsErrorResponse::builder()
+                        .body(ErrorResponseBody {
+                            message: "The upstream provider rejected the request.".to_string(),
+                            r#type: "invalid_request_error".to_string(),
+                            param: None,
+                            code: "upstream_error".to_string(),
+                        })
+                        .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                        .build()
+                };
+                return LoopAction::Done(Err(err));
+            }
+            Scan2xx::EmptyBody => {
+                warn!(
+                    http_status = status,
+                    upstream = %target.url,
+                    "Upstream returned 2xx with an empty body before any content; treating it as 502"
+                );
+                upstream_span.record("http.response.status_code", 502_u16);
+                tracing::Span::current().record("http.response.status_code", 502_u16);
+
+                if pool.should_fallback_on_status(502) {
+                    tracing::Span::current().record("onwards.fallback", "empty_body");
+                    // Retry internally; on exhaustion the loop's final-error handling
+                    // surfaces the sanitized 503 carried below.
+                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                }
+
+                // Not configured to retry 502s: collapse the anomalous empty 200 to a
+                // generic 503 rather than forwarding a bodyless success to the client.
+                record_response_status(503);
+                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+            }
+            Scan2xx::Clean => {}
+        }
+
         // Determine if SSE buffering is needed for non-strict sanitization
         // Note: Strict mode handlers apply their own buffering before their sanitizers,
         // so we skip buffering here to avoid double-wrapping
@@ -1064,44 +1297,6 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
 
-        // Cached-input-classification JOIN (§5.3 / §6.3). Only when a classifier was
-        // wired (handle is Some). The classify task has been running in parallel with
-        // the upstream call since the request was forked, so in the normal case it is
-        // already complete here and this await returns immediately. The bounded wait
-        // (cache_classify_deadline) is only hit on a classifier/index/tokenizer outage,
-        // where we fall back to all-zero (best-effort un-cached) stats and let
-        // reconciliation correct any overcharge. With the no-op classifier stats are zero.
-        //
-        // NOTE (streaming): for SSE this await currently precedes returning the body, so
-        // a slow classify (outage only) could delay first-byte by up to the deadline.
-        // The stats are only needed for the terminal usage frame, so deferring the await
-        // into the SSE rewrite stream (resolving lazily at that frame) is a possible
-        // future optimisation — left out for now as classify normally completes well
-        // before time-to-first-token.
-        if let Some(handle) = cache_classify_handle.take() {
-            let stats = match tokio::time::timeout(state.cache_classify_deadline, handle).await {
-                Ok(Ok(stats)) => stats,
-                Ok(Err(join_err)) => {
-                    // Distinguish a real bug (panic) from expected operational
-                    // cancellation, for cleaner log analysis.
-                    if join_err.is_panic() {
-                        error!("Cache classify task panicked: {}", join_err);
-                    } else if join_err.is_cancelled() {
-                        debug!("Cache classify task was cancelled");
-                    } else {
-                        error!("Cache classify task failed: {}", join_err);
-                    }
-                    crate::cache::CacheStats::default()
-                }
-                Err(_) => {
-                    debug!("Cache classify deadline missed, injecting zero cache stats");
-                    crate::cache::CacheStats::default()
-                }
-            };
-            response =
-                crate::cache_usage::inject_cache_stats_into_response(response, &stats).await;
-        }
-
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
         // Critical for streaming responses where the body outlives the handler.
@@ -1228,6 +1423,101 @@ pub async fn models<T: HttpClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_error_status_detects_provider_envelope() {
+        // Whole-body error envelope (the 200-with-error pattern).
+        let body =
+            serde_json::json!({"error": {"code": 429, "message": "Provider returned error"}});
+        assert_eq!(embedded_error_status(&body), Some(429));
+
+        // Error alongside otherwise-valid fields (reassembled-stream shape).
+        let body = serde_json::json!({
+            "id": "gen-x", "object": "chat.completion.chunk", "choices": [],
+            "error": {"code": 503, "message": "upstream"}
+        });
+        assert_eq!(embedded_error_status(&body), Some(503));
+
+        // Stringified numeric code.
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": "502"}})),
+            Some(502)
+        );
+    }
+
+    #[test]
+    fn embedded_error_status_ignores_normal_and_ambiguous_bodies() {
+        // A well-formed completion must never be disturbed.
+        let ok = serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]
+        });
+        assert_eq!(embedded_error_status(&ok), None);
+
+        // No code / null code / non-numeric (string) code / out-of-range code.
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"message": "x"}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": null}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": "rate_limit_exceeded"}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": 200}})),
+            None
+        );
+        assert_eq!(
+            embedded_error_status(&serde_json::json!({"error": {"code": 999}})),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_sse_event_distinguishes_error_data_and_comment() {
+        use SseEventKind::{Comment, Data, Error};
+
+        // A provider's first-frame error on a 200 stream.
+        assert_eq!(
+            classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
+            Error(429)
+        );
+        // Error alongside otherwise-valid chunk fields (provider shape).
+        assert_eq!(
+            classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
+            Error(502)
+        );
+        // Tolerant of `data:` with no space after the colon.
+        assert_eq!(
+            classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
+            Error(503)
+        );
+        // Multi-line `data:` fields are concatenated with `\n` before parsing
+        // (SSE spec): the two `data:` lines here join to the valid JSON
+        // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
+        assert_eq!(
+            classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
+            Error(429)
+        );
+
+        // Normal content and the [DONE] sentinel are data frames, not errors.
+        assert_eq!(
+            classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+            Data
+        );
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+
+        // Comment / keep-alive frames carry no `data:` field.
+        assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
+        assert_eq!(classify_sse_event(b": ping\n\n"), Comment);
+
+        // Non-UTF-8 is treated as opaque data (forwarded, never flagged).
+        assert_eq!(classify_sse_event(&[0xFF, 0xFE]), Data);
+    }
 
     #[test]
     fn test_filter_headers_strips_hop_by_hop_headers() {
@@ -1977,8 +2267,6 @@ mod tests {
             tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
             response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: crate::cache::DEFAULT_CLASSIFY_DEADLINE,
         };
 
         // Create a simple POST request

@@ -46,8 +46,6 @@ use std::sync::Arc;
 use tracing::{info, instrument};
 
 pub mod auth;
-pub mod cache;
-pub mod cache_usage;
 pub mod client;
 pub mod config;
 pub mod errors;
@@ -66,9 +64,6 @@ pub mod target;
 pub mod telemetry;
 pub mod traits;
 
-pub use cache::{
-    CacheClassifier, CacheStats, ClassifyInput, DEFAULT_CLASSIFY_DEADLINE, NoopCacheClassifier,
-};
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
@@ -236,23 +231,6 @@ pub struct AppState<T: HttpClient> {
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
-    /// Optional cached-input-classification hook (the onwards ↔ dwctl seam, §6.2).
-    ///
-    /// Defaults to `None`, in which case the entire cache path is dormant and
-    /// onwards behaviour is byte-identical to today (no fork, no
-    /// `cache_control` stripping, no usage injection). When set via
-    /// [`AppState::with_cache_classifier`], onwards forks each request to the
-    /// classifier in parallel with the upstream call and injects the resulting
-    /// [`cache::CacheStats`] into the response `usage`. The default
-    /// [`cache::NoopCacheClassifier`] returns all-zero stats, so even when wired
-    /// the injected fields are zero and downstream billing is unaffected.
-    pub cache_classifier: Option<Arc<dyn cache::CacheClassifier>>,
-    /// Deadline for the parallel classify branch. The response join waits at
-    /// most this long for [`cache::CacheClassifier::classify`] before falling back
-    /// to all-zero stats (best-effort, billed as un-cached). Only consulted
-    /// when `cache_classifier` is `Some`. Defaults to
-    /// [`cache::DEFAULT_CLASSIFY_DEADLINE`].
-    pub cache_classify_deadline: std::time::Duration,
 }
 
 /// Default maximum request body size (32 MB).
@@ -280,14 +258,6 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("tool_executor", &"<dyn ToolExecutor>")
             .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
-            .field(
-                "cache_classifier",
-                &self
-                    .cache_classifier
-                    .as_ref()
-                    .map(|_| "<dyn CacheClassifier>"),
-            )
-            .field("cache_classify_deadline", &self.cache_classify_deadline)
             .finish()
     }
 }
@@ -312,8 +282,6 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -336,8 +304,6 @@ impl AppState<HyperClient> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 }
@@ -355,8 +321,6 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -376,8 +340,6 @@ impl<T: HttpClient> AppState<T> {
             tool_executor: Arc::new(NoOpToolExecutor),
             response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
-            cache_classifier: None,
-            cache_classify_deadline: cache::DEFAULT_CLASSIFY_DEADLINE,
         }
     }
 
@@ -416,25 +378,6 @@ impl<T: HttpClient> AppState<T> {
     /// Applies to both the strict and non-strict routers.
     pub fn with_body_limit(mut self, limit: usize) -> Self {
         self.body_limit = limit;
-        self
-    }
-
-    /// Inject a cached-input-classification hook (builder pattern, §6.2).
-    ///
-    /// This is the **additive, optional** seam: wiring a classifier activates the
-    /// request fork, `cache_control` stripping, and response usage injection.
-    /// Leaving it unset (the default) keeps onwards byte-identical to today.
-    /// Pass [`cache::NoopCacheClassifier`] for an all-zero, behaviour-preserving
-    /// activation (used for local end-to-end validation of the spine).
-    pub fn with_cache_classifier(mut self, classifier: Arc<dyn cache::CacheClassifier>) -> Self {
-        self.cache_classifier = Some(classifier);
-        self
-    }
-
-    /// Override the deadline for the parallel classify branch (builder pattern).
-    /// Only consulted when a classifier is wired.
-    pub fn with_cache_classify_deadline(mut self, deadline: std::time::Duration) -> Self {
-        self.cache_classify_deadline = deadline;
         self
     }
 }
@@ -1143,6 +1086,313 @@ mod tests {
         assert!(requests[1].uri.contains("api.anthropic.com"));
     }
 
+    /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
+    /// identical providers (all hit the shared mock client), configured to retry
+    /// on the given upstream `on_status` codes.
+    fn fallback_targets(alias: &str, n: usize, on_status: Vec<u16>) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+
+        let providers = (0..n)
+            .map(|i| {
+                let t = Target::builder()
+                    .url(format!("https://p{i}.example.com/").parse().unwrap())
+                    .request_timeout_secs(5)
+                    .build();
+                Provider::new(t, 1)
+            })
+            .collect();
+        let fallback = Some(FallbackConfig {
+            enabled: true,
+            on_status,
+            ..Default::default()
+        });
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(alias.to_string(), pool);
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    /// Retry on an upstream 429. Used by the embedded-error tests below.
+    fn embedded_error_targets(alias: &str, n: usize) -> target::Targets {
+        fallback_targets(alias, n, vec![429])
+    }
+
+    // Some upstreams return HTTP 200 and put the real error in the body. These
+    // tests exercise the embedded-error detection + retry in target_message_handler.
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+        // 200 stream whose first frame is a `429` error envelope. onwards must
+        // retry across providers and, when exhausted, return a sanitized 503 —
+        // never the upstream 429.
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![error_frame]);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted retries must surface a sanitized 503, not the upstream 429"
+        );
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_succeeds() {
+        // First provider returns the 200+error frame; the retry succeeds and the
+        // user is served the successful stream — the throttle stays invisible.
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let ok_chunk = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n".to_string();
+        let done = "data: [DONE]\n\n".to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![ok_chunk, done]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            200,
+            "a successful retry must be served transparently"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "first attempt errored, second succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unary_embedded_error_collapses_to_503() {
+        // The same envelope on a non-streaming 200 body collapses to a 503.
+        let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
+        let mock = MockHttpClient::new(StatusCode::OK, body);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 503);
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_keepalive_before_error_is_still_detected() {
+        // A keep-alive comment precedes the error frame; the peek must skip it
+        // and still detect the 429, retry, and exhaust to 503.
+        let keepalive = ": keep-alive\n\n".to_string();
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![keepalive, error_frame]);
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "an error after a keep-alive frame must still be detected"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    // Some upstreams also fail by returning a `200 OK` with an *empty* body (no
+    // tokens, no error envelope — just EOF). These tests exercise the
+    // empty-body ("Mode C") detection + retry, and crucially that a valid stream
+    // which simply hasn't produced a token yet is NOT mistaken for empty.
+
+    // A normal streaming content frame (classified as data, never an error).
+    const OK_CONTENT_FRAME: &str = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n";
+
+    #[tokio::test]
+    async fn test_streaming_empty_body_retries_then_succeeds() {
+        // First provider opens a 200 stream that ends with zero frames (terminal
+        // empty); the retry to a healthy provider serves the real stream. The
+        // empty response must never reach the client.
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![], // provider 0: empty stream
+                vec![OK_CONTENT_FRAME.to_string()], // provider 1: real content
+            ],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200, "the retry's success is served");
+        assert!(
+            response.text().contains("hi"),
+            "client receives the healthy provider's content"
+        );
+        assert_eq!(mock.get_requests().len(), 2, "empty stream must trigger a retry");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_empty_body_exhausts_to_503() {
+        // Every provider returns an empty 200 stream — exhausted retries surface a
+        // sanitized 503, never a bodyless 200.
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![]);
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 503);
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+    }
+
+    #[tokio::test]
+    async fn test_unary_empty_body_retries_and_exhausts_to_503() {
+        // The unary form: a 200 with an empty body (the deserialize-EOF case) is
+        // retried across providers and collapses to a 503 when exhausted.
+        let mock = MockHttpClient::new(StatusCode::OK, "");
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 503);
+        assert_eq!(mock.get_requests().len(), 2, "empty unary body must trigger a retry");
+    }
+
+    #[tokio::test]
+    async fn test_streaming_keepalive_then_token_is_forwarded_not_retried() {
+        // A valid stream that leads with a keep-alive comment and only *then*
+        // emits its first token must be forwarded as-is — the keep-alive is not
+        // "empty". This is the false-positive guard for slow-first-token streams.
+        let keepalive = ": keep-alive\n\n".to_string();
+        let mock = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![keepalive, OK_CONTENT_FRAME.to_string()],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("hi"));
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a valid stream must not be retried just because the token followed a keep-alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_only_keepalives_so_far_is_forwarded_not_retried() {
+        // The stream has emitted only keep-alive comments by the time the peek
+        // budget/event-count is reached, and has NOT terminated. That is a
+        // slow-but-alive stream, not a terminal empty — it must be forwarded, not
+        // retried (and definitely not collapsed to 503).
+        let keepalive = ": keep-alive\n\n".to_string();
+        let mock = MockHttpClient::new_streaming(
+            StatusCode::OK,
+            vec![keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "keep-alives without a terminal end must not be treated as empty"
+        );
+    }
+
     #[tokio::test]
     async fn test_request_and_response_details() {
         // Create a target
@@ -1232,192 +1482,6 @@ mod tests {
         assert_eq!(forwarded_body["model"], "test-model");
         assert_eq!(forwarded_body["messages"][0]["content"], "Hello!");
         assert_eq!(forwarded_body["temperature"], 0.7);
-    }
-
-    /// Helper: a single-target Targets for the cache-seam tests.
-    fn single_target(model: &str) -> Targets {
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            model.to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .onwards_key("test-api-key".to_string())
-                    .build(),
-            ),
-        );
-        Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        }
-    }
-
-    /// With NO classifier wired (the dormant default), the cache path is invisible:
-    /// `cache_control` markers pass through to the upstream untouched and the
-    /// response carries no synthetic cache fields. This guards the
-    /// non-breaking, behaviour-preserving contract for standalone onwards.
-    #[tokio::test]
-    async fn test_cache_seam_dormant_by_default() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        // No .with_cache_classifier() — dormant.
-        let app_state = AppState::with_client(targets, mock_client.clone());
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}
-                ]}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // cache_control reached the upstream untouched (no stripping).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert!(
-            forwarded["messages"][0]["content"][0]
-                .get("cache_control")
-                .is_some(),
-            "dormant onwards must NOT strip cache_control"
-        );
-
-        // Response usage carries no synthetic cache fields.
-        let body: serde_json::Value = response.json();
-        assert!(body["usage"].get("cache_read_input_tokens").is_none());
-        assert!(body["usage"].get("prompt_tokens_details").is_none());
-    }
-
-    /// With the no-op classifier wired, the spine activates: the outbound request
-    /// has all `cache_control` stripped, and the (non-streaming) response usage
-    /// carries the zeroed cache fields. Billing-relevant `prompt_tokens` is
-    /// untouched.
-    #[tokio::test]
-    async fn test_cache_seam_noop_strips_and_injects_non_streaming() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": [
-                    {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-                ]}],
-                "cache_control": {"type": "ephemeral"}
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // Outbound request: every cache_control stripped (recursively).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert!(forwarded.get("cache_control").is_none());
-        assert!(
-            forwarded["messages"][0]["content"][0]
-                .get("cache_control")
-                .is_none()
-        );
-        // Content otherwise intact.
-        assert_eq!(forwarded["messages"][0]["content"][0]["text"], "hi");
-
-        // Response usage: zeroed cache fields present, prompt_tokens untouched.
-        let body: serde_json::Value = response.json();
-        let usage = &body["usage"];
-        assert_eq!(usage["prompt_tokens"], 9);
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
-        assert_eq!(usage["cache_creation_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
-        assert_eq!(usage["cache_creation"]["ephemeral_24h_input_tokens"], 0);
-    }
-
-    /// A NORMAL request (no `cache_control` markers) with the no-op classifier
-    /// wired must pass straight through: content forwarded unchanged, the
-    /// (zeroed) cache fields injected, `prompt_tokens` untouched, no error. This
-    /// is the common case — the classifier is active but the request opts out —
-    /// and proves the active path doesn't disturb ordinary traffic.
-    #[tokio::test]
-    async fn test_cache_seam_no_markers_wires_through_cleanly() {
-        let targets = single_target("test-model");
-        let mock_response = r#"{"id":"c1","object":"chat.completion","model":"test-model","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "what's the weather?"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        // Outbound request forwarded unchanged (nothing to strip).
-        let forwarded: serde_json::Value =
-            serde_json::from_slice(&mock_client.get_requests()[0].body).unwrap();
-        assert_eq!(forwarded["messages"][0]["content"], "what's the weather?");
-
-        // Response usage: zeroed cache fields injected, original counts untouched.
-        let body: serde_json::Value = response.json();
-        let usage = &body["usage"];
-        assert_eq!(usage["prompt_tokens"], 7);
-        assert_eq!(usage["completion_tokens"], 3);
-        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
-        assert_eq!(usage["cache_creation_input_tokens"], 0);
-    }
-
-    /// Streaming path: with the no-op classifier wired, the terminal usage frame
-    /// gets the zeroed cache fields injected while delta chunks and `[DONE]`
-    /// pass through untouched.
-    #[tokio::test]
-    async fn test_cache_seam_noop_injects_streaming_terminal_frame() {
-        let targets = single_target("test-model");
-        let chunks = vec![
-            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n".to_string(),
-            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"test-model\",\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11}}\n\n".to_string(),
-            "data: [DONE]\n\n".to_string(),
-        ];
-        let mock_client = MockHttpClient::new_streaming(StatusCode::OK, chunks);
-        let app_state = AppState::with_client(targets, mock_client.clone())
-            .with_cache_classifier(Arc::new(crate::cache::NoopCacheClassifier));
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "stream": true,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .await;
-        assert_eq!(response.status_code(), 200);
-
-        let text = response.text();
-        // Delta chunk untouched.
-        assert!(text.contains("\"delta\":{\"content\":\"hi\"}"));
-        // Terminal usage frame got zeroed cache fields.
-        assert!(text.contains("\"cache_read_input_tokens\":0"));
-        assert!(text.contains("\"cached_tokens\":0"));
-        assert!(text.contains("\"cache_creation_input_tokens\":0"));
-        // [DONE] preserved.
-        assert!(text.contains("data: [DONE]"));
     }
 
     #[tokio::test]

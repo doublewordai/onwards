@@ -63,6 +63,11 @@ struct LenientChoice {
     finish_reason: Option<String>,
     #[serde(default)]
     logprobs: Option<serde_json::Value>,
+    /// vLLM/sglang report the matched stop sequence (a string, or a token id)
+    /// here. Preserved through sanitization so downstream readers (e.g. the
+    /// Anthropic `stop_sequence` translation) can see it; omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<serde_json::Value>,
     /// Catch-all for unknown fields (ignored during serialization)
     #[serde(flatten, skip_serializing)]
     _extra: HashMap<String, serde_json::Value>,
@@ -388,6 +393,42 @@ mod tests {
 
         let sanitized: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(sanitized["model"], "gpt-4");
+    }
+
+    #[test]
+    fn test_matched_stop_reason_is_preserved() {
+        // vLLM/sglang put the matched stop sequence at choices[].stop_reason;
+        // sanitization must keep it so downstream translation can read it.
+        let sanitizer = ResponseSanitizer {
+            original_model: Some("m".to_string()),
+        };
+        let response_json = r#"{
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "one two" },
+                "finish_reason": "stop",
+                "stop_reason": "three"
+            }]
+        }"#;
+        let result = sanitizer
+            .sanitize("/v1/chat/completions", &HeaderMap::new(), response_json.as_bytes())
+            .unwrap()
+            .unwrap();
+        let sanitized: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert_eq!(sanitized["choices"][0]["stop_reason"], "three");
+
+        // A response without it does not gain a spurious null field.
+        let plain = r#"{
+            "id": "c", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+        }"#;
+        let result = sanitizer
+            .sanitize("/v1/chat/completions", &HeaderMap::new(), plain.as_bytes())
+            .unwrap()
+            .unwrap();
+        let sanitized: serde_json::Value = serde_json::from_slice(&result).unwrap();
+        assert!(sanitized["choices"][0].get("stop_reason").is_none());
     }
 
     #[test]
