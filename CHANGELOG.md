@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0](https://github.com/doublewordai/onwards/compare/v0.33.4...v0.34.0) - 2026-06-25
+
+### Added
+
+- removed input caching plumbing ([#226](https://github.com/doublewordai/onwards/pull/226))
+
 ## [0.33.4](https://github.com/doublewordai/onwards/compare/v0.33.3...v0.33.4) - 2026-06-24
 
 ### Added
