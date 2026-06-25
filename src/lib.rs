@@ -622,6 +622,14 @@ pub fn build_metrics_layer_and_handle(
     prefix: impl Into<Cow<'static, str>>,
 ) -> MetricsLayerAndHandle {
     info!("Building metrics layer");
+    // IMPORTANT: do not enable metric idle-timeout / eviction on this recorder.
+    // `onwards_model_inflight{model}` is consumed by the autoscaler to decide when a
+    // model has zero active streams and is safe to scale to zero. Series must persist
+    // for the process lifetime: with idle eviction, a long-lived single stream's gauge
+    // (value 1, untouched for the whole stream) could be evicted and render as ABSENT,
+    // which the consumer reads as "0 inflight" and would tear the worker down mid-stream.
+    // With eviction off (the default), an absent series unambiguously means "this model
+    // has had no requests in this process lifetime" == genuinely 0 inflight.
     PrometheusMetricLayerBuilder::new()
         .with_prefix(prefix)
         .enable_response_body_size(true)
@@ -2364,6 +2372,39 @@ mod tests {
                 final_count,
                 initial_count + 11,
                 "Metrics should increment by 11 total"
+            );
+        }
+
+        /// The per-model `onwards_model_inflight` gauge is created ONLY for a
+        /// configured model. An unknown model from a request body must never
+        /// register a series — that would be an unbounded-cardinality / DoS vector,
+        /// made worse by our deliberate no-eviction policy. Here no target is
+        /// configured, so the request 404s at the target lookup *before* `set_model`
+        /// runs, and no `onwards_model_inflight{model=…}` series appears.
+        #[rstest]
+        #[tokio::test]
+        async fn test_onwards_model_inflight_not_created_for_unknown_model(
+            get_shared_metrics_servers: &(TestServer, TestServer),
+        ) {
+            let (server, metrics_server) = get_shared_metrics_servers;
+            let model = "unconfigured-cardinality-probe";
+
+            // Distinct endpoint path (still the wildcard proxy handler) so we don't
+            // perturb the shared `/v1/chat/completions` 404 counter other tests read.
+            let response = server
+                .post("/v1/embeddings")
+                .json(&json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+            // Unknown model -> 404 at the target lookup, before set_model.
+            assert_eq!(response.status_code(), 404);
+
+            let metrics_text = metrics_server.get("/metrics").await.text();
+            assert!(
+                !metrics_text.contains(&format!("onwards_model_inflight{{model=\"{model}\"}}")),
+                "an unknown model must NOT create a per-model series:\n{metrics_text}"
             );
         }
     }

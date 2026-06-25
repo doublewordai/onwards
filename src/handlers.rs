@@ -136,12 +136,52 @@ enum UpstreamOutcome {
     Error(Box<dyn std::error::Error + Send + Sync>),
 }
 
-/// RAII guard that decrements the `onwards_requests_inflight` gauge on drop.
-struct InflightGuard;
+/// RAII guard that decrements the inflight gauges on drop.
+///
+/// Decrements the global `onwards_requests_inflight` always, and the per-model
+/// `onwards_model_inflight{model=…}` once the model has been resolved (see
+/// [`InflightGuard::set_model`]). Because the guard rides the response body via
+/// [`GuardedStream`], both gauges stay incremented for the full lifetime of a
+/// streaming response and only drop when the stream finishes — so
+/// `onwards_model_inflight` reflects *active streams per model*, not requests
+/// accepted. A downstream autoscaler (scouter) polls this on the Dynamo gateway
+/// to gate graceful scale-down: a model being drained is only scaled to zero
+/// once its in-flight count hits zero (no active streams to cut).
+struct InflightGuard {
+    /// Resolved model name, set once `extract_model_from_request` succeeds.
+    /// `None` for requests that error before model resolution (e.g. an oversized
+    /// body or an unparseable model), which therefore only count toward the
+    /// global gauge.
+    model: Option<String>,
+}
+
+impl InflightGuard {
+    /// Associate the resolved model with this in-flight request and increment the
+    /// per-model gauge. Must be called **after** the model is validated against the
+    /// configured targets (only known models get a series), so the gauge's label
+    /// set is bounded by configured models — an arbitrary/unknown model from a
+    /// request body never registers a series (that would be an unbounded-cardinality
+    /// vector, made worse by our deliberate no-eviction policy). Called at most once
+    /// per guard; the matching decrement happens in `Drop`. On the Dynamo gateway
+    /// the requested model is the served model, so this label matches what the
+    /// autoscaler scales and what `/v1/models` lists.
+    fn set_model(&mut self, model: &str) {
+        debug_assert!(
+            self.model.is_none(),
+            "set_model must be called at most once per guard (else the per-model gauge leaks)"
+        );
+        let model = model.to_string();
+        metrics::gauge!("onwards_model_inflight", "model" => model.clone()).increment(1.0);
+        self.model = Some(model);
+    }
+}
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
         metrics::gauge!("onwards_requests_inflight").decrement(1.0);
+        if let Some(model) = self.model.take() {
+            metrics::gauge!("onwards_model_inflight", "model" => model).decrement(1.0);
+        }
     }
 }
 
@@ -325,7 +365,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // on the success path so the gauge stays incremented for the full lifetime of
     // streaming response bodies.
     metrics::gauge!("onwards_requests_inflight").increment(1.0);
-    let mut inflight_guard = Some(InflightGuard);
+    let mut inflight_guard = Some(InflightGuard { model: None });
 
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
@@ -386,7 +426,18 @@ pub async fn target_message_handler<T: HttpClient>(
     );
 
     let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => pool.clone(),
+        Some(pool) => {
+            // Now that the model is known to be a configured target, tag the
+            // in-flight guard so `onwards_model_inflight{model=…}` tracks this
+            // request for its whole lifetime (the guard moves into GuardedStream on
+            // the streaming success path and decrements when the body finishes).
+            // Gating on a known model bounds the gauge's label set — an unknown
+            // model 404s above without ever creating a series.
+            if let Some(guard) = inflight_guard.as_mut() {
+                guard.set_model(&model_name);
+            }
+            pool.clone()
+        }
         None => {
             debug!("No target found for model: {}", model_name);
             record_response_status(404);
