@@ -601,7 +601,8 @@ fn convert_message_content(
                             ));
                         } else {
                             return Err(AdapterError::ConversionError(
-                                "input_file must provide one of file_data, file_id, or file_url"
+                                "input_file must provide file_data or file_id; file_url alone is \
+                                 not supported when converting to Chat Completions"
                                     .to_string(),
                             ));
                         }
