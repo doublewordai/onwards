@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.1](https://github.com/doublewordai/onwards/compare/v0.34.0...v0.34.1) - 2026-06-25
+
+### Added
+
+- *(metrics)* per-model onwards_model_inflight gauge for drain-gated scale-down ([#232](https://github.com/doublewordai/onwards/pull/232))
+
 ## [0.34.0](https://github.com/doublewordai/onwards/compare/v0.33.4...v0.34.0) - 2026-06-25
 
 ### Added
