@@ -140,11 +140,15 @@ impl ProviderPool {
     /// Select providers lazily for fallback scenarios.
     ///
     /// Returns an iterator that yields one provider at a time. Each call to
-    /// `next()` performs a fresh least-connections evaluation, excluding
-    /// previously tried providers (unless `with_replacement` is set).
+    /// `next()` asks the LB strategy for the next provider not yet tried in the
+    /// current pass (excluding previously tried providers, unless
+    /// `with_replacement` is set for weighted-random).
     ///
-    /// The number of attempts is controlled by `fallback.max_attempts`
-    /// (defaults to provider count).
+    /// The total number of attempts is controlled by `fallback.max_attempts`
+    /// (defaults to provider count) and sits *above* the LB strategy: when a pass
+    /// is exhausted, the cascade restarts (exclusions cleared) until the budget is
+    /// spent. So every strategy — including a single-provider `Priority` pool —
+    /// honors the configured retry count, rather than stopping after one cascade.
     pub fn select_iter(&self) -> SelectIter<'_> {
         let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
         let max_attempts = self
@@ -325,25 +329,17 @@ impl ProviderPool {
     /// Maximum number of attempts `select_iter()` may yield, given the current
     /// fallback configuration, load-balancing strategy, and provider count.
     ///
-    /// Mirrors `SelectIter::next` exactly: `with_replacement` is honored only
-    /// for `WeightedRandom`; `Priority` always excludes already-tried
-    /// providers (see `SelectIter::next` for the source of truth). When
-    /// providers can't be re-yielded, the configured `max_attempts` is
-    /// effectively clamped to `providers.len()`.
+    /// The total attempt budget for the fallback/retry loop, sitting *above* the
+    /// LB strategy: `fallback.max_attempts` if set, else the provider count (one
+    /// pass through the pool). Unlike provider selection within a pass, this is
+    /// NOT clamped by provider count or strategy — `SelectIter` restarts the LB
+    /// cascade when a pass is exhausted, so e.g. a single-provider `Priority`
+    /// pool with `max_attempts = 3` retries that provider three times.
     pub fn fallback_max_attempts(&self) -> usize {
-        let configured = self
-            .fallback
+        self.fallback
             .as_ref()
             .and_then(|f| f.max_attempts)
-            .unwrap_or(self.providers.len());
-        let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
-        let allows_replacement =
-            with_replacement && matches!(self.strategy, LoadBalanceStrategy::WeightedRandom);
-        if allows_replacement {
-            configured
-        } else {
-            configured.min(self.providers.len())
-        }
+            .unwrap_or(self.providers.len())
     }
 
     /// Get the load balancing strategy
@@ -432,11 +428,34 @@ impl<'a> Iterator for SelectIter<'a> {
         }
         self.attempts += 1;
 
-        let result = self.pool.select_excluding(&self.excluded)?;
+        // Ask the LB strategy for the next eligible provider for the current
+        // exclusions. `select_excluding` returns `None` when no provider is
+        // eligible — either every provider has been tried in this pass, or the
+        // untried ones are all at their concurrency limit.
+        //
+        // If that happens but the attempt budget still allows it, start a fresh
+        // pass: clear the exclusions (re-including already-tried providers) and
+        // cascade through the strategy's options again. This is what puts the
+        // configured retry budget *above* the LB strategy — every strategy
+        // (including a single-provider Priority pool) keeps retrying until
+        // `max_attempts` is spent, rather than stopping after one cascade.
+        //
+        // When `excluded` is already empty there is nothing to re-include, so a
+        // `None` there means an empty pool or every provider at capacity: end the
+        // iterator rather than re-running the same scan.
+        let result = match self.pool.select_excluding(&self.excluded) {
+            Some(result) => result,
+            None if self.excluded.is_empty() => return None,
+            None => {
+                self.excluded.clear();
+                self.pool.select_excluding(&self.excluded)?
+            }
+        };
 
-        // For priority strategy, always exclude tried providers so failover
-        // advances through the list. with_replacement only applies to
-        // weighted random selection.
+        // For priority strategy, exclude the provider just tried so the next step
+        // advances through the list within this pass. with_replacement only
+        // applies to weighted random selection (sample with replacement within a
+        // pass); cross-pass retries are driven by `max_attempts` above.
         let should_exclude = match self.pool.strategy {
             LoadBalanceStrategy::Priority => true,
             LoadBalanceStrategy::WeightedRandom => !self.with_replacement,
@@ -661,64 +680,33 @@ mod tests {
         );
         assert_eq!(pool.fallback_max_attempts(), 2);
 
-        // max_attempts above provider count with no replacement — still clamped.
-        let pool = ProviderPool::with_config(
-            two_providers(),
-            None,
-            None,
-            None,
-            Some(FallbackConfig {
-                enabled: true,
-                max_attempts: Some(10),
-                ..Default::default()
-            }),
-            LoadBalanceStrategy::default(),
-            false,
-            Vec::new(),
-        );
-        assert_eq!(pool.fallback_max_attempts(), 2);
-
-        // with_replacement honors max_attempts beyond provider count.
-        let pool = ProviderPool::with_config(
-            two_providers(),
-            None,
-            None,
-            None,
-            Some(FallbackConfig {
-                enabled: true,
-                max_attempts: Some(10),
-                with_replacement: true,
-                ..Default::default()
-            }),
-            LoadBalanceStrategy::default(),
-            false,
-            Vec::new(),
-        );
-        assert_eq!(pool.fallback_max_attempts(), 10);
-
-        // Priority strategy always excludes tried providers, so
-        // with_replacement is ignored — cap stays at provider count even
-        // if max_attempts is larger. This must match `SelectIter::next`.
-        let pool = ProviderPool::with_config(
-            two_providers(),
-            None,
-            None,
-            None,
-            Some(FallbackConfig {
-                enabled: true,
-                max_attempts: Some(10),
-                with_replacement: true,
-                ..Default::default()
-            }),
+        // max_attempts is the attempt budget and sits ABOVE the LB strategy: it
+        // is no longer clamped to provider count. `SelectIter` restarts the
+        // cascade when a pass is exhausted, so the budget is honored verbatim for
+        // every strategy — even without `with_replacement`.
+        for strategy in [
+            LoadBalanceStrategy::WeightedRandom,
             LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-        assert_eq!(pool.fallback_max_attempts(), 2);
-
-        // Sanity-check: helper agrees with what SelectIter actually yields
-        // for the surprising case (Priority + with_replacement).
-        assert_eq!(pool.select_iter().count(), 2);
+        ] {
+            let pool = ProviderPool::with_config(
+                two_providers(),
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    max_attempts: Some(10),
+                    ..Default::default()
+                }),
+                strategy,
+                false,
+                Vec::new(),
+            );
+            assert_eq!(pool.fallback_max_attempts(), 10);
+            // And the iterator actually yields that many, restarting the pass
+            // (count() drops each guard immediately, so concurrency is fine).
+            assert_eq!(pool.select_iter().count(), 10);
+        }
     }
 
     #[test]
@@ -1033,6 +1021,61 @@ mod tests {
         assert_eq!(order.len(), 2);
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
+    }
+
+    #[test]
+    fn test_select_iter_retries_above_strategy() {
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        // A single-provider Priority pool with max_attempts = 3: the retry budget
+        // sits above the strategy, so the one provider is yielded 3 times — genuine
+        // single-model retry, which Priority could not express before (no
+        // with_replacement needed). count() drops each guard before the next pull.
+        let pool = ProviderPool::with_config(
+            vec![Provider::new(
+                create_test_target("https://only.example.com"),
+                1,
+            )],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(3),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let indices: Vec<_> = pool.select_iter().map(|(idx, _, _)| idx).collect();
+        assert_eq!(
+            indices,
+            vec![0, 0, 0],
+            "single provider retried up to the budget"
+        );
+
+        // A multi-provider Priority pool with a budget beyond one cascade walks the
+        // priority order, then restarts and cascades again until the budget is spent.
+        let pool = ProviderPool::with_config(
+            vec![
+                Provider::new(create_test_target("https://p0.example.com"), 1),
+                Provider::new(create_test_target("https://p1.example.com"), 1),
+            ],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(5),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let indices: Vec<_> = pool.select_iter().map(|(idx, _, _)| idx).collect();
+        assert_eq!(indices, vec![0, 1, 0, 1, 0], "cascade, restart, cascade...");
     }
 
     #[test]
