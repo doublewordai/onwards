@@ -2354,7 +2354,8 @@ mod tests {
     /// never the response body content.
     #[tokio::test(flavor = "current_thread")]
     async fn zdr_sanitize_chat_response_does_not_log_body() {
-        const SENTINEL: &str = "ZDR-SENTINEL-COMPLETION-9f3a";
+        // Looks like real model output, so a regression that logs the body is obvious.
+        const SENTINEL: &str = "pikachu-used-thunderbolt-9f3a";
         let body = json!({
             "id": "chatcmpl-x",
             "object": "chat.completion",
@@ -2394,7 +2395,8 @@ mod tests {
     /// be logged by `sanitize_error_response` — only the status and length.
     #[tokio::test(flavor = "current_thread")]
     async fn zdr_sanitize_error_response_does_not_log_provider_body() {
-        const SENTINEL: &str = "ZDR-SENTINEL-ERRBODY-2b7c";
+        // Provider error bodies can echo prompt/response content like this.
+        const SENTINEL: &str = "pikachu-fainted-2b7c";
         let logs = capture_logs(|| async {
             let response = Response::builder()
                 .status(StatusCode::BAD_REQUEST)
