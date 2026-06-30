@@ -276,8 +276,9 @@ impl ResponseSanitizer {
                         // event so a downstream reassembler can detect them and
                         // reclassify the HTTP status. Non-strict mode forwards
                         // the envelope verbatim and preserves the upstream code.
+                        // ZDR: log only the length, never the SSE chunk content.
                         tracing::warn!(
-                            data_sample = ?data_part.chars().take(200).collect::<String>(),
+                            data_len = data_part.len(),
                             "Provider returned error envelope in SSE stream (non-strict: forwarding verbatim)"
                         );
                         sanitized_lines.push(error_event);

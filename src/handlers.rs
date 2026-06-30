@@ -387,12 +387,14 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     }
 
-    // Log full incoming request details for debugging
+    // Log incoming request metadata for debugging.
+    // ZDR: never log the request body or headers — bodies carry prompt content
+    // and headers carry auth credentials. Only method, path, and body length.
     trace!(
-        "Incoming request details:\n  Method: {}\n  URI: {}\n  Body: {}",
-        req.method(),
-        req.uri(),
-        String::from_utf8_lossy(&body_bytes)
+        method = %req.method(),
+        uri = %req.uri(),
+        body_len = body_bytes.len(),
+        "Incoming request"
     );
 
     // Extract the model using the shared function
@@ -885,7 +887,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // Replace upstream error bodies with generic messages to prevent
         // information leakage (provider names, URLs, internal model names).
         if target.sanitize_response && !(200..300).contains(&status) {
-            // Buffer and log the original error for debugging/tracing
+            // Drain the original error body so we can record its size, but do
+            // NOT log its content. ZDR: provider error bodies can echo prompt or
+            // response content, so only the status, upstream, and length are safe.
             let error_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .ok();
@@ -893,11 +897,7 @@ pub async fn target_message_handler<T: HttpClient>(
             error!(
                 status = status,
                 upstream = %target.url,
-                body = error_body
-                    .as_ref()
-                    .map(|b| String::from_utf8_lossy(b))
-                    .unwrap_or_default()
-                    .as_ref(),
+                body_len = error_body.as_ref().map(|b| b.len()).unwrap_or(0),
                 "Upstream provider returned error, sanitizing before forwarding to client"
             );
 
@@ -1246,14 +1246,11 @@ pub async fn target_message_handler<T: HttpClient>(
                     }
                 };
 
+                // ZDR: log only the buffered length, never the response body content.
                 debug!(
                     "Response body buffered: {} bytes, content-type: {}",
                     response_body.len(),
                     content_type
-                );
-                trace!(
-                    "Response body content: {}",
-                    String::from_utf8_lossy(&response_body)
                 );
 
                 // Apply transformation
@@ -1266,14 +1263,11 @@ pub async fn target_message_handler<T: HttpClient>(
                     Ok(Some(transformed_body)) => {
                         // Update response with sanitized body
                         let content_length = transformed_body.len();
+                        // ZDR: log only the lengths, never the sanitized body content.
                         debug!(
                             "Sanitization successful: {} bytes -> {} bytes",
                             response_body.len(),
                             content_length
-                        );
-                        trace!(
-                            "Sanitized body: {}",
-                            String::from_utf8_lossy(&transformed_body)
                         );
                         *response.body_mut() = axum::body::Body::from(transformed_body);
 

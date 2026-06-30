@@ -755,14 +755,8 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         let chat_response: ChatCompletionResponse = match serde_json::from_slice(&body_bytes) {
             Ok(resp) => resp,
             Err(e) => {
-                error!(error = %e, "Failed to parse chat completions response");
-                // Log some of the response for debugging
-                if let Ok(text) = std::str::from_utf8(&body_bytes) {
-                    debug!(
-                        response_preview = &text[..text.len().min(500)],
-                        "Response body preview"
-                    );
-                }
+                // ZDR: never log the response body — only its length and the parse error.
+                error!(error = %e, response_len = body_bytes.len(), "Failed to parse chat completions response");
                 return error_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream_error",
@@ -1344,11 +1338,8 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
         .await
     {
         Ok(bytes) => {
-            debug!(
-                bytes_read = bytes.len(),
-                body_sample = ?String::from_utf8_lossy(&bytes).chars().take(100).collect::<String>(),
-                "Read upstream response body for sanitization"
-            );
+            // ZDR: log only the length, never the response body content.
+            debug!(bytes_read = bytes.len(), "Read upstream response body for sanitization");
             bytes
         }
         Err(e) => {
@@ -1366,9 +1357,10 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
         Err(e) => {
             // Failed to deserialize - provider returned malformed response
             // Log the error but return standard error instead of passing through
+            // ZDR: never log the body — only its length and the parse error.
             error!(
                 error = %e,
-                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                response_len = body_bytes.len(),
                 "Failed to deserialize chat response from provider, returning standard error"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
@@ -1397,11 +1389,8 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
         Ok(sanitized_bytes) => {
             // Set Content-Length to match the new sanitized body size
             let content_length = sanitized_bytes.len();
-            debug!(
-                content_length = content_length,
-                body_sample = ?String::from_utf8_lossy(&sanitized_bytes).chars().take(100).collect::<String>(),
-                "Setting sanitized response body"
-            );
+            // ZDR: log only the length, never the sanitized body content.
+            debug!(content_length = content_length, "Setting sanitized response body");
             *response.body_mut() = Body::from(sanitized_bytes);
 
             // Remove Transfer-Encoding since we're setting Content-Length
@@ -1482,7 +1471,7 @@ async fn sanitize_streaming_chat_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse SSE data line from provider, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -1501,7 +1490,7 @@ async fn sanitize_streaming_chat_response(
                         // downstream reassembler with no signal.
                         if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
                             error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                 "Provider returned error envelope in SSE chunk, forwarding as error event"
                             );
                             sanitized_lines.push(error_event);
@@ -1535,7 +1524,7 @@ async fn sanitize_streaming_chat_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse SSE data line from provider, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -1605,7 +1594,7 @@ async fn sanitize_completions_response(mut response: Response, original_model: S
         Err(e) => {
             error!(
                 error = %e,
-                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                response_len = body_bytes.len(), // ZDR: length only, never response body content
                 "Failed to deserialize completions response from provider, returning standard error"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
@@ -1688,7 +1677,7 @@ async fn sanitize_streaming_completions_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    raw = %data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse completions chunk, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -1704,7 +1693,7 @@ async fn sanitize_streaming_completions_response(
                         // silently stripped. Reuses the parse above.
                         if let Some(error_event) = try_format_sse_error(&raw_chunk, trusted) {
                             error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                 "Provider returned error envelope in SSE chunk, forwarding as error event"
                             );
                             sanitized_lines.push(error_event);
@@ -1733,7 +1722,7 @@ async fn sanitize_streaming_completions_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    raw = %data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse completions chunk, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -1799,7 +1788,7 @@ async fn sanitize_embeddings_response(mut response: Response, original_model: St
         Err(e) => {
             error!(
                 error = %e,
-                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                response_len = body_bytes.len(), // ZDR: length only, never response body content
                 "Failed to deserialize embeddings response from provider, returning standard error"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
@@ -1868,7 +1857,7 @@ async fn sanitize_responses_response(
         Err(e) => {
             error!(
                 error = %e,
-                body_sample = ?String::from_utf8_lossy(&body_bytes).chars().take(200).collect::<String>(),
+                response_len = body_bytes.len(), // ZDR: length only, never response body content
                 "Failed to deserialize responses API response from provider, returning standard error"
             );
             return error_response(StatusCode::BAD_GATEWAY, "api_error", "Bad gateway");
@@ -1980,7 +1969,7 @@ async fn sanitize_streaming_responses_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse responses SSE data line from provider, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -1997,7 +1986,7 @@ async fn sanitize_streaming_responses_response(
                         // schema. Reuses the parse above.
                         if let Some(error_event) = try_format_sse_error(&raw_event, trusted) {
                             error!(
-                                data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                 "Provider returned error envelope in SSE chunk, forwarding as error event"
                             );
                             sanitized_lines.push(error_event);
@@ -2037,7 +2026,7 @@ async fn sanitize_streaming_responses_response(
                             Err(e) => {
                                 error!(
                                     error = %e,
-                                    data_sample = ?data_part.chars().take(200).collect::<String>(),
+                                    data_len = data_part.len(), // ZDR: length only, never SSE chunk content
                                     "Failed to parse responses SSE data line from provider, terminating stream"
                                 );
                                 return Err(std::io::Error::other(
@@ -2200,7 +2189,9 @@ fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
 async fn sanitize_error_response(mut response: Response) -> Response {
     let status = response.status();
 
-    // Read and log the actual error for debugging
+    // Drain the body so the connection can be reused, but do NOT log its content.
+    // ZDR: provider error bodies can echo prompt/response content, so only the
+    // status and body length are safe to record.
     let body_bytes =
         match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
             Ok(bytes) => bytes,
@@ -2210,10 +2201,9 @@ async fn sanitize_error_response(mut response: Response) -> Response {
             }
         };
 
-    // Log the actual third-party error (never sent to client)
     error!(
         status = %status,
-        third_party_error = ?String::from_utf8_lossy(&body_bytes),
+        body_len = body_bytes.len(),
         "Third-party error response (logged, not forwarded)"
     );
 
@@ -2304,6 +2294,116 @@ mod tests {
     use dashmap::DashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    // --- ZDR no-payload-logging regression tests (COR-497) ---
+
+    /// A `MakeWriter` that appends every emitted log byte into a shared buffer,
+    /// so a test can assert what did (and crucially did not) reach the logging layer.
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` while capturing all tracing output (TRACE and above) on the current
+    /// thread, then return the captured text. `#[tokio::test]` runs on a
+    /// current-thread runtime, so the thread-local subscriber covers the awaits.
+    async fn capture_logs<F, Fut>(f: F) -> String
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(buf.clone()))
+            .finish();
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            f().await;
+        }
+        let bytes = buf.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The success path of `sanitize_chat_response` must log only length metadata,
+    /// never the response body content.
+    #[tokio::test]
+    async fn zdr_sanitize_chat_response_does_not_log_body() {
+        const SENTINEL: &str = "ZDR-SENTINEL-COMPLETION-9f3a";
+        let body = json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "upstream-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": SENTINEL},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+        .to_string();
+
+        let logs = capture_logs(|| async {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let _ = sanitize_chat_response(response, "client-model".to_string()).await;
+        })
+        .await;
+
+        assert!(
+            !logs.contains(SENTINEL),
+            "response body content leaked into logs:\n{logs}"
+        );
+        // Sanity: the sanitizer still emitted its length-only diagnostics.
+        assert!(
+            logs.contains("bytes_read") || logs.contains("content_length"),
+            "expected length metadata in logs, got:\n{logs}"
+        );
+    }
+
+    /// Provider error bodies (which can echo prompt/response content) must never
+    /// be logged by `sanitize_error_response` — only the status and length.
+    #[tokio::test]
+    async fn zdr_sanitize_error_response_does_not_log_provider_body() {
+        const SENTINEL: &str = "ZDR-SENTINEL-ERRBODY-2b7c";
+        let logs = capture_logs(|| async {
+            let response = Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(format!("{{\"error\":\"{SENTINEL}\"}}")))
+                .unwrap();
+            let _ = sanitize_error_response(response).await;
+        })
+        .await;
+
+        assert!(
+            !logs.contains(SENTINEL),
+            "provider error body leaked into logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("body_len"),
+            "expected body_len metadata in logs, got:\n{logs}"
+        );
+    }
 
     #[test]
     fn test_error_response_format() {
