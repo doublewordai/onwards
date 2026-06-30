@@ -1170,7 +1170,11 @@ mod tests {
             503,
             "exhausted retries must surface a sanitized 503, not the upstream 429"
         );
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1226,7 +1230,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1273,7 +1281,7 @@ mod tests {
         let mock = MockHttpClient::new_streaming_sequence(
             StatusCode::OK,
             vec![
-                vec![], // provider 0: empty stream
+                vec![],                             // provider 0: empty stream
                 vec![OK_CONTENT_FRAME.to_string()], // provider 1: real content
             ],
         );
@@ -1294,7 +1302,11 @@ mod tests {
             response.text().contains("hi"),
             "client receives the healthy provider's content"
         );
-        assert_eq!(mock.get_requests().len(), 2, "empty stream must trigger a retry");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "empty stream must trigger a retry"
+        );
     }
 
     #[tokio::test]
@@ -1315,7 +1327,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1336,7 +1352,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "empty unary body must trigger a retry");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "empty unary body must trigger a retry"
+        );
     }
 
     #[tokio::test]
@@ -1379,7 +1399,13 @@ mod tests {
         let keepalive = ": keep-alive\n\n".to_string();
         let mock = MockHttpClient::new_streaming(
             StatusCode::OK,
-            vec![keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive],
+            vec![
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive,
+            ],
         );
         let app_state =
             AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
