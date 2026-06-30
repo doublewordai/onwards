@@ -887,9 +887,11 @@ pub async fn target_message_handler<T: HttpClient>(
         // Replace upstream error bodies with generic messages to prevent
         // information leakage (provider names, URLs, internal model names).
         if target.sanitize_response && !(200..300).contains(&status) {
-            // Drain the original error body so we can record its size, but do
-            // NOT log its content. ZDR: provider error bodies can echo prompt or
-            // response content, so only the status, upstream, and length are safe.
+            // Drain the original error body (buffering up to 64 KiB) so we can
+            // record its length, but do NOT log its content. ZDR: provider error
+            // bodies can echo prompt/response content, so only the status,
+            // upstream, and buffered length are safe. `body_len` below is that
+            // buffered size — 0 if the read errored or the body exceeded 64 KiB.
             let error_body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .ok();

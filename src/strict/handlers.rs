@@ -1334,23 +1334,25 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
 /// rewrites the model field, and re-serializes.
 async fn sanitize_chat_response(mut response: Response, original_model: String) -> Response {
     // Read the response body
-    let body_bytes = match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
-        .await
-    {
-        Ok(bytes) => {
-            // ZDR: log only the length, never the response body content.
-            debug!(bytes_read = bytes.len(), "Read upstream response body for sanitization");
-            bytes
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to read response body for sanitization");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                "Failed to read upstream response",
-            );
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => {
+                // ZDR: log only the length, never the response body content.
+                debug!(
+                    bytes_read = bytes.len(),
+                    "Read upstream response body for sanitization"
+                );
+                bytes
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to read response body for sanitization");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
 
     let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
@@ -1390,7 +1392,10 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
             // Set Content-Length to match the new sanitized body size
             let content_length = sanitized_bytes.len();
             // ZDR: log only the length, never the sanitized body content.
-            debug!(content_length = content_length, "Setting sanitized response body");
+            debug!(
+                content_length = content_length,
+                "Setting sanitized response body"
+            );
             *response.body_mut() = Body::from(sanitized_bytes);
 
             // Remove Transfer-Encoding since we're setting Content-Length
@@ -2189,11 +2194,13 @@ fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
 async fn sanitize_error_response(mut response: Response) -> Response {
     let status = response.status();
 
-    // Drain the body so the connection can be reused, but do NOT log its content.
-    // ZDR: provider error bodies can echo prompt/response content, so only the
-    // status and body length are safe to record.
+    // Drain the body (bounded, so a misbehaving provider cannot make us buffer
+    // an arbitrarily large response) to record its length, but do NOT log its
+    // content. ZDR: provider error bodies can echo prompt/response content, so
+    // only the status and the buffered length are safe to record.
+    const MAX_ERROR_BODY: usize = 64 * 1024;
     let body_bytes =
-        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), MAX_ERROR_BODY).await {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!(error = %e, "Failed to read error response body");
@@ -2320,8 +2327,10 @@ mod tests {
     }
 
     /// Run `f` while capturing all tracing output (TRACE and above) on the current
-    /// thread, then return the captured text. `#[tokio::test]` runs on a
-    /// current-thread runtime, so the thread-local subscriber covers the awaits.
+    /// thread, then return the captured text. The subscriber is installed via
+    /// `set_default` (thread-local), so the callers below MUST run on a
+    /// `current_thread` runtime — otherwise a future resumed on another worker
+    /// thread would emit events the capture misses.
     async fn capture_logs<F, Fut>(f: F) -> String
     where
         F: FnOnce() -> Fut,
@@ -2343,7 +2352,7 @@ mod tests {
 
     /// The success path of `sanitize_chat_response` must log only length metadata,
     /// never the response body content.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn zdr_sanitize_chat_response_does_not_log_body() {
         const SENTINEL: &str = "ZDR-SENTINEL-COMPLETION-9f3a";
         let body = json!({
@@ -2383,7 +2392,7 @@ mod tests {
 
     /// Provider error bodies (which can echo prompt/response content) must never
     /// be logged by `sanitize_error_response` — only the status and length.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn zdr_sanitize_error_response_does_not_log_provider_body() {
         const SENTINEL: &str = "ZDR-SENTINEL-ERRBODY-2b7c";
         let logs = capture_logs(|| async {
