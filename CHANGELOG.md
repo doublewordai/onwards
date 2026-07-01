@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.2](https://github.com/doublewordai/onwards/compare/v0.34.1...v0.34.2) - 2026-06-30
+
+### Fixed
+
+- stop logging prompt/response/provider-error bodies in the realtime path ([#235](https://github.com/doublewordai/onwards/pull/235))
+
 ## [0.34.1](https://github.com/doublewordai/onwards/compare/v0.34.0...v0.34.1) - 2026-06-25
 
 ### Added
