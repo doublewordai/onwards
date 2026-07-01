@@ -76,17 +76,26 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
     (400..600).contains(&status).then_some(status)
 }
 
-/// A bounded, lossy-UTF-8 sample of an upstream body or SSE frame, logged when
-/// an embedded provider error is detected. The offending provider name and the
-/// human-readable message live in the body, not the status line — so without
-/// this an embedded error is only ever visible as a bare status code. Bounded so
-/// an arbitrary upstream body can't blow up a log line; mirrors the streaming
-/// sanitizer's `data_sample`.
+/// A bounded, lossy-UTF-8 sample of an upstream *error envelope* (unary body or
+/// SSE frame), logged when an embedded provider error is detected. The offending
+/// provider name and human-readable message live in the body, not the status
+/// line — so without this an embedded error is only ever visible as a bare
+/// status code. Only ever called on a detected error envelope (an `error.code`
+/// in 400..600), never a normal completion body. Bounded in both output length
+/// *and* decode work — we validate at most `SAMPLE_CHARS * 4` bytes — so an
+/// arbitrary upstream body can't blow up a log line or the cost of building it.
+/// Mirrors the `data_sample` field the streaming sanitizer already logs.
 fn embedded_error_sample(bytes: &[u8]) -> String {
-    const SAMPLE_LEN: usize = 256;
-    String::from_utf8_lossy(bytes)
+    const SAMPLE_CHARS: usize = 256;
+    // A UTF-8 codepoint is at most 4 bytes, so this prefix always yields at least
+    // `SAMPLE_CHARS` chars while bounding the UTF-8 validation work for a huge
+    // body. A codepoint split at the boundary only affects chars past the cut,
+    // which `take(SAMPLE_CHARS)` discards anyway.
+    const MAX_PREFIX_BYTES: usize = SAMPLE_CHARS * 4;
+    let prefix = &bytes[..bytes.len().min(MAX_PREFIX_BYTES)];
+    String::from_utf8_lossy(prefix)
         .chars()
-        .take(SAMPLE_LEN)
+        .take(SAMPLE_CHARS)
         .collect()
 }
 
@@ -1556,11 +1565,14 @@ mod tests {
         assert!(sample.contains("Together"));
         assert!(sample.contains("Provider returned error"));
 
-        // Bounded so an arbitrary upstream body can't blow up a log line, and
-        // truncation counts chars (never splits a UTF-8 codepoint).
-        let big = format!("{}{}", "é".repeat(500), "tail");
+        // Bounded to 256 chars, counted in chars (never split codepoints), even
+        // when the input exceeds the byte-prefix scan window (256 * 4 = 1024
+        // bytes). 700 × 2-byte "é" = 1400 bytes > 1024, so this also exercises
+        // the prefix-slice path.
+        let big = format!("{}{}", "é".repeat(700), "tail");
         let sample = embedded_error_sample(big.as_bytes());
         assert_eq!(sample.chars().count(), 256);
+        assert!(sample.chars().all(|c| c == 'é'));
         assert!(!sample.contains("tail"));
     }
 
