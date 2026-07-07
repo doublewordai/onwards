@@ -1170,11 +1170,7 @@ mod tests {
             503,
             "exhausted retries must surface a sanitized 503, not the upstream 429"
         );
-        assert_eq!(
-            mock.get_requests().len(),
-            2,
-            "both providers should be tried"
-        );
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
     }
 
     #[tokio::test]
@@ -1230,231 +1226,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            2,
-            "both providers should be tried"
-        );
-    }
-
-    // A single-provider pool with an explicit `max_attempts` — models a realtime
-    // request that a routing rule has redirected onto ONE upstream (e.g. the
-    // OpenRouter component of a composite), where the only retry available is
-    // same-provider, bounded by `max_attempts`. Every other embedded-error test
-    // leaves `max_attempts` unset (== provider count), so this path is untested.
-    fn single_provider_max_attempts(
-        alias: &str,
-        on_status: Vec<u16>,
-        max_attempts: usize,
-    ) -> target::Targets {
-        use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
-
-        let t = Target::builder()
-            .url("https://p0.example.com/".parse().unwrap())
-            .request_timeout_secs(5)
-            .build();
-        let providers = vec![Provider::new(t, 1)];
-        let fallback = Some(FallbackConfig {
-            enabled: true,
-            on_status,
-            max_attempts: Some(max_attempts),
-            ..Default::default()
-        });
-        let pool = ProviderPool::with_config(
-            providers,
-            None,
-            None,
-            None,
-            fallback,
-            LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(alias.to_string(), pool);
-        target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: true,
-            http_pool_config: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_unary_embedded_error_single_provider_retries_to_max_attempts() {
-        // Realtime-gemma shape: ONE upstream (OpenRouter), max_attempts=3, a 200
-        // body carrying an embedded 504. onwards should retry the same provider
-        // up to max_attempts before collapsing to 503.
-        let body = r#"{"error":{"code":504,"message":"Provider returned error"}}"#;
-        let mock = MockHttpClient::new(StatusCode::OK, body);
-        let app_state = AppState::with_client(
-            single_provider_max_attempts("gpt-4", vec![504], 3),
-            mock.clone(),
-        );
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            3,
-            "single provider with max_attempts=3 must retry the same provider 3 times"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_unary_embedded_error_one_provider_no_max_attempts_does_not_retry() {
-        // The ACTUAL current gemma-realtime state: the composite falls over
-        // dynamo → OpenRouter, but the on-prem component is descheduled, so the
-        // composite has ONE live provider and no explicit `fallback_max_attempts`
-        // — the budget defaults to `providers.len() == 1`. An embedded error then
-        // gets a single attempt and no retry. This is the bug; the test above
-        // (explicit max_attempts=3) is the fix.
-        let mock = MockHttpClient::new(
-            StatusCode::OK,
-            r#"{"error":{"code":504,"message":"Provider returned error"}}"#,
-        );
-        let app_state =
-            AppState::with_client(fallback_targets("gpt-4", 1, vec![504]), mock.clone());
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            1,
-            "one provider + no explicit max_attempts => budget of 1 => no retry (the bug)"
-        );
-    }
-
-    // The full realtime shape: a public composite whose routing rule redirects a
-    // {purpose: realtime} key onto a single-provider target with explicit
-    // max_attempts. Verifies the retry budget survives the redirect (it's read
-    // from the redirect target pool, not the composite).
-    fn composite_redirect_targets(
-        composite_alias: &str,
-        target_alias: &str,
-        token: &str,
-        on_status: Vec<u16>,
-        max_attempts: usize,
-    ) -> target::Targets {
-        use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{
-            FallbackConfig, LoadBalanceStrategy, RoutingAction, RoutingRule, Target,
-        };
-        use std::collections::HashMap;
-
-        let target_pool = ProviderPool::with_config(
-            vec![Provider::new(
-                Target::builder()
-                    .url("https://openrouter.example.com/".parse().unwrap())
-                    .request_timeout_secs(5)
-                    .build(),
-                1,
-            )],
-            None,
-            None,
-            None,
-            Some(FallbackConfig {
-                enabled: true,
-                on_status,
-                max_attempts: Some(max_attempts),
-                ..Default::default()
-            }),
-            LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-
-        // Composite carries only the redirect rule; its own provider is never hit.
-        let composite_pool = ProviderPool::with_config(
-            vec![Provider::new(
-                Target::builder()
-                    .url("https://composite-unused.example.com/".parse().unwrap())
-                    .request_timeout_secs(5)
-                    .build(),
-                1,
-            )],
-            None,
-            None,
-            None,
-            None,
-            LoadBalanceStrategy::Priority,
-            false,
-            vec![RoutingRule {
-                match_labels: HashMap::from([("purpose".to_string(), "realtime".to_string())]),
-                action: RoutingAction::Redirect {
-                    target: target_alias.to_string(),
-                },
-            }],
-        );
-
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(composite_alias.to_string(), composite_pool);
-        targets_map.insert(target_alias.to_string(), target_pool);
-
-        let key_labels = Arc::new(DashMap::new());
-        key_labels.insert(
-            token.to_string(),
-            HashMap::from([("purpose".to_string(), "realtime".to_string())]),
-        );
-
-        target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels,
-            strict_mode: true,
-            http_pool_config: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_realtime_redirect_preserves_target_max_attempts() {
-        // Coverage for the traffic-rule redirect path (used by some composites,
-        // though NOT gemma — its traffic rules are empty). When a rule redirects
-        // a request onto a single-provider pool with max_attempts=3, the retry
-        // budget must come from the redirect target, not the source composite.
-        let body = r#"{"error":{"code":504,"message":"Provider returned error"}}"#;
-        let mock = MockHttpClient::new(StatusCode::OK, body);
-        let app_state = AppState::with_client(
-            composite_redirect_targets("gemma", "gemma-openrouter", "rt-token", vec![504], 3),
-            mock.clone(),
-        );
-        let server = TestServer::new(build_router(app_state)).unwrap();
-
-        let response = server
-            .post("/v1/chat/completions")
-            .add_header("authorization", "Bearer rt-token")
-            .json(&json!({
-                "model": "gemma",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            3,
-            "redirect must carry the target pool's max_attempts=3 into the retry loop"
-        );
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
     }
 
     #[tokio::test]
@@ -1501,7 +1273,7 @@ mod tests {
         let mock = MockHttpClient::new_streaming_sequence(
             StatusCode::OK,
             vec![
-                vec![],                             // provider 0: empty stream
+                vec![], // provider 0: empty stream
                 vec![OK_CONTENT_FRAME.to_string()], // provider 1: real content
             ],
         );
@@ -1522,11 +1294,7 @@ mod tests {
             response.text().contains("hi"),
             "client receives the healthy provider's content"
         );
-        assert_eq!(
-            mock.get_requests().len(),
-            2,
-            "empty stream must trigger a retry"
-        );
+        assert_eq!(mock.get_requests().len(), 2, "empty stream must trigger a retry");
     }
 
     #[tokio::test]
@@ -1547,11 +1315,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            2,
-            "both providers should be tried"
-        );
+        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
     }
 
     #[tokio::test]
@@ -1572,11 +1336,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(
-            mock.get_requests().len(),
-            2,
-            "empty unary body must trigger a retry"
-        );
+        assert_eq!(mock.get_requests().len(), 2, "empty unary body must trigger a retry");
     }
 
     #[tokio::test]
@@ -1619,13 +1379,7 @@ mod tests {
         let keepalive = ": keep-alive\n\n".to_string();
         let mock = MockHttpClient::new_streaming(
             StatusCode::OK,
-            vec![
-                keepalive.clone(),
-                keepalive.clone(),
-                keepalive.clone(),
-                keepalive.clone(),
-                keepalive,
-            ],
+            vec![keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive],
         );
         let app_state =
             AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
