@@ -86,8 +86,10 @@ pub async fn models_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<ChatCompletionRequest>,
+    Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response {
+    request.scrub_request_id_fields();
+
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
 
@@ -164,7 +166,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let extensions = std::mem::take(&mut parts.extensions);
     let req = Request::from_parts(parts, body);
 
-    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+    let mut request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
             error!(error = %e, "Failed to parse responses request");
@@ -175,6 +177,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
             );
         }
     };
+    request.scrub_request_id_fields();
 
     debug!(
         model = %request.model,
@@ -2591,6 +2594,81 @@ mod tests {
         assert!(!body_str.contains("cost"));
         assert!(!body_str.contains("internal_id"));
         assert!(!body_str.contains("custom_field"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_chat_request_scrubs_request_id_fields_before_forwarding() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1677652288,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello!"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "id": "chatcmpl-client-leak",
+            "completion_id": "cmpl-client-leak",
+            "completionId": "cmplClientLeak",
+            "response_id": "resp_client_leak",
+            "responseId": "respClientLeak",
+            "provider_extension": "preserve-me",
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let forwarded_object = forwarded_json.as_object().unwrap();
+
+        assert!(!forwarded_object.contains_key("id"));
+        assert!(!forwarded_object.contains_key("completion_id"));
+        assert!(!forwarded_object.contains_key("completionId"));
+        assert!(!forwarded_object.contains_key("response_id"));
+        assert!(!forwarded_object.contains_key("responseId"));
+        assert_eq!(forwarded_json["provider_extension"], "preserve-me");
     }
 
     /// Test that strict mode rewrites the model field to match the requested model
@@ -5468,6 +5546,102 @@ mod tests {
             "Optional 'status' field should not be present when omitted in request, found: {:?}",
             message_item
         );
+    }
+
+    #[tokio::test]
+    async fn test_responses_api_request_scrubs_request_id_fields_before_forwarding() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 1234567890,
+            "completed_at": 1234567900,
+            "status": "completed",
+            "incomplete_details": null,
+            "model": "gpt-4o",
+            "previous_response_id": "resp_previous",
+            "instructions": null,
+            "output": [],
+            "error": null,
+            "tools": [],
+            "tool_choice": "auto",
+            "truncation": "disabled",
+            "parallel_tool_calls": true,
+            "text": { "format": { "type": "text" } },
+            "top_p": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "top_logprobs": 0,
+            "temperature": 1.0,
+            "reasoning": null,
+            "usage": null,
+            "max_output_tokens": null,
+            "max_tool_calls": null,
+            "store": false,
+            "background": false,
+            "service_tier": "default",
+            "metadata": null,
+            "safety_identifier": null,
+            "prompt_cache_key": null
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+
+        let request_body = r#"{
+            "id": "resp_client_leak",
+            "completion_id": "cmpl-client-leak",
+            "completionId": "cmplClientLeak",
+            "response_id": "resp_client_leak_2",
+            "responseId": "respClientLeak2",
+            "provider_extension": "preserve-me",
+            "model": "gpt-4o",
+            "previous_response_id": "resp_previous",
+            "input": "Hello"
+        }"#;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let forwarded_object = forwarded_json.as_object().unwrap();
+
+        assert!(!forwarded_object.contains_key("id"));
+        assert!(!forwarded_object.contains_key("completion_id"));
+        assert!(!forwarded_object.contains_key("completionId"));
+        assert!(!forwarded_object.contains_key("response_id"));
+        assert!(!forwarded_object.contains_key("responseId"));
+        assert_eq!(forwarded_json["previous_response_id"], "resp_previous");
+        assert_eq!(forwarded_json["provider_extension"], "preserve-me");
     }
 
     /// Test that unknown item types preserve their original payload
