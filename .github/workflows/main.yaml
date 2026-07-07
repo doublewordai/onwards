@@ -15,7 +15,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run Tests
-        run: cargo test --verbose
+        # --all-features so the optional `multi-step` surface (fusillade
+        # integration) is compiled and tested in CI, not just default features.
+        run: cargo test --all-features --verbose
 
   docker:
     needs: test
