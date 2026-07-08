@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.5](https://github.com/doublewordai/onwards/compare/v0.34.4...v0.34.5) - 2026-07-08
+
+### Fixed
+
+- forward Responses text format to chat completions ([#244](https://github.com/doublewordai/onwards/pull/244))
+
 ## [0.34.4](https://github.com/doublewordai/onwards/compare/v0.34.3...v0.34.4) - 2026-07-07
 
 ### Added
