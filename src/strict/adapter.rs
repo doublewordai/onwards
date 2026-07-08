@@ -9,7 +9,7 @@
 
 use super::schemas::chat_completions::{
     ChatCompletionRequest, ChatCompletionResponse, ChatMessage, Choice, FunctionCall,
-    MessageContent, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
+    MessageContent, ResponseFormat, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
 };
 use super::schemas::responses::{
     ContentPart, FunctionCallItem, Input, Item, ItemStatus,
@@ -134,7 +134,7 @@ impl OpenResponsesAdapter {
             tools,
             tool_choice,
             parallel_tool_calls: request.parallel_tool_calls,
-            response_format: None, // TODO: Convert text.format
+            response_format: convert_text_format_to_response_format(request.text.as_ref()),
             service_tier: None,
             extra: None,
         })
@@ -762,6 +762,27 @@ fn generate_item_id() -> String {
     format!("item_{:016x}", count)
 }
 
+fn convert_text_format_to_response_format(text: Option<&TextConfig>) -> Option<ResponseFormat> {
+    let format = text?.format.as_ref()?;
+    let mut value = serde_json::to_value(format).ok()?;
+    let format_type = value.get("type")?.as_str()?.to_string();
+
+    match format_type.as_str() {
+        "json_object" => Some(ResponseFormat {
+            format_type,
+            json_schema: None,
+        }),
+        "json_schema" => {
+            value.as_object_mut()?.remove("type");
+            Some(ResponseFormat {
+                format_type,
+                json_schema: Some(value),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::schemas::responses::{
@@ -906,6 +927,76 @@ mod tests {
         assert_eq!(chat_request.messages[1].role, "user");
         assert_eq!(chat_request.temperature, Some(0.7));
         assert_eq!(chat_request.max_tokens, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_adapter_converts_json_schema_text_format_to_response_format() {
+        let adapter = create_test_adapter();
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Return product data",
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "product_info",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "required": ["title"],
+                        "properties": {
+                            "title": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let chat_request = adapter.to_chat_request(&request).await.unwrap();
+        let response_format = chat_request
+            .response_format
+            .expect("json_schema text format should be forwarded");
+
+        assert_eq!(response_format.format_type, "json_schema");
+        assert_eq!(
+            response_format.json_schema,
+            Some(serde_json::json!({
+                "name": "product_info",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "required": ["title"],
+                    "properties": {
+                        "title": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adapter_converts_json_object_text_format_to_response_format() {
+        let adapter = create_test_adapter();
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Return JSON",
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
+            }
+        }))
+        .unwrap();
+
+        let chat_request = adapter.to_chat_request(&request).await.unwrap();
+        let response_format = chat_request
+            .response_format
+            .expect("json_object text format should be forwarded");
+
+        assert_eq!(response_format.format_type, "json_object");
+        assert_eq!(response_format.json_schema, None);
     }
 
     #[test]
