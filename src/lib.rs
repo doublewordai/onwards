@@ -3194,8 +3194,10 @@ mod tests {
             let router = build_router(app_state);
             let server = TestServer::new(router).unwrap();
 
-            // Make multiple requests
-            for _ in 0..20 {
+            // Make enough requests that a 3:1 weighted random pool should
+            // reliably favor the high-weight provider without making the test
+            // expensive.
+            for _ in 0..100 {
                 let response = server
                     .post("/v1/chat/completions")
                     .json(&json!({
@@ -3208,7 +3210,7 @@ mod tests {
             }
 
             let requests = mock_client.get_requests();
-            assert_eq!(requests.len(), 20);
+            assert_eq!(requests.len(), 100);
 
             // Count requests to each provider (URI is the full path, check if it contains the host)
             let high_weight_count = requests
