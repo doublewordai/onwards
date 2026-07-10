@@ -978,8 +978,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade"
-version = "21.0.0"
-source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
+version = "21.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5d04f5b7ddafc991a80fd3e5d4988efaf6af791e3b8ea5557232f462eafdf35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1011,8 +1012,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-arsenal"
-version = "1.0.0"
-source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06df8fb12fcaa31fd34880a656abf9292dbb98ee8d9109164f9295e2f1ffcc6a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1039,7 +1041,8 @@ dependencies = [
 [[package]]
 name = "fusillade-core"
 version = "1.0.0"
-source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "523273ae988756dd1260bba667af3f078df2e1171d798f3c06655d91052127b8"
 dependencies = [
  "anyhow",
  "async-trait",
