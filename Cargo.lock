@@ -978,15 +978,16 @@ dependencies = [
 
 [[package]]
 name = "fusillade"
-version = "20.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3cb6b150ddc665bd22fa4255e9eb07e6267643c7c58077f1138a8056d7c8563f"
+version = "21.0.0"
+source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "dashmap",
  "eventsource-stream",
+ "fusillade-arsenal",
+ "fusillade-core",
  "futures",
  "hostname",
  "humantime",
@@ -999,14 +1000,57 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
- "sqlx",
- "sqlx-pool-router",
  "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade-arsenal"
+version = "1.0.0"
+source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "either",
+ "fusillade-core",
+ "futures",
+ "humantime",
+ "metrics",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "sqlx-pool-router",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade-core"
+version = "1.0.0"
+source = "git+https://github.com/doublewordai/fusillade?tag=fusillade-v21.0.0#87f4f493a164c94328a0708c41491f3c133aab3b"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
