@@ -439,8 +439,12 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
 
-        if is_streaming || response_is_sse {
+        if (is_streaming || response_is_sse)
+            && crate::stream_continuation::has_identity_content_encoding(response.headers())
+        {
             sanitize_streaming_completions_response(response, resolved_model, trusted).await
+        } else if is_streaming || response_is_sse {
+            response
         } else {
             sanitize_completions_response(response, resolved_model).await
         }
@@ -1238,7 +1242,13 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
     }
 
     let request = match request_builder.body(Body::from(body_bytes)) {
-        Ok(req) => req,
+        Ok(mut req) => {
+            if path == "/completions" {
+                req.extensions_mut()
+                    .insert(crate::handlers::CanonicalRequestPath("/v1/completions"));
+            }
+            req
+        }
         Err(e) => {
             error!(error = %e, "Failed to build request");
             let response = error_response(

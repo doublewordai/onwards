@@ -1,9 +1,15 @@
-use axum::{body::Body, http::Method};
+use axum::{
+    body::Body,
+    http::{
+        HeaderMap, Method,
+        header::{CONTENT_ENCODING, CONTENT_TYPE},
+    },
+};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::client::HttpClient;
 use crate::handlers::{UpstreamRequestMetadata, build_upstream_request};
@@ -23,6 +29,30 @@ pub struct CompletionContinuation {
     id: Option<Value>,
     model: Option<Value>,
     created: Option<Value>,
+    identity_established: bool,
+}
+
+pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
+    let mut content_types = headers.get_all(CONTENT_TYPE).iter();
+    let (Some(content_type), None) = (content_types.next(), content_types.next()) else {
+        return false;
+    };
+    content_type
+        .to_str()
+        .ok()
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+pub(crate) fn has_identity_content_encoding(headers: &HeaderMap) -> bool {
+    let mut encodings = headers.get_all(CONTENT_ENCODING).iter();
+    match (encodings.next(), encodings.next()) {
+        (None, None) => true,
+        (Some(value), None) => value
+            .to_str()
+            .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity")),
+        _ => false,
+    }
 }
 
 /// The forwarded SSE event and whether the stream reached a terminal state.
@@ -83,6 +113,14 @@ impl CompletionContinuation {
             return None;
         }
 
+        let fallback_model = request
+            .get("model")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let fallback_created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         Some(Self {
             request,
             prompt,
@@ -90,9 +128,10 @@ impl CompletionContinuation {
             max_buffered_bytes: config.max_buffered_bytes,
             continuable: true,
             terminal: false,
-            id: None,
-            model: None,
-            created: None,
+            id: Some(Value::String(format!("cmpl-{}", uuid::Uuid::new_v4()))),
+            model: Some(fallback_model),
+            created: Some(Value::from(fallback_created)),
+            identity_established: false,
         })
     }
 
@@ -150,8 +189,8 @@ impl CompletionContinuation {
             CompletionEvent::Recognized { text, terminal } => (text, terminal),
         };
 
-        if !rewrite_identity {
-            self.capture_identity(&completion);
+        if !rewrite_identity && !self.identity_established {
+            self.establish_identity(&completion);
         }
 
         if let Some(text) = text {
@@ -161,12 +200,8 @@ impl CompletionContinuation {
             self.terminal = true;
         }
 
-        let event = if rewrite_identity {
-            self.rewrite_identity(&mut completion);
-            Bytes::from(serialize_sse(&completion)?)
-        } else {
-            Bytes::copy_from_slice(event)
-        };
+        self.rewrite_identity(&mut completion);
+        let event = Bytes::from(serialize_sse(&completion)?);
         Ok(EventObservation {
             event,
             terminal: self.terminal,
@@ -214,16 +249,17 @@ impl CompletionContinuation {
         self.generated_text.push_str(text);
     }
 
-    fn capture_identity(&mut self, completion: &Value) {
-        if self.id.is_none() {
-            self.id = completion.get("id").cloned();
-        }
-        if self.model.is_none() {
-            self.model = completion.get("model").cloned();
-        }
-        if self.created.is_none() {
-            self.created = completion.get("created").cloned();
-        }
+    fn establish_identity(&mut self, completion: &Value) {
+        self.id = completion.get("id").cloned().or_else(|| self.id.take());
+        self.model = completion
+            .get("model")
+            .cloned()
+            .or_else(|| self.model.take());
+        self.created = completion
+            .get("created")
+            .cloned()
+            .or_else(|| self.created.take());
+        self.identity_established = true;
     }
 
     fn rewrite_identity(&self, completion: &mut Value) {
@@ -499,12 +535,7 @@ where
                     }
                     break;
                 }
-                let is_sse = response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|value| value.contains("text/event-stream"));
-                if !is_sse {
+                if !is_event_stream(response.headers()) {
                     drop(response);
                     drop(guard);
                     metrics::counter!(
@@ -512,7 +543,17 @@ where
                         "reason" => "content_type"
                     )
                     .increment(1);
-                    break;
+                    continue;
+                }
+                if !has_identity_content_encoding(response.headers()) {
+                    drop(response);
+                    drop(guard);
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "content_encoding"
+                    )
+                    .increment(1);
+                    continue;
                 }
 
                 next_body = Some(response.into_body());
@@ -837,13 +878,18 @@ mod tests {
     }
 
     #[test]
-    fn event_observation_exposes_original_event_when_no_identity_rewrite_is_requested() {
+    fn initial_recognized_event_receives_stable_fallback_identity() {
         let mut state = eligible_state(1024);
         let event = br#"data: {"choices":[{"text":"hello","finish_reason":null}]}
 
 "#;
         let observation = state.observe_event(event, false).unwrap();
-        assert_eq!(observation.event.as_ref(), event);
+        let rewritten: Value =
+            serde_json::from_slice(&observation.event[6..observation.event.len() - 2]).unwrap();
+        assert!(rewritten["id"].as_str().unwrap().starts_with("cmpl-"));
+        assert_eq!(rewritten["model"], "requested-m");
+        assert!(rewritten["created"].is_u64());
+        assert_eq!(rewritten["choices"][0]["text"], "hello");
         assert!(!observation.terminal);
     }
 
@@ -895,9 +941,9 @@ mod tests {
     }
 
     #[test]
-    fn continuation_events_do_not_fill_missing_initial_identity() {
+    fn missing_initial_identity_is_stable_across_continuations() {
         let mut state = eligible_state(1024);
-        state
+        let initial = state
             .observe_event(
                 br#"data: {"id":"cmpl-first","choices":[{"text":"one","finish_reason":null}]}
 
@@ -905,6 +951,8 @@ mod tests {
                 false,
             )
             .unwrap();
+        let initial: Value =
+            serde_json::from_slice(&initial.event[6..initial.event.len() - 2]).unwrap();
 
         for (model, created) in [("provider-a", 2), ("provider-b", 3)] {
             let event = format!(
@@ -914,9 +962,31 @@ mod tests {
             let rewritten: Value =
                 serde_json::from_slice(&observation.event[6..observation.event.len() - 2]).unwrap();
             assert_eq!(rewritten["id"], "cmpl-first");
-            assert_eq!(rewritten["model"], model);
-            assert_eq!(rewritten["created"], created);
+            assert_eq!(rewritten["model"], initial["model"]);
+            assert_eq!(rewritten["created"], initial["created"]);
         }
+    }
+
+    #[test]
+    fn response_representation_checks_are_exact_and_case_insensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "content-type",
+            "Text/Event-Stream; charset=utf-8".parse().unwrap(),
+        );
+        assert!(is_event_stream(&headers));
+        assert!(has_identity_content_encoding(&headers));
+
+        headers.insert(CONTENT_ENCODING, "IDENTITY".parse().unwrap());
+        assert!(has_identity_content_encoding(&headers));
+
+        headers.insert(
+            "content-type",
+            "application/x-text/event-streamish".parse().unwrap(),
+        );
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(!is_event_stream(&headers));
+        assert!(!has_identity_content_encoding(&headers));
     }
 
     #[test]

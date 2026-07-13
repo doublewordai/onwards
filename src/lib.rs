@@ -661,7 +661,20 @@ pub mod test_utils {
     #[derive(Clone)]
     pub struct MockStreamingResponse {
         pub status: StatusCode,
+        pub content_type: Option<String>,
+        pub headers: Vec<(String, String)>,
         pub events: Vec<MockStreamEvent>,
+    }
+
+    impl MockStreamingResponse {
+        pub fn sse(status: StatusCode, events: Vec<MockStreamEvent>) -> Self {
+            Self {
+                status,
+                content_type: Some("text/event-stream".to_string()),
+                headers: Vec::new(),
+                events,
+            }
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -762,6 +775,8 @@ pub mod test_utils {
                         .cloned()
                         .unwrap_or(MockStreamingResponse {
                             status: StatusCode::OK,
+                            content_type: Some("text/event-stream".to_string()),
+                            headers: Vec::new(),
                             events: Vec::new(),
                         });
                     let mut events = VecDeque::from(response.events);
@@ -779,13 +794,17 @@ pub mod test_utils {
                         None => Poll::Ready(None),
                     });
 
-                    axum::response::Response::builder()
+                    let mut builder = axum::response::Response::builder()
                         .status(response.status)
-                        .header("content-type", "text/event-stream")
                         .header("cache-control", "no-cache")
-                        .header("connection", "keep-alive")
-                        .body(Body::from_stream(stream))
-                        .unwrap()
+                        .header("connection", "keep-alive");
+                    if let Some(content_type) = response.content_type {
+                        builder = builder.header("content-type", content_type);
+                    }
+                    for (name, value) in response.headers {
+                        builder = builder.header(name, value);
+                    }
+                    builder.body(Body::from_stream(stream)).unwrap()
                 }),
             }
         }
@@ -1205,12 +1224,23 @@ mod tests {
         provider_models: &[Option<&str>],
         fallback: FallbackConfig,
     ) -> target::Targets {
+        stream_continuation_targets_with_options(alias, provider_models, fallback, false, false)
+    }
+
+    fn stream_continuation_targets_with_options(
+        alias: &str,
+        provider_models: &[Option<&str>],
+        fallback: FallbackConfig,
+        strict_mode: bool,
+        sanitize_response: bool,
+    ) -> target::Targets {
         let providers = provider_models
             .iter()
             .enumerate()
             .map(|(i, model)| {
                 let builder = Target::builder()
-                    .url(format!("https://stream-{i}.example.com/").parse().unwrap());
+                    .url(format!("https://stream-{i}.example.com/").parse().unwrap())
+                    .sanitize_response(sanitize_response);
                 let target = match model {
                     Some(model) => builder.onwards_model((*model).to_string()).build(),
                     None => builder.build(),
@@ -1235,9 +1265,19 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
+            strict_mode,
             http_pool_config: None,
         }
+    }
+
+    fn strict_stream_continuation_router(
+        targets: target::Targets,
+        mock: MockHttpClient,
+    ) -> axum::Router {
+        axum::Router::new().nest(
+            "/v1",
+            crate::strict::build_strict_router(AppState::with_client(targets, mock)),
+        )
     }
 
     fn stream_continuation_fallback(
@@ -1266,6 +1306,14 @@ mod tests {
         format!(
             "data: {{\"id\":\"{id}\",\"object\":\"text_completion\",\"created\":1,\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"text\":{text:?},\"finish_reason\":{finish_reason}}}]}}\n\n"
         )
+    }
+
+    fn completion_sse_values(body: &str) -> Vec<serde_json::Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
     }
 
     #[tokio::test]
@@ -1402,20 +1450,20 @@ mod tests {
         let first = completion_event("cmpl-first", "first", "Hello", "null");
         let second = completion_event("cmpl-second", "second", " world", "\"stop\"");
         let mock = MockHttpClient::new_streaming_response_sequence(vec![
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
                     MockStreamEvent::Data(first),
                     MockStreamEvent::Error("upstream reset".to_string()),
                 ],
-            },
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![
+            ),
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
                     MockStreamEvent::Data(second),
                     MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
                 ],
-            },
+            ),
         ]);
         let targets = stream_continuation_targets(
             "requested-model",
@@ -1475,20 +1523,20 @@ mod tests {
         let first = completion_event("cmpl-first", "first", "Hello", "null");
         let second = completion_event("cmpl-second", "second", " world", "null");
         let mock = MockHttpClient::new_streaming_response_sequence(vec![
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
                     MockStreamEvent::Data(first),
                     MockStreamEvent::Error("first reset".to_string()),
                 ],
-            },
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![
+            ),
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
                     MockStreamEvent::Data(second),
                     MockStreamEvent::Error("final reset".to_string()),
                 ],
-            },
+            ),
         ]);
         let targets = stream_continuation_targets(
             "requested-model",
@@ -1524,12 +1572,14 @@ mod tests {
         let first = completion_event("cmpl-first", "first", "Hello", "null");
         let second = completion_event("cmpl-second", "second", " world", "\"stop\"");
         let mock = MockHttpClient::new_streaming_response_sequence(vec![
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![MockStreamEvent::Data(first), MockStreamEvent::Pending],
+            ),
             MockStreamingResponse {
                 status: StatusCode::OK,
-                events: vec![MockStreamEvent::Data(first), MockStreamEvent::Pending],
-            },
-            MockStreamingResponse {
-                status: StatusCode::OK,
+                content_type: Some("text/event-stream".to_string()),
+                headers: vec![("x-upstream".to_string(), "continuation".to_string())],
                 events: vec![
                     MockStreamEvent::Data(second),
                     MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
@@ -1650,21 +1700,15 @@ mod tests {
         let first = completion_event("cmpl-first", "provider-b", "Hello", "null");
         let second = completion_event("cmpl-second", "provider-a", " world", "\"stop\"");
         let mock = MockHttpClient::new_streaming_response_sequence(vec![
-            MockStreamingResponse {
-                status: StatusCode::BAD_GATEWAY,
-                events: Vec::new(),
-            },
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![MockStreamEvent::Data(first)],
-            },
-            MockStreamingResponse {
-                status: StatusCode::OK,
-                events: vec![
+            MockStreamingResponse::sse(StatusCode::BAD_GATEWAY, Vec::new()),
+            MockStreamingResponse::sse(StatusCode::OK, vec![MockStreamEvent::Data(first)]),
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
                     MockStreamEvent::Data(second),
                     MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
                 ],
-            },
+            ),
         ]);
         let targets = stream_continuation_targets(
             "requested-model",
@@ -1685,6 +1729,362 @@ mod tests {
 
         assert!(response.text().contains(" world"));
         assert_eq!(mock.get_requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_requests_identity_and_clears_composite_framing() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let second = completion_event("cmpl-second", "second", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_response_sequence(vec![
+            MockStreamingResponse {
+                status: StatusCode::OK,
+                content_type: Some("Text/Event-Stream; charset=utf-8".to_string()),
+                headers: vec![
+                    ("content-length".to_string(), first.len().to_string()),
+                    ("content-encoding".to_string(), "IDENTITY".to_string()),
+                    ("x-upstream".to_string(), "initial".to_string()),
+                ],
+                events: vec![MockStreamEvent::Data(first)],
+            },
+            MockStreamingResponse {
+                status: StatusCode::OK,
+                content_type: Some("text/event-stream".to_string()),
+                headers: vec![("x-upstream".to_string(), "continuation".to_string())],
+                events: vec![
+                    MockStreamEvent::Data(second),
+                    MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
+                ],
+            },
+        ]);
+        let targets = stream_continuation_targets(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+        );
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .header("accept-encoding", "gzip, br")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "requested-model",
+                    "prompt": "Say hello: ",
+                    "stream": true
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = build_router(AppState::with_client(targets, mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("x-upstream").unwrap(), "initial");
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-cache");
+        assert!(response.headers().get("content-length").is_none());
+        assert!(response.headers().get("content-encoding").is_none());
+        assert!(response.headers().get("transfer-encoding").is_none());
+        assert!(response.headers().get("connection").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" world"));
+
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            assert_eq!(
+                request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "accept-encoding")
+                    .map(|(_, value)| value.as_str()),
+                Some("identity")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_preserves_encoded_initial_response_unwrapped() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let mock = MockHttpClient::new_streaming_response_sequence(vec![MockStreamingResponse {
+            status: StatusCode::OK,
+            content_type: Some("text/event-stream".to_string()),
+            headers: vec![
+                ("content-encoding".to_string(), "gzip".to_string()),
+                ("content-length".to_string(), first.len().to_string()),
+            ],
+            events: vec![MockStreamEvent::Data(first.clone())],
+        }]);
+        let targets = stream_continuation_targets(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+        );
+        let request = axum::extract::Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({"model":"requested-model","prompt":"P: ","stream":true}).to_string(),
+            ))
+            .unwrap();
+
+        let response = build_router(AppState::with_client(targets, mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            first.len().to_string().as_str()
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.as_ref(), first.as_bytes());
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_rejects_encoded_and_lookalike_continuations() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let encoded = completion_event("cmpl-encoded", "encoded", " encoded", "null");
+        let lookalike = completion_event("cmpl-lookalike", "lookalike", " lookalike", "null");
+        let final_event = completion_event("cmpl-final", "final", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_response_sequence(vec![
+            MockStreamingResponse::sse(StatusCode::OK, vec![MockStreamEvent::Data(first)]),
+            MockStreamingResponse {
+                status: StatusCode::OK,
+                content_type: Some("text/event-stream".to_string()),
+                headers: vec![("content-encoding".to_string(), "br".to_string())],
+                events: vec![MockStreamEvent::Data(encoded)],
+            },
+            MockStreamingResponse {
+                status: StatusCode::OK,
+                content_type: Some("application/x-text/event-streamish".to_string()),
+                headers: Vec::new(),
+                events: vec![MockStreamEvent::Data(lookalike)],
+            },
+            MockStreamingResponse {
+                status: StatusCode::OK,
+                content_type: Some("TEXT/EVENT-STREAM; CHARSET=UTF-8".to_string()),
+                headers: Vec::new(),
+                events: vec![
+                    MockStreamEvent::Data(final_event),
+                    MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
+                ],
+            },
+        ]);
+        let targets = stream_continuation_targets(
+            "requested-model",
+            &[None, None, None, None],
+            stream_continuation_fallback(true, 2, 3, None, vec!["/v1/completions"]),
+        );
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+        let body = response.text();
+
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" world"));
+        assert!(!body.contains(" encoded"));
+        assert!(!body.contains(" lookalike"));
+        assert_eq!(mock.get_requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_initial_lookalike_media_type_is_not_wrapped() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let mock = MockHttpClient::new_streaming_response_sequence(vec![MockStreamingResponse {
+            status: StatusCode::OK,
+            content_type: Some("application/x-text/event-streamish".to_string()),
+            headers: Vec::new(),
+            events: vec![MockStreamEvent::Data(first.clone())],
+        }]);
+        let targets = stream_continuation_targets(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+        );
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+
+        assert_eq!(response.text(), first);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_strict_mode_uses_external_completion_endpoint() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let second = completion_event("cmpl-second", "second", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![first], vec![second, "data: [DONE]\n\n".to_string()]],
+        );
+        let targets = stream_continuation_targets_with_options(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+            true,
+            false,
+        );
+        let server =
+            TestServer::new(strict_stream_continuation_router(targets, mock.clone())).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+        let body = response.text();
+
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" world"));
+        assert_eq!(mock.get_requests().len(), 2);
+        assert!(
+            mock.get_requests()
+                .iter()
+                .all(|request| request.uri.ends_with("/completions"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_non_strict_sanitizer_preserves_completion_text() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let second = completion_event("cmpl-second", "second", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![first], vec![second, "data: [DONE]\n\n".to_string()]],
+        );
+        let targets = stream_continuation_targets_with_options(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+            false,
+            true,
+        );
+        let state = AppState::with_client(targets, mock.clone())
+            .with_response_transform(create_openai_sanitizer());
+        let server = TestServer::new(build_router(state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+        let body = response.text();
+        let values = completion_sse_values(&body);
+        let text: String = values
+            .iter()
+            .filter_map(|value| value["choices"][0]["text"].as_str())
+            .collect();
+
+        assert_eq!(text, "Hello world");
+        assert!(body.contains("data: [DONE]"));
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_strict_missing_identity_stays_stable() {
+        let first = "data: {\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"Hello\",\"finish_reason\":null}]}\n\n".to_string();
+        let second = completion_event("cmpl-provider", "provider-model", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![first], vec![second, "data: [DONE]\n\n".to_string()]],
+        );
+        let targets = stream_continuation_targets_with_options(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+            true,
+            false,
+        );
+        let server =
+            TestServer::new(strict_stream_continuation_router(targets, mock.clone())).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+        let body = response.text();
+        let values = completion_sse_values(&body);
+        let ids: std::collections::HashSet<_> = values.iter().map(|value| &value["id"]).collect();
+        let models: std::collections::HashSet<_> =
+            values.iter().map(|value| &value["model"]).collect();
+        let created: std::collections::HashSet<_> =
+            values.iter().map(|value| &value["created"]).collect();
+
+        assert_eq!(ids.len(), 1);
+        assert_eq!(models.len(), 1);
+        assert_eq!(created.len(), 1);
+        assert_eq!(values[0]["model"], "requested-model");
+        assert_ne!(values[0]["id"], "cmpl-provider");
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_accumulates_bytes_across_two_body_failures() {
+        let first = completion_event("cmpl-first", "first", "Hello", "null");
+        let second = completion_event("cmpl-second", "second", " brave", "null");
+        let third = completion_event("cmpl-third", "third", " world", "\"stop\"");
+        let mock = MockHttpClient::new_streaming_response_sequence(vec![
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
+                    MockStreamEvent::Data(first),
+                    MockStreamEvent::Error("first reset".to_string()),
+                ],
+            ),
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
+                    MockStreamEvent::Data(second),
+                    MockStreamEvent::Error("second reset".to_string()),
+                ],
+            ),
+            MockStreamingResponse::sse(
+                StatusCode::OK,
+                vec![
+                    MockStreamEvent::Data(third),
+                    MockStreamEvent::Data("data: [DONE]\n\n".to_string()),
+                ],
+            ),
+        ]);
+        let targets = stream_continuation_targets(
+            "requested-model",
+            &[None, None, None],
+            stream_continuation_fallback(true, 2, 2, None, vec!["/v1/completions"]),
+        );
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({"model":"requested-model","prompt":"P: ","stream":true}))
+            .await;
+        let body = response.text();
+        let requests = mock.get_requests();
+
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" brave"));
+        assert!(body.contains(" world"));
+        assert_eq!(requests.len(), 3);
+        let third_body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        assert_eq!(third_body["prompt"], "P: Hello brave");
     }
 
     /// Retry on an upstream 429. Used by the embedded-error tests below.
@@ -1720,7 +2120,11 @@ mod tests {
             503,
             "exhausted retries must surface a sanitized 503, not the upstream 429"
         );
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1776,7 +2180,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1823,7 +2231,7 @@ mod tests {
         let mock = MockHttpClient::new_streaming_sequence(
             StatusCode::OK,
             vec![
-                vec![], // provider 0: empty stream
+                vec![],                             // provider 0: empty stream
                 vec![OK_CONTENT_FRAME.to_string()], // provider 1: real content
             ],
         );
@@ -1844,7 +2252,11 @@ mod tests {
             response.text().contains("hi"),
             "client receives the healthy provider's content"
         );
-        assert_eq!(mock.get_requests().len(), 2, "empty stream must trigger a retry");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "empty stream must trigger a retry"
+        );
     }
 
     #[tokio::test]
@@ -1865,7 +2277,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "both providers should be tried");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
     }
 
     #[tokio::test]
@@ -1886,7 +2302,11 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 503);
-        assert_eq!(mock.get_requests().len(), 2, "empty unary body must trigger a retry");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "empty unary body must trigger a retry"
+        );
     }
 
     #[tokio::test]
@@ -1929,7 +2349,13 @@ mod tests {
         let keepalive = ": keep-alive\n\n".to_string();
         let mock = MockHttpClient::new_streaming(
             StatusCode::OK,
-            vec![keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive.clone(), keepalive],
+            vec![
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive.clone(),
+                keepalive,
+            ],
         );
         let app_state =
             AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());

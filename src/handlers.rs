@@ -16,7 +16,10 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
-        header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+        header::{
+            ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, TRAILER,
+            TRANSFER_ENCODING,
+        },
     },
     response::{IntoResponse, Response},
 };
@@ -339,6 +342,9 @@ pub(crate) struct UpstreamRequestMetadata {
     pool_trusted: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct CanonicalRequestPath(pub(crate) &'static str);
+
 impl UpstreamRequestMetadata {
     fn new(method: Method, path_and_query: String, headers: HeaderMap, pool_trusted: bool) -> Self {
         Self {
@@ -354,6 +360,40 @@ impl UpstreamRequestMetadata {
         use tracing_opentelemetry::OpenTelemetrySpanExt;
         self.trace_context = Some(tracing::Span::current().context());
         self
+    }
+
+    fn with_identity_encoding(mut self) -> Self {
+        self.headers
+            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        self
+    }
+}
+
+fn clear_composite_representation_headers(headers: &mut HeaderMap) {
+    for name in [
+        CONTENT_LENGTH,
+        CONTENT_ENCODING,
+        CONTENT_RANGE,
+        TRANSFER_ENCODING,
+        TRAILER,
+    ] {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "upgrade",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "etag",
+        "accept-ranges",
+    ] {
+        headers.remove(name);
     }
 }
 
@@ -707,29 +747,41 @@ where
         .map(|v| v.as_str())
         .unwrap_or(req.uri().path())
         .to_string();
+    let canonical_request_path = req
+        .extensions()
+        .get::<CanonicalRequestPath>()
+        .map(|path| path.0)
+        .unwrap_or(req.uri().path())
+        .to_string();
+    let is_completion_path = canonical_request_path == "/v1/completions";
 
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
-    let request_metadata = UpstreamRequestMetadata::new(
-        method.clone(),
-        path_and_query.clone(),
-        original_headers.clone(),
-        pool.is_trusted(),
-    );
     let mut completion_continuation = pool
         .fallback()
         .filter(|fallback| fallback.enabled)
         .and_then(|fallback| fallback.stream_continuation.as_ref())
         .and_then(|config| {
             crate::stream_continuation::CompletionContinuation::from_request(
-                req.uri().path(),
+                &canonical_request_path,
                 &method,
                 &body_bytes,
                 config,
             )
             .map(|continuation| (continuation, config.clone()))
         });
+    let request_metadata = UpstreamRequestMetadata::new(
+        method.clone(),
+        path_and_query.clone(),
+        original_headers.clone(),
+        pool.is_trusted(),
+    );
+    let request_metadata = if completion_continuation.is_some() {
+        request_metadata.with_identity_encoding()
+    } else {
+        request_metadata
+    };
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
@@ -977,7 +1029,9 @@ where
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let is_sse = content_type.contains("text/event-stream");
+        let is_sse = crate::stream_continuation::is_event_stream(response.headers());
+        let is_identity_encoded =
+            crate::stream_continuation::has_identity_content_encoding(response.headers());
 
         // Some upstreams return HTTP 200 while embedding the
         // real error in the body — `{"error":{"code":429,...}}` for a unary
@@ -1015,6 +1069,7 @@ where
         }
         let scan: Scan2xx = if (200..300).contains(&status)
             && state.targets.strict_mode
+            && is_identity_encoded
         {
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
@@ -1205,10 +1260,12 @@ where
         }
 
         if is_sse
+            && is_identity_encoded
             && (200..300).contains(&status)
             && let Some((continuation, config)) = completion_continuation.take()
         {
-            let (parts, body) = response.into_parts();
+            let (mut parts, body) = response.into_parts();
+            clear_composite_representation_headers(&mut parts.headers);
             let body = crate::stream_continuation::wrap_completion_stream(
                 body,
                 connection_guard
@@ -1229,6 +1286,7 @@ where
         let needs_sse_buffering = !state.targets.strict_mode
             && state.response_transform_fn.is_some()
             && target.sanitize_response
+            && is_identity_encoded
             && (200..300).contains(&status);
 
         // Wrap SSE streams with buffering to ensure complete events (delimited by \n\n).
@@ -1250,6 +1308,7 @@ where
             && target.sanitize_response
             && (200..300).contains(&status)
             && !state.targets.strict_mode
+            && is_identity_encoded
         {
             debug!(
                 "Attempting response sanitization for status {}, path {}",
@@ -1276,7 +1335,12 @@ where
                     match chunk_result {
                         Ok(chunk) => {
                             // Sanitize this chunk
-                            match sanitizer.sanitize_streaming(&chunk) {
+                            let sanitized = if is_completion_path {
+                                sanitizer.sanitize_completion_streaming(&chunk)
+                            } else {
+                                sanitizer.sanitize_streaming(&chunk)
+                            };
+                            match sanitized {
                                 Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
                                 Ok(None) => Ok(chunk),
                                 Err(e) => {
