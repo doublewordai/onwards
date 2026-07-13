@@ -37,6 +37,11 @@ Controls automatic retry on other providers when requests fail:
 | `enabled` | bool | `false` | Master switch for fallback |
 | `on_status` | int[] | -- | Status codes that trigger fallback (supports wildcards) |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
+| `with_replacement` | bool | `false` | For `weighted_random`, allow a provider to be selected again |
+| `max_attempts` | int? | provider count | Maximum pre-response failover attempts |
+| `backoff` | object? | `null` | Delay between attempts; no delay when omitted |
+| `max_total_backoff_ms` | int? | `null` | Maximum cumulative time spent sleeping between attempts |
+| `stream_continuation` | object? | `null` | Best-effort continuation for eligible interrupted completion streams |
 
 Status code wildcards:
 
@@ -45,6 +50,75 @@ Status code wildcards:
 - `502` matches exact 502
 
 When fallback triggers, the next provider is selected based on strategy (weighted random resamples from remaining pool; priority uses definition order).
+
+### Stream continuation
+
+Stream continuation is opt-in and applies only to eligible `POST /v1/completions`
+streams. It forwards the already emitted text to another provider when the
+initial provider stops before sending a terminal event. The prefix is kept in
+memory for the lifetime of the request; it is not persisted and is lost if the
+process restarts. The output is best-effort: an interruption or exhausted
+continuation budget can leave the client with a partial stream, and the proxy
+does not synthesize a `[DONE]` event after exhaustion.
+
+Configure it inside `fallback`:
+
+```json
+{
+  "targets": {
+    "gpt-4-instruct": {
+      "fallback": {
+        "enabled": true,
+        "on_status": [429, 5],
+        "on_rate_limit": true,
+        "stream_continuation": {
+          "enabled": true,
+          "endpoints": ["/v1/completions"],
+          "max_attempts": 1,
+          "max_buffered_bytes": 1048576,
+          "idle_timeout_ms": 30000
+        }
+      },
+      "providers": [
+        { "url": "https://primary.example.com", "onwards_key": "sk-primary" },
+        { "url": "https://backup.example.com", "onwards_key": "sk-backup" }
+      ]
+    }
+  }
+}
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Enables continuation, subject to the parent `fallback.enabled` switch |
+| `endpoints` | string[] | `[]` | Exact request paths eligible for continuation; use `["/v1/completions"]` only |
+| `max_attempts` | int | `1` | Fresh post-commit continuation-attempt budget |
+| `max_buffered_bytes` | int | `1048576` | Maximum generated-text bytes retained for a continuation request |
+| `idle_timeout_ms` | int? | `null` | Maximum idle time between upstream stream events; `null` disables this timeout |
+
+`fallback.max_attempts` controls failover before the response starts and its
+headers are committed. `stream_continuation.max_attempts` is a separate, fresh
+budget after a successful stream has committed its response. Continuation
+reuses the parent fallback status matching, local rate-limit behavior, provider
+selection, request/header handling, and backoff settings, including
+`max_total_backoff_ms`.
+
+Only a narrow completion shape is supported: a string `prompt`, `stream: true`,
+`n` omitted or `1`, and `echo` omitted or `false`. Chat and Responses requests,
+tool-calling streams, structured-output streams, multi-choice requests, prompt
+token-array requests, and `echo: true` are unsupported and pass through without
+continuation. The upstream response must be a successful response with the
+exact `text/event-stream` media type (case-insensitive; parameters are allowed)
+and no content encoding or `Content-Encoding: identity`. An encoded stream is
+left untouched; an encoded or non-SSE continuation response is rejected rather
+than spliced into the client stream.
+
+The buffer cap is measured in UTF-8 bytes. Once appending a recognized text
+chunk would exceed the cap, continuation is disabled for that request and the
+overflow text is not retained. `idle_timeout_ms` applies between upstream
+events and treats an idle stream as interrupted. Final usage is forwarded from
+the provider that supplies the terminal stream; it is not aggregate usage or
+aggregate billing across the initial and continuation providers.
 
 ## Pool-level options
 
