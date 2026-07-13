@@ -57,6 +57,7 @@ pub mod response_id;
 pub mod response_loop;
 pub mod response_sanitizer;
 pub mod sse;
+pub mod stream_continuation;
 #[cfg(feature = "multi-step")]
 pub mod streaming;
 pub mod strict;
