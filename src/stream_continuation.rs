@@ -597,7 +597,7 @@ where
                     outcome = tracing::field::Empty,
                     http.response.status_code = tracing::field::Empty,
                 );
-                request_metadata.set_span_parent(&attempt_span);
+                let attempt_request_metadata = request_metadata.for_child_span(&attempt_span);
 
                 if target
                     .limiter
@@ -632,7 +632,7 @@ where
                 };
                 let (request, upstream_uri) = match build_upstream_request(
                     &target,
-                    &request_metadata,
+                    &attempt_request_metadata,
                     request_body,
                 ) {
                     Ok(request) => request,

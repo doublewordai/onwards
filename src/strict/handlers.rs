@@ -28,7 +28,7 @@ use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
 use crate::extract_model_from_request;
-use crate::handlers::{ResolvedTrust, target_message_handler};
+use crate::handlers::{ResolvedTrust, target_message_handler_with_continuation};
 use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
@@ -1212,7 +1212,7 @@ async fn forward_request_raw<T: HttpClient + Clone + Send + Sync + 'static>(
     };
 
     // Forward using the standard handler
-    match target_message_handler(State(state), request).await {
+    match target_message_handler_with_continuation(State(state), request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
@@ -1266,10 +1266,11 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
     };
 
     // Use the existing target message handler
-    let (response, internal_error) = match target_message_handler(State(state), request).await {
-        Ok(response) => (response, false),
-        Err(err) => (err.into_response(), true),
-    };
+    let (response, internal_error) =
+        match target_message_handler_with_continuation(State(state), request).await {
+            Ok(response) => (response, false),
+            Err(err) => (err.into_response(), true),
+        };
 
     let trusted = response
         .extensions()

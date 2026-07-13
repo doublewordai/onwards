@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add best-effort prefix continuation for eligible `/v1/completions` streams
 
+### Changed
+
+- **Rust API migration (next minor):** `FallbackConfig` now includes `stream_continuation`; callers using exhaustive struct literals must initialize it, usually with `None`
+
 ## [0.34.6](https://github.com/doublewordai/onwards/compare/v0.34.5...v0.34.6) - 2026-07-10
 
 ### Other

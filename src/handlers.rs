@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::load_balancer::ProviderPool;
 use crate::models::ListModelResponse;
-use crate::sse::CheckedSseStream;
+use crate::sse::{CheckedSseStream, SseStreamError};
 use crate::target::{ConcurrencyGuard, RoutingAction, Target};
 use axum::{
     Json,
@@ -377,11 +377,14 @@ impl UpstreamRequestMetadata {
         self
     }
 
-    pub(crate) fn set_span_parent(&self, span: &tracing::Span) {
+    pub(crate) fn for_child_span(&self, span: &tracing::Span) -> Self {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
         if let Some(parent) = self.trace_context.clone() {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
             let _ = span.set_parent(parent);
         }
+        let mut child = self.clone();
+        child.trace_context = Some(span.context());
+        child
     }
 
     fn with_identity_encoding(mut self) -> Self {
@@ -495,14 +498,97 @@ pub(crate) fn build_upstream_request(
     Ok((Request::from_parts(parts, body), upstream_uri))
 }
 
-/// The main handler responsible for forwarding requests to targets
+trait ContinuationBodyFactory<T: HttpClient> {
+    const ENABLED: bool;
+
+    fn wrap(
+        initial_body: axum::body::Body,
+        initial_guard: ConcurrencyGuard,
+        continuation: crate::stream_continuation::CompletionContinuation,
+        config: crate::target::StreamContinuationConfig,
+        pool: ProviderPool,
+        http_client: T,
+        request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body;
+}
+
+struct ContinuationDisabled;
+
+impl<T: HttpClient> ContinuationBodyFactory<T> for ContinuationDisabled {
+    const ENABLED: bool = false;
+
+    fn wrap(
+        _initial_body: axum::body::Body,
+        _initial_guard: ConcurrencyGuard,
+        _continuation: crate::stream_continuation::CompletionContinuation,
+        _config: crate::target::StreamContinuationConfig,
+        _pool: ProviderPool,
+        _http_client: T,
+        _request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body {
+        unreachable!("legacy handler never activates stream continuation")
+    }
+}
+
+struct ContinuationEnabled;
+
+impl<T> ContinuationBodyFactory<T> for ContinuationEnabled
+where
+    T: HttpClient + Send + 'static,
+{
+    const ENABLED: bool = true;
+
+    fn wrap(
+        initial_body: axum::body::Body,
+        initial_guard: ConcurrencyGuard,
+        continuation: crate::stream_continuation::CompletionContinuation,
+        config: crate::target::StreamContinuationConfig,
+        pool: ProviderPool,
+        http_client: T,
+        request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body {
+        crate::stream_continuation::wrap_completion_stream(
+            initial_body,
+            initial_guard,
+            continuation,
+            config,
+            pool,
+            http_client,
+            request_metadata,
+        )
+    }
+}
+
+/// Forward a request using the legacy public handler contract.
+///
+/// Stream continuation is installed by the supported router entry points,
+/// whose client bounds allow the client to live inside the downstream body.
+pub async fn target_message_handler<T: HttpClient>(
+    state: State<AppState<T>>,
+    req: axum::extract::Request,
+) -> Result<Response, OnwardsErrorResponse> {
+    target_message_handler_core::<T, ContinuationDisabled>(state, req).await
+}
+
+pub(crate) async fn target_message_handler_with_continuation<T>(
+    state: State<AppState<T>>,
+    req: axum::extract::Request,
+) -> Result<Response, OnwardsErrorResponse>
+where
+    T: HttpClient + Send + 'static,
+{
+    target_message_handler_core::<T, ContinuationEnabled>(state, req).await
+}
+
+/// The shared handler core responsible for forwarding requests to targets.
 /// TODO(fergus): Better error messages beyond raw status codes.
-pub async fn target_message_handler<T>(
+async fn target_message_handler_core<T, C>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
 ) -> Result<Response, OnwardsErrorResponse>
 where
-    T: HttpClient + Send + 'static,
+    T: HttpClient,
+    C: ContinuationBodyFactory<T>,
 {
     // Create the tracing span BEFORE entering it so that set_parent() correctly
     // updates the OTel parent context. With #[instrument], the OTel span is started
@@ -784,20 +870,23 @@ where
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
-    let mut completion_continuation = pool
-        .fallback()
-        .filter(|fallback| fallback.enabled)
-        .and_then(|fallback| fallback.stream_continuation.as_ref())
-        .and_then(|config| {
-            crate::stream_continuation::CompletionContinuation::from_request_with_resolved_model(
-                &canonical_request_path,
-                &method,
-                &body_bytes,
-                config,
-                Some(&model_name),
-            )
-            .map(|continuation| (continuation, config.clone()))
-        });
+    let mut completion_continuation = if C::ENABLED {
+        pool.fallback()
+            .filter(|fallback| fallback.enabled)
+            .and_then(|fallback| fallback.stream_continuation.as_ref())
+            .and_then(|config| {
+                crate::stream_continuation::CompletionContinuation::from_request_with_resolved_model(
+                    &canonical_request_path,
+                    &method,
+                    &body_bytes,
+                    config,
+                    Some(&model_name),
+                )
+                .map(|continuation| (continuation, config.clone()))
+            })
+    } else {
+        None
+    };
     let composite_response_policy = completion_continuation
         .as_ref()
         .map(|_| CompositeResponsePolicy::for_pool(&pool));
@@ -1120,6 +1209,10 @@ where
             /// 502. Keyed on stream termination, never a time budget, so a
             /// valid-but-slow stream is forwarded (Clean), not retried.
             EmptyBody,
+            /// Checked SSE framing failed before a content frame. The original
+            /// response is forwarded with its typed body error so neither the
+            /// pre-response fallback loop nor continuation can treat it as EOF.
+            Framing,
         }
         let scan: Scan2xx = if (200..300).contains(&status)
             && state.targets.strict_mode
@@ -1151,6 +1244,7 @@ where
                 // before any content — a *terminal* empty, safe to retry.
                 let mut saw_data = false;
                 let mut stream_ended = false;
+                let mut framing_failed = false;
                 let peek = async {
                     for _ in 0..SSE_PEEK_MAX_EVENTS {
                         match events.next().await {
@@ -1170,7 +1264,10 @@ where
                                 SseEventKind::Comment => peeked.push(Ok(chunk)),
                             },
                             Some(Err(e)) => {
-                                stream_ended = true;
+                                match &e {
+                                    SseStreamError::Source(_) => stream_ended = true,
+                                    SseStreamError::Framing(_) => framing_failed = true,
+                                }
                                 peeked.push(Err(e));
                                 break;
                             }
@@ -1192,6 +1289,8 @@ where
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
                 if let Some(status) = embedded {
                     Scan2xx::Embedded(status)
+                } else if framing_failed {
+                    Scan2xx::Framing
                 } else if !timed_out && stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A *timeout* (stream still open,
@@ -1310,6 +1409,13 @@ where
                 record_response_status(503);
                 return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
             }
+            Scan2xx::Framing => {
+                warn!(
+                    http_status = status,
+                    upstream = %target.url,
+                    "Upstream returned malformed SSE framing; forwarding the checked body error"
+                );
+            }
             Scan2xx::Clean => {}
         }
 
@@ -1322,7 +1428,7 @@ where
             let (mut parts, body) = response.into_parts();
             composite_content_type = parts.headers.get(CONTENT_TYPE).cloned();
             clear_composite_representation_headers(&mut parts.headers);
-            let body = crate::stream_continuation::wrap_completion_stream(
+            let body = C::wrap(
                 body,
                 connection_guard
                     .take()
@@ -1680,8 +1786,60 @@ mod tests {
     }
 
     #[test]
-    fn target_message_handler_accepts_non_clone_http_clients() {
-        let _handler = target_message_handler::<NonCloneHttpClient>;
+    fn target_message_handler_preserves_literal_http_client_bound() {
+        fn assert_literal_bound<T: HttpClient>() {
+            let _handler = target_message_handler::<T>;
+        }
+
+        assert_literal_bound::<NonCloneHttpClient>();
+    }
+
+    #[test]
+    fn continuation_attempt_metadata_injects_attempt_span_id() {
+        use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::prelude::*;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("continuation-attempt-metadata-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let mut inbound_headers = HeaderMap::new();
+        inbound_headers.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let parent_context = propagator.extract(&HeaderExtractor(&inbound_headers));
+        let metadata = UpstreamRequestMetadata {
+            method: Method::POST,
+            path_and_query: "/v1/completions".to_string(),
+            headers: HeaderMap::new(),
+            trace_context: Some(parent_context),
+            pool_trusted: false,
+        };
+        let attempt_span = tracing::info_span!("test.continuation_attempt");
+        let attempt_metadata = metadata.for_child_span(&attempt_span);
+        let attempt_context = attempt_span.context();
+        let attempt_span_context = attempt_context.span().span_context().clone();
+        let target = target_with_trace_flags(Some(false), Some(true));
+
+        let (request, _) =
+            build_upstream_request(&target, &attempt_metadata, bytes::Bytes::new()).unwrap();
+        let traceparent = request
+            .headers()
+            .get("traceparent")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let fields = traceparent.split('-').collect::<Vec<_>>();
+
+        assert_eq!(fields[1], attempt_span_context.trace_id().to_string());
+        assert_eq!(fields[2], attempt_span_context.span_id().to_string());
     }
 
     #[test]

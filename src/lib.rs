@@ -66,7 +66,7 @@ pub mod telemetry;
 pub mod traits;
 
 use client::{HttpClient, HyperClient};
-use handlers::{models as models_handler, target_message_handler};
+use handlers::{models as models_handler, target_message_handler_with_continuation};
 use models::ExtractedModel;
 #[cfg(feature = "multi-step")]
 pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
@@ -522,7 +522,7 @@ pub fn build_router<T: HttpClient + Clone + Send + Sync + 'static>(state: AppSta
     Router::new()
         .route("/models", get(models_handler))
         .route("/v1/models", get(models_handler))
-        .route("/{*path}", any(target_message_handler))
+        .route("/{*path}", any(target_message_handler_with_continuation))
         // The wildcard handler buffers the body itself (bounded by
         // `state.body_limit`), but raise the extractor-level default too so
         // any extractor-based route added later shares the same limit.
@@ -2489,6 +2489,47 @@ mod tests {
                     StatusCode::OK,
                     vec![MockStreamEvent::Data(first.clone()), tail],
                 ),
+                MockStreamingResponse::sse(
+                    StatusCode::OK,
+                    vec![MockStreamEvent::Data(fallback.clone())],
+                ),
+            ]);
+            let targets = stream_continuation_targets_with_options(
+                "requested-model",
+                &[None, None],
+                stream_continuation_fallback(true, 2, 1, None, vec!["/v1/completions"]),
+                true,
+                false,
+            );
+            let request = axum::extract::Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    json!({"model":"requested-model","prompt":"P: ","stream":true}).to_string(),
+                ))
+                .unwrap();
+
+            let response = strict_stream_continuation_router(targets, mock.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+
+            assert!(response.into_body().collect().await.is_err());
+            assert_eq!(mock.get_requests().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_strict_first_frame_framing_errors_never_retry() {
+        let fallback = completion_event("cmpl-second", "second", " leaked", "\"stop\"");
+
+        for first_event in [
+            MockStreamEvent::Data("data: incomplete".to_string()),
+            MockStreamEvent::Bytes(vec![b'x'; 64 * 1024 + 1]),
+        ] {
+            let mock = MockHttpClient::new_streaming_response_sequence(vec![
+                MockStreamingResponse::sse(StatusCode::OK, vec![first_event]),
                 MockStreamingResponse::sse(
                     StatusCode::OK,
                     vec![MockStreamEvent::Data(fallback.clone())],
