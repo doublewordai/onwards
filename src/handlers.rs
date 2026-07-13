@@ -15,7 +15,7 @@ use axum::{
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{CONTENT_LENGTH, TRANSFER_ENCODING},
     },
     response::{IntoResponse, Response},
@@ -192,7 +192,7 @@ impl Drop for InflightGuard {
 /// outlives the handler.
 struct GuardedStream<S> {
     inner: S,
-    _guard: ConcurrencyGuard,
+    _guard: Option<ConcurrencyGuard>,
     _inflight_guard: InflightGuard,
 }
 
@@ -330,12 +330,116 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     headers.insert("x-forwarded-proto", "https".parse().unwrap());
 }
 
+#[derive(Clone)]
+pub(crate) struct UpstreamRequestMetadata {
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    trace_context: Option<opentelemetry::Context>,
+    pool_trusted: bool,
+}
+
+impl UpstreamRequestMetadata {
+    fn new(method: Method, path_and_query: String, headers: HeaderMap, pool_trusted: bool) -> Self {
+        Self {
+            method,
+            path_and_query,
+            headers,
+            trace_context: None,
+            pool_trusted,
+        }
+    }
+
+    fn with_current_trace_context(mut self) -> Self {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.trace_context = Some(tracing::Span::current().context());
+        self
+    }
+}
+
+pub(crate) fn build_upstream_request(
+    target: &Target,
+    metadata: &UpstreamRequestMetadata,
+    body: bytes::Bytes,
+) -> Result<(Request, String), OnwardsErrorResponse> {
+    let request_path = metadata
+        .path_and_query
+        .strip_prefix('/')
+        .unwrap_or(&metadata.path_and_query);
+    let target_path = target.url.path().trim_end_matches('/');
+    let path_to_join = if !target_path.is_empty() && target_path != "/" {
+        let target_path_no_slash = &target_path[1..];
+        if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+            if rest.is_empty() || rest.starts_with('/') {
+                rest.strip_prefix('/').unwrap_or(rest)
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        }
+    } else {
+        request_path
+    };
+    let upstream_uri = target
+        .url
+        .join(path_to_join)
+        .map_err(|_| OnwardsErrorResponse::internal())?
+        .to_string();
+    let upstream_uri_parsed = Uri::try_from(&upstream_uri).map_err(|_| {
+        error!("Invalid URI: {}", upstream_uri);
+        OnwardsErrorResponse::internal()
+    })?;
+
+    let mut headers = metadata.headers.clone();
+    if let Some(host) = upstream_uri_parsed.host() {
+        let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
+            format!("{host}:{port}")
+        } else {
+            host.to_string()
+        };
+        headers.insert("host", host_value.parse().unwrap());
+    }
+    headers.insert(
+        CONTENT_LENGTH,
+        body.len()
+            .to_string()
+            .parse()
+            .expect("Content-Length should be valid"),
+    );
+    headers.remove(TRANSFER_ENCODING);
+    filter_headers_for_upstream(&mut headers, target);
+    if resolve_trace_propagation(target, metadata.pool_trusted) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let trace_context = metadata
+            .trace_context
+            .clone()
+            .unwrap_or_else(|| tracing::Span::current().context());
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        propagator.inject_context(&trace_context, &mut HeaderInjector(&mut headers));
+    } else {
+        withhold_trace_context(&mut headers);
+    }
+
+    let request = Request::builder()
+        .method(metadata.method.clone())
+        .uri(upstream_uri_parsed)
+        .body(axum::body::Body::from(body))
+        .map_err(|_| OnwardsErrorResponse::internal())?;
+    let (mut parts, body) = request.into_parts();
+    parts.headers = headers;
+    Ok((Request::from_parts(parts, body), upstream_uri))
+}
+
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
-pub async fn target_message_handler<T: HttpClient>(
+pub async fn target_message_handler<T>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
-) -> Result<Response, OnwardsErrorResponse> {
+) -> Result<Response, OnwardsErrorResponse>
+where
+    T: HttpClient + Clone + Send + Sync + 'static,
+{
     // Create the tracing span BEFORE entering it so that set_parent() correctly
     // updates the OTel parent context. With #[instrument], the OTel span is started
     // on the first enter() which happens before the function body runs — making
@@ -607,6 +711,25 @@ pub async fn target_message_handler<T: HttpClient>(
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
+    let request_metadata = UpstreamRequestMetadata::new(
+        method.clone(),
+        path_and_query.clone(),
+        original_headers.clone(),
+        pool.is_trusted(),
+    );
+    let mut completion_continuation = pool
+        .fallback()
+        .filter(|fallback| fallback.enabled)
+        .and_then(|fallback| fallback.stream_continuation.as_ref())
+        .and_then(|config| {
+            crate::stream_continuation::CompletionContinuation::from_request(
+                req.uri().path(),
+                &method,
+                &body_bytes,
+                config,
+            )
+            .map(|continuation| (continuation, config.clone()))
+        });
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
@@ -620,6 +743,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
     for (_idx, target, connection_guard) in pool.select_iter() {
+        let mut connection_guard = Some(connection_guard);
         any_attempted = true;
         attempt_number += 1;
 
@@ -709,97 +833,14 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Build the upstream URI for this target
-        let request_path = path_and_query.strip_prefix('/').unwrap_or(&path_and_query);
-        let target_path = target.url.path().trim_end_matches('/');
-
-        let path_to_join = if !target_path.is_empty() && target_path != "/" {
-            let target_path_no_slash = &target_path[1..];
-            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
-                if rest.is_empty() || rest.starts_with('/') {
-                    rest.strip_prefix('/').unwrap_or(rest)
-                } else {
-                    request_path
-                }
-            } else {
-                request_path
-            }
-        } else {
-            request_path
+        let (attempt_req, upstream_uri) = match build_upstream_request(
+            target,
+            &request_metadata,
+            attempt_body,
+        ) {
+            Ok(request) => request,
+            Err(error) => return LoopAction::Done(Err(error)),
         };
-
-        let upstream_uri = match target.url.join(path_to_join) {
-            Ok(url) => url.to_string(),
-            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-        };
-        let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
-            Ok(uri) => uri,
-            Err(_) => {
-                error!("Invalid URI: {}", upstream_uri);
-                return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
-            }
-        };
-
-        // Build request for this provider
-        let mut attempt_headers = original_headers.clone();
-
-        // Update host header
-        if let Some(host) = upstream_uri_parsed.host() {
-            let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
-                format!("{host}:{port}")
-            } else {
-                host.to_string()
-            };
-            attempt_headers.insert("host", host_value.parse().unwrap());
-        }
-
-        // Set Content-Length and remove Transfer-Encoding
-        attempt_headers.insert(
-            CONTENT_LENGTH,
-            attempt_body
-                .len()
-                .to_string()
-                .parse()
-                .expect("Content-Length should be valid"),
-        );
-        attempt_headers.remove(TRANSFER_ENCODING);
-
-        // Filter headers for upstream forwarding
-        filter_headers_for_upstream(&mut attempt_headers, target);
-
-        // Apply W3C trace-context policy for this upstream, gated on the
-        // per-target propagate_trace_context flag (defaults to the resolved
-        // trusted value).
-        //
-        // - Enabled: inject the current span context, propagating the trace to
-        //   upstreams that participate in our distributed tracing fabric
-        //   (typically self-hosted, marked trusted). inject_context overwrites
-        //   any inbound traceparent/tracestate.
-        // - Disabled: strip any *inbound* traceparent/tracestate so they are
-        //   not forwarded to an untrusted third party. These headers are not
-        //   in HEADERS_TO_STRIP (they're handled here, next to the inject
-        //   decision), so without this branch an inbound trace context from
-        //   the caller would pass straight through, defeating the opt-out and
-        //   letting the third party re-emit our trace IDs on its own outbound
-        //   calls.
-        if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            let ctx = tracing::Span::current().context();
-            let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
-            propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
-        } else {
-            withhold_trace_context(&mut attempt_headers);
-        }
-
-        // Build the request
-        let attempt_req = axum::extract::Request::builder()
-            .method(method.clone())
-            .uri(upstream_uri_parsed)
-            .body(axum::body::Body::from(attempt_body))
-            .unwrap();
-        let (mut parts, body) = attempt_req.into_parts();
-        parts.headers = attempt_headers;
-        let attempt_req = axum::extract::Request::from_parts(parts, body);
 
         trace!(
             "Outgoing request to provider:\n  URI: {}",
@@ -1161,6 +1202,25 @@ pub async fn target_message_handler<T: HttpClient>(
                 return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
             }
             Scan2xx::Clean => {}
+        }
+
+        if is_sse
+            && (200..300).contains(&status)
+            && let Some((continuation, config)) = completion_continuation.take()
+        {
+            let (parts, body) = response.into_parts();
+            let body = crate::stream_continuation::wrap_completion_stream(
+                body,
+                connection_guard
+                    .take()
+                    .expect("initial provider guard moved once"),
+                continuation,
+                config,
+                pool.clone(),
+                state.http_client.clone(),
+                request_metadata.clone().with_current_trace_context(),
+            );
+            response = Response::from_parts(parts, body);
         }
 
         // Determine if SSE buffering is needed for non-strict sanitization

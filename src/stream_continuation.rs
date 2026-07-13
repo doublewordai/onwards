@@ -1,8 +1,15 @@
-use axum::http::Method;
+use axum::{body::Body, http::Method};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::fmt;
+use std::time::Duration;
 
+use crate::client::HttpClient;
+use crate::handlers::{UpstreamRequestMetadata, build_upstream_request};
+use crate::load_balancer::{ProviderPool, SelectionState};
+use crate::sse::SseBufferedStream;
+use crate::target::ConcurrencyGuard;
 use crate::target::StreamContinuationConfig;
 
 /// State retained while forwarding an eligible completion stream.
@@ -22,6 +29,7 @@ pub struct CompletionContinuation {
 pub struct EventObservation {
     pub event: Bytes,
     pub terminal: bool,
+    pub done: bool,
 }
 
 /// Errors raised while building a continuation request or rewriting an event.
@@ -98,6 +106,7 @@ impl CompletionContinuation {
             return Ok(EventObservation {
                 event: Bytes::copy_from_slice(event),
                 terminal: self.terminal,
+                done: false,
             });
         };
 
@@ -106,6 +115,7 @@ impl CompletionContinuation {
             return Ok(EventObservation {
                 event: Bytes::copy_from_slice(event),
                 terminal: true,
+                done: true,
             });
         }
 
@@ -113,6 +123,7 @@ impl CompletionContinuation {
             return Ok(EventObservation {
                 event: Bytes::copy_from_slice(event),
                 terminal: self.terminal,
+                done: false,
             });
         };
         let (text, terminal) = match completion_event(&completion) {
@@ -124,6 +135,7 @@ impl CompletionContinuation {
                 return Ok(EventObservation {
                     event: Bytes::copy_from_slice(event),
                     terminal: self.terminal,
+                    done: false,
                 });
             }
             CompletionEvent::Ambiguous { terminal } => {
@@ -132,6 +144,7 @@ impl CompletionContinuation {
                 return Ok(EventObservation {
                     event: Bytes::copy_from_slice(event),
                     terminal: self.terminal,
+                    done: false,
                 });
             }
             CompletionEvent::Recognized { text, terminal } => (text, terminal),
@@ -157,6 +170,7 @@ impl CompletionContinuation {
         Ok(EventObservation {
             event,
             terminal: self.terminal,
+            done: false,
         })
     }
 
@@ -228,6 +242,304 @@ impl CompletionContinuation {
     }
 }
 
+enum StreamInterruption {
+    Done,
+    Eof,
+    Body(std::io::Error),
+    IdleTimeout,
+}
+
+impl StreamInterruption {
+    fn into_error(self) -> Option<std::io::Error> {
+        match self {
+            Self::Done | Self::Eof => None,
+            Self::Body(error) => Some(error),
+            Self::IdleTimeout => Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "upstream completion stream idle timeout",
+            )),
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Eof => "eof",
+            Self::Body(_) => "body_error",
+            Self::IdleTimeout => "idle_timeout",
+        }
+    }
+}
+
+/// Combines an initial completion body with independently selected continuation bodies.
+pub(crate) fn wrap_completion_stream<T>(
+    initial_body: Body,
+    initial_guard: ConcurrencyGuard,
+    mut continuation: CompletionContinuation,
+    config: StreamContinuationConfig,
+    pool: ProviderPool,
+    http_client: T,
+    request_metadata: UpstreamRequestMetadata,
+) -> Body
+where
+    T: HttpClient + Clone + Send + Sync + 'static,
+{
+    let fallback = pool.fallback().cloned().unwrap_or_default();
+    let mut selection = SelectionState::new(config.max_attempts, fallback.with_replacement);
+    let stream = async_stream::stream! {
+        let mut current_body = initial_body;
+        let mut current_guard = Some(initial_guard);
+        let mut rewrite_identity = false;
+        let mut continuation_attempt = 0_u32;
+        let mut total_backoff_ms = 0_u64;
+
+        loop {
+            let mut events = SseBufferedStream::new(current_body.into_data_stream());
+            let interruption = loop {
+                let next = if let Some(timeout_ms) = config.idle_timeout_ms {
+                    match tokio::time::timeout(Duration::from_millis(timeout_ms), events.next()).await {
+                        Ok(next) => next,
+                        Err(_) => break StreamInterruption::IdleTimeout,
+                    }
+                } else {
+                    events.next().await
+                };
+
+                match next {
+                    Some(Ok(event)) => {
+                        let observation = match continuation.observe_event(&event, rewrite_identity) {
+                            Ok(observation) => observation,
+                            Err(error) => {
+                                yield Err::<Bytes, std::io::Error>(std::io::Error::other(error));
+                                return;
+                            }
+                        };
+                        let done = observation.done;
+                        yield Ok::<Bytes, std::io::Error>(observation.event);
+                        if done {
+                            break StreamInterruption::Done;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        break StreamInterruption::Body(std::io::Error::other(error));
+                    }
+                    None => break StreamInterruption::Eof,
+                }
+            };
+
+            drop(events);
+            drop(current_guard.take());
+
+            tracing::debug!(
+                reason = interruption.reason(),
+                attempt = continuation_attempt,
+                "Completion stream ended"
+            );
+
+            if matches!(interruption, StreamInterruption::Done) {
+                metrics::counter!(
+                    "onwards_stream_continuation_terminal_total",
+                    "reason" => interruption.reason()
+                )
+                .increment(1);
+                break;
+            }
+
+            let final_error = interruption.into_error();
+            if !continuation.is_continuable() {
+                if let Some(error) = final_error {
+                    yield Err::<Bytes, std::io::Error>(error);
+                }
+                break;
+            }
+
+            let mut next_body = None;
+            let mut next_guard = None;
+            loop {
+                if continuation_attempt as usize >= config.max_attempts {
+                    break;
+                }
+                let retry_index = continuation_attempt.saturating_add(1);
+                if let Some(backoff) = fallback.backoff.as_ref() {
+                    let delay = backoff.delay(retry_index);
+                    let delay_ms = delay.as_millis() as u64;
+                    let next_total = total_backoff_ms.saturating_add(delay_ms);
+                    if fallback
+                        .max_total_backoff_ms
+                        .is_some_and(|max_total| next_total > max_total)
+                    {
+                        metrics::counter!(
+                            "onwards_stream_continuation_failures_total",
+                            "reason" => "backoff_budget"
+                        )
+                        .increment(1);
+                        break;
+                    }
+                    total_backoff_ms = next_total;
+                    tokio::time::sleep(delay).await;
+                }
+
+                let Some((_index, target, guard)) = pool.select_next(&mut selection) else {
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "selection_exhausted"
+                    )
+                    .increment(1);
+                    break;
+                };
+                continuation_attempt = continuation_attempt.saturating_add(1);
+                metrics::counter!("onwards_stream_continuation_attempts_total").increment(1);
+                let target = target.clone();
+
+                if target
+                    .limiter
+                    .as_ref()
+                    .is_some_and(|limiter| limiter.check().is_err())
+                {
+                    drop(guard);
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "rate_limit"
+                    )
+                    .increment(1);
+                    if pool.should_fallback_on_rate_limit() {
+                        continue;
+                    }
+                    break;
+                }
+
+                let request_body = match continuation.request_body(target.onwards_model.as_deref()) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        drop(guard);
+                        metrics::counter!(
+                            "onwards_stream_continuation_failures_total",
+                            "reason" => "request_body"
+                        )
+                        .increment(1);
+                        tracing::error!(error = %error, "Failed to build completion continuation request");
+                        break;
+                    }
+                };
+                let (request, upstream_uri) = match build_upstream_request(
+                    &target,
+                    &request_metadata,
+                    request_body,
+                ) {
+                    Ok(request) => request,
+                    Err(_error) => {
+                        drop(guard);
+                        metrics::counter!(
+                            "onwards_stream_continuation_failures_total",
+                            "reason" => "request_build"
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            "Failed to build completion continuation upstream request"
+                        );
+                        break;
+                    }
+                };
+
+                tracing::debug!(
+                    attempt = continuation_attempt,
+                    upstream = %upstream_uri,
+                    "Requesting completion stream continuation"
+                );
+                let response = if let Some(timeout_secs) = target.request_timeout_secs {
+                    match tokio::time::timeout(
+                        Duration::from_secs(timeout_secs),
+                        http_client.request(request),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => {
+                            drop(guard);
+                            metrics::counter!(
+                                "onwards_stream_continuation_failures_total",
+                                "reason" => "header_timeout"
+                            )
+                            .increment(1);
+                            continue;
+                        }
+                    }
+                } else {
+                    http_client.request(request).await
+                };
+
+                let response = match response {
+                    Ok(response) => response,
+                    Err(error) => {
+                        drop(guard);
+                        metrics::counter!(
+                            "onwards_stream_continuation_failures_total",
+                            "reason" => "network_error"
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            upstream = %target.url,
+                            error = %error,
+                            "Completion continuation request failed"
+                        );
+                        continue;
+                    }
+                };
+                let status = response.status().as_u16();
+                if !(200..300).contains(&status) {
+                    drop(response);
+                    drop(guard);
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "status"
+                    )
+                    .increment(1);
+                    if pool.should_fallback_on_status(status) {
+                        continue;
+                    }
+                    break;
+                }
+                let is_sse = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("text/event-stream"));
+                if !is_sse {
+                    drop(response);
+                    drop(guard);
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "content_type"
+                    )
+                    .increment(1);
+                    break;
+                }
+
+                next_body = Some(response.into_body());
+                next_guard = Some(guard);
+                metrics::counter!("onwards_stream_continuation_resumptions_total").increment(1);
+                break;
+            }
+
+            match (next_body, next_guard) {
+                (Some(body), Some(guard)) => {
+                    current_body = body;
+                    current_guard = Some(guard);
+                    rewrite_identity = true;
+                }
+                _ => {
+                    if let Some(error) = final_error {
+                        yield Err::<Bytes, std::io::Error>(error);
+                    }
+                    break;
+                }
+            }
+        }
+    };
+
+    Body::from_stream(stream)
+}
+
 enum CompletionEvent<'a> {
     Recognized {
         text: Option<&'a str>,
@@ -251,6 +563,13 @@ fn completion_event(completion: &Value) -> CompletionEvent<'_> {
             })
             .unwrap_or(CompletionEvent::Unrecognized);
     };
+
+    if choices.is_empty() && choice_less_completion_metadata(completion) {
+        return CompletionEvent::Recognized {
+            text: None,
+            terminal: false,
+        };
+    }
 
     if choices.len() != 1 {
         return CompletionEvent::Ambiguous {
