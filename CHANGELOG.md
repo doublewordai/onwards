@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- add best-effort prefix continuation for eligible `/v1/completions` streams
+- add best-effort prefix continuation for eligible Completions, Chat Completions, and Responses streams
 
 ### Changed
 

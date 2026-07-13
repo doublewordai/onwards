@@ -1477,10 +1477,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_continuation_chat_stream_is_ineligible() {
-        let chat = "data: {\"id\":\"chat-1\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n".to_string();
-        let mock = MockHttpClient::new_streaming_sequence(StatusCode::OK, vec![vec![chat]]);
-        let targets = stream_continuation_targets(
+    async fn stream_continuation_strict_chat_stream_resumes_as_one_assistant_message() {
+        let first_role = "data: {\"id\":\"chat-first\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"first\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string();
+        let first_text = "data: {\"id\":\"chat-first\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"first\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n".to_string();
+        let second_role = "data: {\"id\":\"chat-second\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"second\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n".to_string();
+        let second_text = "data: {\"id\":\"chat-second\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"second\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}\n\n".to_string();
+        let stop = "data: {\"id\":\"chat-second\",\"object\":\"chat.completion.chunk\",\"created\":2,\"model\":\"second\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![first_role, first_text],
+                vec![
+                    second_role,
+                    second_text,
+                    stop,
+                    "data: [DONE]\n\n".to_string(),
+                ],
+            ],
+        );
+        let targets = stream_continuation_targets_with_options(
             "requested-model",
             &[None, None],
             stream_continuation_fallback(
@@ -1490,9 +1505,11 @@ mod tests {
                 None,
                 vec!["/v1/completions", "/v1/chat/completions"],
             ),
+            true,
+            false,
         );
         let server =
-            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+            TestServer::new(strict_stream_continuation_router(targets, mock.clone())).unwrap();
 
         let response = server
             .post("/v1/chat/completions")
@@ -1504,7 +1521,76 @@ mod tests {
             .await;
 
         assert_eq!(response.status_code(), 200);
-        assert_eq!(mock.get_requests().len(), 1);
+        let body = response.text();
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" world"));
+        assert!(body.contains("chat-first"));
+        assert!(!body.contains("chat-second"));
+
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        let continuation: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let messages = continuation["messages"].as_array().unwrap();
+        assert_eq!(messages.last().unwrap()["role"], "assistant");
+        assert_eq!(messages.last().unwrap()["content"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_strict_responses_stream_stitches_text_events() {
+        let first_created = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_first\",\"model\":\"first\",\"output\":[]}}\n\n".to_string();
+        let first_item = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"id\":\"msg_first\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n".to_string();
+        let first_part = "event: response.content_part.added\ndata: {\"type\":\"response.content_part.added\",\"sequence_number\":2,\"item_id\":\"msg_first\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\"}}\n\n".to_string();
+        let first_delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"msg_first\",\"output_index\":0,\"content_index\":0,\"delta\":\"Hello\"}\n\n".to_string();
+        let second_created = first_created.replace("resp_first", "resp_second");
+        let second_item = first_item.replace("msg_first", "msg_second");
+        let second_part = first_part.replace("msg_first", "msg_second");
+        let second_delta = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":3,\"item_id\":\"msg_second\",\"output_index\":0,\"content_index\":0,\"delta\":\" world\"}\n\n".to_string();
+        let completed = "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":4,\"response\":{\"id\":\"resp_second\",\"model\":\"second\",\"output\":[{\"id\":\"msg_second\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\" world\"}]}]}}\n\n".to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![first_created, first_item, first_part, first_delta],
+                vec![
+                    second_created,
+                    second_item,
+                    second_part,
+                    second_delta,
+                    completed,
+                ],
+            ],
+        );
+        let targets = stream_continuation_targets_with_options(
+            "requested-model",
+            &[None, None],
+            stream_continuation_fallback(true, 2, 1, None, vec!["/v1/responses"]),
+            true,
+            false,
+        );
+        let server =
+            TestServer::new(strict_stream_continuation_router(targets, mock.clone())).unwrap();
+
+        let response = server
+            .post("/v1/responses")
+            .json(&json!({
+                "model": "requested-model",
+                "input": "Hello",
+                "stream": true
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let body = response.text();
+        assert!(body.contains("Hello"));
+        assert!(body.contains(" world"));
+        assert!(body.contains("resp_first"));
+        assert!(!body.contains("resp_second"));
+
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        let continuation: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let input = continuation["input"].as_array().unwrap();
+        assert_eq!(input.last().unwrap()["role"], "assistant");
+        assert_eq!(input.last().unwrap()["content"][0]["text"], "Hello");
     }
 
     #[tokio::test]
@@ -2053,6 +2139,71 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("identity")
         );
+    }
+
+    #[tokio::test]
+    async fn stream_continuation_encoded_strict_chat_and_responses_are_preserved_unwrapped() {
+        for (path, request_body) in [
+            (
+                "/v1/chat/completions",
+                json!({
+                    "model": "requested-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": true
+                }),
+            ),
+            (
+                "/v1/responses",
+                json!({
+                    "model": "requested-model",
+                    "input": "Hello",
+                    "stream": true
+                }),
+            ),
+        ] {
+            let compressed = gzip_bytes(b"encoded-stream");
+            let mock =
+                MockHttpClient::new_streaming_response_sequence(vec![MockStreamingResponse {
+                    status: StatusCode::OK,
+                    content_type: Some("text/event-stream".to_string()),
+                    headers: vec![
+                        ("content-encoding".to_string(), "gzip".to_string()),
+                        ("content-length".to_string(), compressed.len().to_string()),
+                    ],
+                    events: vec![MockStreamEvent::Bytes(compressed.clone())],
+                }]);
+            let targets = stream_continuation_targets_with_options(
+                "requested-model",
+                &[None],
+                stream_continuation_fallback(true, 1, 1, None, vec![path]),
+                true,
+                false,
+            );
+            let request = axum::extract::Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(request_body.to_string()))
+                .unwrap();
+
+            let response = strict_stream_continuation_router(targets, mock.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+
+            assert_eq!(response.headers().get("content-encoding").unwrap(), "gzip");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(body.as_ref(), compressed.as_slice());
+            assert_eq!(mock.get_requests().len(), 1);
+            assert_eq!(
+                mock.get_requests()[0]
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name == "accept-encoding")
+                    .map(|(_, value)| value.as_str()),
+                Some("identity")
+            );
+        }
     }
 
     #[tokio::test]

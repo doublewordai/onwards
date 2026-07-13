@@ -341,7 +341,10 @@ pub(crate) fn framing_error_in_chain(error: &(dyn Error + 'static)) -> Option<Ss
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParsedSseEvent {
     Comment,
-    Data(Vec<u8>),
+    Data {
+        data: Vec<u8>,
+        event_type: Option<Vec<u8>>,
+    },
     Invalid,
 }
 
@@ -354,6 +357,7 @@ pub(crate) fn parse_sse_event(event: &[u8]) -> ParsedSseEvent {
     };
     let mut data = Vec::new();
     let mut found_data = false;
+    let mut event_type = None;
 
     while position < event.len() {
         let line_start = position;
@@ -377,6 +381,22 @@ pub(crate) fn parse_sse_event(event: &[u8]) -> ParsedSseEvent {
             continue;
         }
 
+        if line == b"event" {
+            if event_type.replace(Vec::new()).is_some() {
+                return ParsedSseEvent::Invalid;
+            }
+            continue;
+        }
+        if let Some(value) = line.strip_prefix(b"event:") {
+            if event_type
+                .replace(value.strip_prefix(b" ").unwrap_or(value).to_vec())
+                .is_some()
+            {
+                return ParsedSseEvent::Invalid;
+            }
+            continue;
+        }
+
         let value = if line == b"data" {
             &b""[..]
         } else if let Some(value) = line.strip_prefix(b"data:") {
@@ -392,7 +412,9 @@ pub(crate) fn parse_sse_event(event: &[u8]) -> ParsedSseEvent {
     }
 
     if found_data {
-        ParsedSseEvent::Data(data)
+        ParsedSseEvent::Data { data, event_type }
+    } else if event_type.is_some() {
+        ParsedSseEvent::Invalid
     } else {
         ParsedSseEvent::Comment
     }

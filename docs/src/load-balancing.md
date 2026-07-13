@@ -41,7 +41,7 @@ Controls automatic retry on other providers when requests fail:
 | `max_attempts` | int? | provider count | Maximum pre-response failover attempts |
 | `backoff` | object? | `null` | Delay between attempts; no delay when omitted |
 | `max_total_backoff_ms` | int? | `null` | Maximum cumulative time spent sleeping between attempts |
-| `stream_continuation` | object? | `null` | Best-effort continuation for eligible interrupted completion streams |
+| `stream_continuation` | object? | `null` | Best-effort continuation for eligible interrupted text-generation streams |
 
 Status code wildcards:
 
@@ -53,28 +53,31 @@ When fallback triggers, the next provider is selected based on strategy (weighte
 
 ### Stream continuation
 
-Stream continuation is opt-in and applies only to eligible `POST /v1/completions`
-streams. It forwards the already emitted text to a selected provider, which may
-be the same provider, when the initial provider stops before sending a terminal
-event. The prefix is kept in memory for the lifetime of the request; it is not
-persisted and is lost if the process restarts. The output is best-effort: an
-interruption or exhausted continuation budget can leave the client with a
-partial stream, and the proxy does not synthesize a `[DONE]` event after
-exhaustion.
+Stream continuation is opt-in for eligible `POST /v1/completions`,
+`POST /v1/chat/completions`, and `POST /v1/responses` streams. When an upstream
+stops before a terminal event, Onwards sends the text already emitted to a newly
+selected provider, which may be the same provider. The prefix is kept in memory
+for the lifetime of the request; it is not persisted and is lost if the process
+restarts. An interruption or exhausted continuation budget can leave the client
+with a partial stream, and the proxy does not synthesize a terminal event.
 
 Configure it inside `fallback`:
 
 ```json
 {
   "targets": {
-    "gpt-4-instruct": {
+    "gpt-4": {
       "fallback": {
         "enabled": true,
         "on_status": [429, 5],
         "on_rate_limit": true,
         "stream_continuation": {
           "enabled": true,
-          "endpoints": ["/v1/completions"],
+          "endpoints": [
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/v1/responses"
+          ],
           "max_attempts": 1,
           "max_buffered_bytes": 1048576,
           "idle_timeout_ms": 30000
@@ -92,7 +95,7 @@ Configure it inside `fallback`:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Enables continuation, subject to the parent `fallback.enabled` switch |
-| `endpoints` | string[] | `[]` | Exact request paths eligible for continuation; use `["/v1/completions"]` only |
+| `endpoints` | string[] | `[]` | Exact request paths eligible for continuation; supported values are `/v1/completions`, `/v1/chat/completions`, and `/v1/responses` |
 | `max_attempts` | int | `1` | Fresh post-commit continuation-attempt budget |
 | `max_buffered_bytes` | int | `1048576` | Maximum generated-text bytes retained for a continuation request |
 | `idle_timeout_ms` | int? | `null` | Maximum idle time between upstream stream events; `null` disables this timeout |
@@ -106,26 +109,39 @@ selection, request/header handling, and backoff settings, including
 backoff budget; the parent `max_total_backoff_ms` limit applies independently
 to the post-commit continuation attempts.
 
-Only a narrow completion shape is supported: a string `prompt`, `stream: true`,
-`n` omitted or `1`, and `echo` omitted or `false`. Chat and Responses requests,
-tool-calling streams, structured-output streams, multi-choice requests, prompt
-token-array requests, and `echo: true` are unsupported and pass through without
-continuation. Requests containing `tools`, `tool_choice`, `functions`,
-`function_call`, `response_format`, `json_schema`, `grammar`, or `guided_*`
-controls are also excluded. The upstream response must be a successful response
-with the exact `text/event-stream` media type (case-insensitive; parameters are
-allowed) and no content encoding or `Content-Encoding: identity`. Onwards sends
-`Accept-Encoding: identity` for eligible requests and for every strict-mode
-completion request, and only continues unencoded responses. An encoded eligible
-stream is left untouched; an encoded or non-SSE continuation response is
-rejected rather than spliced into the client stream. In strict mode, body
-sanitization cannot be guaranteed for any encoded completion response that
-ignores the identity request because preserving its encoded representation
-requires forwarding it unwrapped.
+Only narrow, single-output text shapes are supported. Completions require a
+string `prompt`, `stream: true`, `n` omitted or `1`, and `echo` omitted or
+`false`. Chat Completions require ordinary message content, `stream: true`, one
+choice, and no logprobs. Responses require string or message-only input,
+`stream: true`, plain-text output, and foreground, non-stored execution. Tool
+calls, reasoning, structured output, multi-choice or multi-item output, and
+provider-specific guided generation controls are excluded. Unsupported requests
+pass through normally without continuation. If an initially eligible stream
+later emits an unrecognized shape, continuation is disabled rather than guessing
+how to splice it.
 
-This is prefix-based continuation, not native token-offset resume. Onwards
-reissues the original prompt with the emitted text appended, so the next model
-call may duplicate text or diverge from the interrupted generation.
+Continuation is protocol-specific. For Completions, Onwards appends the emitted
+text to the original prompt. For Chat Completions, it appends one assistant
+message containing the emitted text and suppresses a repeated assistant-role
+chunk. For Responses, it appends an assistant `output_text` message, suppresses
+repeated lifecycle setup events, and keeps response IDs, item IDs, and sequence
+numbers continuous. Terminal Responses snapshots are rewritten with the full
+cumulative text.
+
+The upstream response must be successful, use the exact `text/event-stream`
+media type (case-insensitive; parameters are allowed), and have no content
+encoding or `Content-Encoding: identity`. Onwards sends
+`Accept-Encoding: identity` for eligible requests and continues only unencoded
+responses. An encoded eligible stream is left untouched; an encoded or non-SSE
+continuation response is rejected rather than spliced into the client stream.
+In strict mode, body sanitization cannot be guaranteed when an eligible encoded
+response ignores the identity request because preserving its encoded
+representation requires forwarding it unwrapped.
+
+This is prefix-based continuation, not native token-offset resume. Chat
+Completions and Responses do not expose a continuation cursor: the emitted text
+is supplied as prior assistant output in a new request. The next model call may
+add a preamble, repeat text, or diverge from the interrupted generation.
 
 The buffer cap is measured in UTF-8 bytes. Once appending a recognized text
 chunk would exceed the cap, continuation is disabled for that request and the

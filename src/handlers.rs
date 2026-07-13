@@ -105,7 +105,7 @@ enum SseEventKind {
 fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
     let data = match crate::sse::parse_sse_event(chunk) {
         crate::sse::ParsedSseEvent::Comment => return SseEventKind::Comment,
-        crate::sse::ParsedSseEvent::Data(data) => data,
+        crate::sse::ParsedSseEvent::Data { data, .. } => data,
         crate::sse::ParsedSseEvent::Invalid => return SseEventKind::Data,
     };
     let Ok(data) = std::str::from_utf8(&data) else {
@@ -337,7 +337,7 @@ pub(crate) struct UpstreamRequestMetadata {
 pub(crate) struct CanonicalRequestPath(pub(crate) &'static str);
 
 #[derive(Clone, Copy)]
-pub(crate) struct PreserveEncodedCompletion;
+pub(crate) struct PreserveEncodedStream;
 
 #[derive(Clone, Copy)]
 struct CompositeResponsePolicy {
@@ -504,7 +504,7 @@ trait ContinuationBodyFactory<T: HttpClient> {
     fn wrap(
         initial_body: axum::body::Body,
         initial_guard: ConcurrencyGuard,
-        continuation: crate::stream_continuation::CompletionContinuation,
+        continuation: crate::stream_continuation::StreamContinuation,
         config: crate::target::StreamContinuationConfig,
         pool: ProviderPool,
         http_client: T,
@@ -520,7 +520,7 @@ impl<T: HttpClient> ContinuationBodyFactory<T> for ContinuationDisabled {
     fn wrap(
         _initial_body: axum::body::Body,
         _initial_guard: ConcurrencyGuard,
-        _continuation: crate::stream_continuation::CompletionContinuation,
+        _continuation: crate::stream_continuation::StreamContinuation,
         _config: crate::target::StreamContinuationConfig,
         _pool: ProviderPool,
         _http_client: T,
@@ -541,13 +541,13 @@ where
     fn wrap(
         initial_body: axum::body::Body,
         initial_guard: ConcurrencyGuard,
-        continuation: crate::stream_continuation::CompletionContinuation,
+        continuation: crate::stream_continuation::StreamContinuation,
         config: crate::target::StreamContinuationConfig,
         pool: ProviderPool,
         http_client: T,
         request_metadata: UpstreamRequestMetadata,
     ) -> axum::body::Body {
-        crate::stream_continuation::wrap_completion_stream(
+        crate::stream_continuation::wrap_generation_stream(
             initial_body,
             initial_guard,
             continuation,
@@ -870,12 +870,12 @@ where
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
-    let mut completion_continuation = if C::ENABLED {
+    let mut stream_continuation = if C::ENABLED {
         pool.fallback()
             .filter(|fallback| fallback.enabled)
             .and_then(|fallback| fallback.stream_continuation.as_ref())
             .and_then(|config| {
-                crate::stream_continuation::CompletionContinuation::from_request_with_resolved_model(
+                crate::stream_continuation::StreamContinuation::from_request_with_resolved_model(
                     &canonical_request_path,
                     &method,
                     &body_bytes,
@@ -887,7 +887,7 @@ where
     } else {
         None
     };
-    let composite_response_policy = completion_continuation
+    let composite_response_policy = stream_continuation
         .as_ref()
         .map(|_| CompositeResponsePolicy::for_pool(&pool));
     let request_metadata = UpstreamRequestMetadata::new(
@@ -897,7 +897,7 @@ where
         pool.is_trusted(),
     )
     .with_current_trace_context();
-    let request_metadata = if completion_continuation.is_some()
+    let request_metadata = if stream_continuation.is_some()
         || (state.targets.strict_mode && is_completion_path)
     {
         request_metadata.with_identity_encoding()
@@ -1165,15 +1165,15 @@ where
         let is_sse = crate::stream_continuation::is_event_stream(response.headers());
         let is_identity_encoded =
             crate::stream_continuation::has_identity_content_encoding(response.headers());
-        let preserve_encoded_completion = (200..300).contains(&status)
+        let preserve_encoded_stream = (200..300).contains(&status)
             && is_sse
             && !is_identity_encoded
-            && (completion_continuation.is_some()
+            && (stream_continuation.is_some()
                 || (state.targets.strict_mode && is_completion_path));
-        if preserve_encoded_completion {
+        if preserve_encoded_stream {
             response
                 .extensions_mut()
-                .insert(PreserveEncodedCompletion);
+                .insert(PreserveEncodedStream);
         }
 
         // Some upstreams return HTTP 200 while embedding the
@@ -1216,7 +1216,7 @@ where
         }
         let scan: Scan2xx = if (200..300).contains(&status)
             && state.targets.strict_mode
-            && !preserve_encoded_completion
+            && !preserve_encoded_stream
         {
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
@@ -1423,7 +1423,7 @@ where
         if is_sse
             && is_identity_encoded
             && (200..300).contains(&status)
-            && let Some((continuation, config)) = completion_continuation.take()
+            && let Some((continuation, config)) = stream_continuation.take()
         {
             let (mut parts, body) = response.into_parts();
             composite_content_type = parts.headers.get(CONTENT_TYPE).cloned();
@@ -1461,7 +1461,7 @@ where
         let needs_sse_buffering = !state.targets.strict_mode
             && state.response_transform_fn.is_some()
             && response_sanitize
-            && !preserve_encoded_completion
+            && !preserve_encoded_stream
             && (200..300).contains(&status);
 
         // Wrap SSE streams with buffering to ensure complete events (delimited by \n\n).
@@ -1483,7 +1483,7 @@ where
             && response_sanitize
             && (200..300).contains(&status)
             && !state.targets.strict_mode
-            && !preserve_encoded_completion
+            && !preserve_encoded_stream
         {
             debug!(
                 "Attempting response sanitization for status {}, path {}",
