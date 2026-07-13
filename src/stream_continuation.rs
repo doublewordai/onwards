@@ -115,27 +115,32 @@ impl CompletionContinuation {
                 terminal: self.terminal,
             });
         };
-        let Some(choice) = completion
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(Value::as_object)
-        else {
-            return Ok(EventObservation {
-                event: Bytes::copy_from_slice(event),
-                terminal: self.terminal,
-            });
+        let (text, terminal) = match completion_event(&completion) {
+            CompletionEvent::Unrecognized => {
+                return Ok(EventObservation {
+                    event: Bytes::copy_from_slice(event),
+                    terminal: self.terminal,
+                });
+            }
+            CompletionEvent::Ambiguous { terminal } => {
+                self.continuable = false;
+                self.terminal |= terminal;
+                return Ok(EventObservation {
+                    event: Bytes::copy_from_slice(event),
+                    terminal: self.terminal,
+                });
+            }
+            CompletionEvent::Recognized { text, terminal } => (text, terminal),
         };
 
-        self.capture_identity(&completion);
+        if !rewrite_identity {
+            self.capture_identity(&completion);
+        }
 
-        if let Some(text) = choice.get("text").and_then(Value::as_str) {
+        if let Some(text) = text {
             self.append_text(text);
         }
-        if choice
-            .get("finish_reason")
-            .is_some_and(|reason| !reason.is_null())
-        {
+        if terminal {
             self.terminal = true;
         }
 
@@ -219,6 +224,73 @@ impl CompletionContinuation {
     }
 }
 
+enum CompletionEvent<'a> {
+    Recognized {
+        text: Option<&'a str>,
+        terminal: bool,
+    },
+    Ambiguous {
+        terminal: bool,
+    },
+    Unrecognized,
+}
+
+fn completion_event(completion: &Value) -> CompletionEvent<'_> {
+    let Some(object) = completion.as_object() else {
+        return CompletionEvent::Unrecognized;
+    };
+    let Some(choices) = object.get("choices").and_then(Value::as_array) else {
+        return choice_less_completion_metadata(completion)
+            .then_some(CompletionEvent::Recognized {
+                text: None,
+                terminal: false,
+            })
+            .unwrap_or(CompletionEvent::Unrecognized);
+    };
+
+    if choices.len() != 1 {
+        return CompletionEvent::Ambiguous {
+            terminal: choice_finish_reason(choices),
+        };
+    }
+
+    let Some(choice) = choices.first().and_then(Value::as_object) else {
+        return CompletionEvent::Unrecognized;
+    };
+    let text = choice.get("text").and_then(Value::as_str);
+    let finish_reason = choice
+        .get("finish_reason")
+        .is_some_and(|reason| !reason.is_null());
+    let explicitly_completion =
+        object.get("object").and_then(Value::as_str) == Some("text_completion");
+    if text.is_none() && !(explicitly_completion && choice.contains_key("finish_reason")) {
+        return CompletionEvent::Unrecognized;
+    }
+
+    CompletionEvent::Recognized {
+        text,
+        terminal: finish_reason,
+    }
+}
+
+fn choice_less_completion_metadata(completion: &Value) -> bool {
+    let Some(completion) = completion.as_object() else {
+        return false;
+    };
+    completion.get("object").and_then(Value::as_str) == Some("text_completion")
+        && completion.contains_key("id")
+        && completion.contains_key("model")
+        && completion.contains_key("created")
+}
+
+fn choice_finish_reason(choices: &[Value]) -> bool {
+    choices.iter().any(|choice| {
+        choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null())
+    })
+}
+
 fn event_data(event: &[u8]) -> Option<String> {
     let mut data = Vec::new();
     let mut found_data = false;
@@ -252,7 +324,7 @@ mod tests {
     use super::*;
     use crate::target::StreamContinuationConfig;
     use axum::http::Method;
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     fn eligible_state(max_buffered_bytes: usize) -> CompletionContinuation {
         let config = StreamContinuationConfig {
@@ -363,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_event_reuses_original_identity() {
+    fn multiline_continuation_event_reuses_original_identity() {
         let mut state = eligible_state(1024);
         state
             .observe_event(
@@ -376,11 +448,8 @@ mod tests {
 
         let observation = state
             .observe_event(
-                br#": keepalive
+                b"data: {\"id\":\"cmpl-next\",\"created\":2,\ndata: \"model\":\"next\",\"choices\":[{\"text\":\"two\",\"finish_reason\":null}]}\n\n",
 
-data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"text":"two","finish_reason":null}]}
-
-"#,
                 true,
             )
             .unwrap();
@@ -407,18 +476,17 @@ data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"text":"two","fin
     }
 
     #[test]
-    fn combines_multiline_data_and_only_tracks_first_choice_text() {
+    fn multiple_choices_disable_continuation_without_appending_a_prefix() {
         let mut state = eligible_state(1024);
-        state
-            .observe_event(
-                b"data: {\"choices\":[{\"text\":\"hello\",\ndata: \"finish_reason\":null},{\"text\":\" ignored\",\"finish_reason\":null}]}\n\n",
-                false,
-            )
-            .unwrap();
+        let event = br#"data: {"choices":[{"text":"one","finish_reason":null},{"text":"two","finish_reason":"stop"}]}
 
-        let body: Value = serde_json::from_slice(&state.request_body(None).unwrap()).unwrap();
-        assert_eq!(body["prompt"], "Say hello: hello");
-        assert_eq!(body["model"], "requested-m");
+"#;
+        let observation = state.observe_event(event, true).unwrap();
+
+        assert_eq!(observation.event.as_ref(), event);
+        assert!(observation.terminal);
+        assert!(!state.is_continuable());
+        assert!(state.generated_text.is_empty());
     }
 
     #[test]
@@ -453,6 +521,109 @@ data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"text":"two","fin
 "#;
         let observation = state.observe_event(event, false).unwrap();
         assert_eq!(observation.event.as_ref(), event);
-        assert_eq!(json!(observation.terminal), json!(false));
+        assert!(!observation.terminal);
+    }
+
+    #[test]
+    fn unrecognized_json_events_pass_through_without_identity_rewrite() {
+        let mut state = eligible_state(1024);
+        state
+            .observe_event(
+                br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"text":"one","finish_reason":null}]}
+
+"#,
+                false,
+            )
+            .unwrap();
+
+        for event in [
+            br#"data: {"id":"chat-next","choices":[{"delta":{"content":"two"},"finish_reason":"stop"}]}
+
+"#
+            .as_slice(),
+            br#"data: {"id":"empty-choice","choices":[{}]}
+
+"#
+            .as_slice(),
+            br#"data: {"id":"other","type":"notification","payload":{"value":1}}
+
+"#
+            .as_slice(),
+        ] {
+            let observation = state.observe_event(event, true).unwrap();
+            assert_eq!(observation.event.as_ref(), event);
+            assert!(!observation.terminal);
+            assert!(state.is_continuable());
+        }
+    }
+
+    #[test]
+    fn continuation_events_do_not_fill_missing_initial_identity() {
+        let mut state = eligible_state(1024);
+        state
+            .observe_event(
+                br#"data: {"id":"cmpl-first","choices":[{"text":"one","finish_reason":null}]}
+
+"#,
+                false,
+            )
+            .unwrap();
+
+        for (model, created) in [("provider-a", 2), ("provider-b", 3)] {
+            let event = format!(
+                "data: {{\"id\":\"cmpl-next\",\"created\":{created},\"model\":\"{model}\",\"choices\":[{{\"text\":\"two\",\"finish_reason\":null}}]}}\n\n"
+            );
+            let observation = state.observe_event(event.as_bytes(), true).unwrap();
+            let rewritten: Value =
+                serde_json::from_slice(&observation.event[6..observation.event.len() - 2]).unwrap();
+            assert_eq!(rewritten["id"], "cmpl-first");
+            assert_eq!(rewritten["model"], model);
+            assert_eq!(rewritten["created"], created);
+        }
+    }
+
+    #[test]
+    fn unambiguous_choice_less_completion_metadata_captures_initial_identity() {
+        let mut state = eligible_state(1024);
+        state
+            .observe_event(
+                br#"data: {"id":"cmpl-first","object":"text_completion","created":1,"model":"first"}
+
+"#,
+                false,
+            )
+            .unwrap();
+
+        let observation = state
+            .observe_event(
+                br#"data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"text":"two","finish_reason":null}]}
+
+"#,
+                true,
+            )
+            .unwrap();
+        let rewritten: Value =
+            serde_json::from_slice(&observation.event[6..observation.event.len() - 2]).unwrap();
+        assert_eq!(rewritten["id"], "cmpl-first");
+        assert_eq!(rewritten["model"], "first");
+        assert_eq!(rewritten["created"], 1);
+    }
+
+    #[test]
+    fn multibyte_text_at_the_buffer_boundary_is_retained_but_overflow_is_not() {
+        let event = "data: {\"choices\":[{\"text\":\"éé\",\"finish_reason\":null}]}\n\n";
+
+        let mut exact_boundary = eligible_state(4);
+        exact_boundary
+            .observe_event(event.as_bytes(), false)
+            .unwrap();
+        let body: Value =
+            serde_json::from_slice(&exact_boundary.request_body(None).unwrap()).unwrap();
+        assert_eq!(body["prompt"], "Say hello: éé");
+
+        let mut overflow = eligible_state(3);
+        overflow.observe_event(event.as_bytes(), false).unwrap();
+        assert!(!overflow.is_continuable());
+        assert!(overflow.generated_text.is_empty());
     }
 }
