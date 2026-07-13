@@ -117,6 +117,10 @@ impl CompletionContinuation {
         };
         let (text, terminal) = match completion_event(&completion) {
             CompletionEvent::Unrecognized => {
+                if let Some(choices) = completion.get("choices").and_then(Value::as_array) {
+                    self.continuable = false;
+                    self.terminal |= choice_finish_reason(choices);
+                }
                 return Ok(EventObservation {
                     event: Bytes::copy_from_slice(event),
                     terminal: self.terminal,
@@ -525,36 +529,50 @@ mod tests {
     }
 
     #[test]
-    fn unrecognized_json_events_pass_through_without_identity_rewrite() {
-        let mut state = eligible_state(1024);
-        state
-            .observe_event(
-                br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"text":"one","finish_reason":null}]}
+    fn unrecognized_choice_events_pass_through_and_disable_continuation() {
+        for (event, terminal) in [
+            (
+                br#"data: {"id":"chat-next","choices":[{"delta":{"content":"two"},"finish_reason":"stop"}]}
+
+"#
+                .as_slice(),
+                true,
+            ),
+            (
+                br#"data: {"id":"empty-choice","choices":[{}]}
+
+"#
+                .as_slice(),
+                false,
+            ),
+        ] {
+            let mut state = eligible_state(1024);
+            state
+                .observe_event(
+                    br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"text":"one","finish_reason":null}]}
 
 "#,
-                false,
-            )
-            .unwrap();
-
-        for event in [
-            br#"data: {"id":"chat-next","choices":[{"delta":{"content":"two"},"finish_reason":"stop"}]}
-
-"#
-            .as_slice(),
-            br#"data: {"id":"empty-choice","choices":[{}]}
-
-"#
-            .as_slice(),
-            br#"data: {"id":"other","type":"notification","payload":{"value":1}}
-
-"#
-            .as_slice(),
-        ] {
+                    false,
+                )
+                .unwrap();
             let observation = state.observe_event(event, true).unwrap();
             assert_eq!(observation.event.as_ref(), event);
-            assert!(!observation.terminal);
-            assert!(state.is_continuable());
+            assert_eq!(observation.terminal, terminal);
+            assert!(!state.is_continuable());
         }
+    }
+
+    #[test]
+    fn unrecognized_json_without_choices_passes_through_without_disabling_continuation() {
+        let mut state = eligible_state(1024);
+        let event = br#"data: {"id":"other","type":"notification","payload":{"value":1}}
+
+"#;
+
+        let observation = state.observe_event(event, true).unwrap();
+        assert_eq!(observation.event.as_ref(), event);
+        assert!(!observation.terminal);
+        assert!(state.is_continuable());
     }
 
     #[test]
