@@ -438,10 +438,12 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 
     if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
+        let preserve_encoded_completion = response
+            .extensions()
+            .get::<crate::handlers::PreserveEncodedCompletion>()
+            .is_some();
 
-        if (is_streaming || response_is_sse)
-            && crate::stream_continuation::has_identity_content_encoding(response.headers())
-        {
+        if (is_streaming || response_is_sse) && !preserve_encoded_completion {
             sanitize_streaming_completions_response(response, resolved_model, trusted).await
         } else if is_streaming || response_is_sse {
             response

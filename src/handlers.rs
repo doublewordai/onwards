@@ -345,6 +345,9 @@ pub(crate) struct UpstreamRequestMetadata {
 #[derive(Clone)]
 pub(crate) struct CanonicalRequestPath(pub(crate) &'static str);
 
+#[derive(Clone, Copy)]
+pub(crate) struct PreserveEncodedCompletion;
+
 impl UpstreamRequestMetadata {
     fn new(method: Method, path_and_query: String, headers: HeaderMap, pool_trusted: bool) -> Self {
         Self {
@@ -390,8 +393,10 @@ fn clear_composite_representation_headers(headers: &mut HeaderMap) {
         "digest",
         "content-digest",
         "repr-digest",
+        "representation-digest",
         "etag",
         "accept-ranges",
+        "last-modified",
     ] {
         headers.remove(name);
     }
@@ -1032,6 +1037,15 @@ where
         let is_sse = crate::stream_continuation::is_event_stream(response.headers());
         let is_identity_encoded =
             crate::stream_continuation::has_identity_content_encoding(response.headers());
+        let preserve_encoded_completion = (200..300).contains(&status)
+            && is_sse
+            && !is_identity_encoded
+            && completion_continuation.is_some();
+        if preserve_encoded_completion {
+            response
+                .extensions_mut()
+                .insert(PreserveEncodedCompletion);
+        }
 
         // Some upstreams return HTTP 200 while embedding the
         // real error in the body — `{"error":{"code":429,...}}` for a unary
@@ -1069,7 +1083,7 @@ where
         }
         let scan: Scan2xx = if (200..300).contains(&status)
             && state.targets.strict_mode
-            && is_identity_encoded
+            && !preserve_encoded_completion
         {
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
@@ -1286,7 +1300,7 @@ where
         let needs_sse_buffering = !state.targets.strict_mode
             && state.response_transform_fn.is_some()
             && target.sanitize_response
-            && is_identity_encoded
+            && !preserve_encoded_completion
             && (200..300).contains(&status);
 
         // Wrap SSE streams with buffering to ensure complete events (delimited by \n\n).
@@ -1308,7 +1322,7 @@ where
             && target.sanitize_response
             && (200..300).contains(&status)
             && !state.targets.strict_mode
-            && is_identity_encoded
+            && !preserve_encoded_completion
         {
             debug!(
                 "Attempting response sanitization for status {}, path {}",
