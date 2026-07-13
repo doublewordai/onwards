@@ -101,7 +101,9 @@ headers are committed. `stream_continuation.max_attempts` is a separate, fresh
 budget after a successful stream has committed its response. Continuation
 reuses the parent fallback status matching, local rate-limit behavior, provider
 selection, request/header handling, and backoff settings, including
-`max_total_backoff_ms`.
+`max_total_backoff_ms`. Stream continuation also starts a fresh cumulative
+backoff budget; the parent `max_total_backoff_ms` limit applies independently
+to the post-commit continuation attempts.
 
 Only a narrow completion shape is supported: a string `prompt`, `stream: true`,
 `n` omitted or `1`, and `echo` omitted or `false`. Chat and Responses requests,
@@ -109,9 +111,14 @@ tool-calling streams, structured-output streams, multi-choice requests, prompt
 token-array requests, and `echo: true` are unsupported and pass through without
 continuation. The upstream response must be a successful response with the
 exact `text/event-stream` media type (case-insensitive; parameters are allowed)
-and no content encoding or `Content-Encoding: identity`. An encoded stream is
-left untouched; an encoded or non-SSE continuation response is rejected rather
-than spliced into the client stream.
+and no content encoding or `Content-Encoding: identity`. Onwards sends
+`Accept-Encoding: identity` for eligible requests and only continues unencoded
+responses. An encoded stream is left untouched; an encoded or non-SSE
+continuation response is rejected rather than spliced into the client stream.
+
+This is prefix-based continuation, not native token-offset resume. Onwards
+reissues the original prompt with the emitted text appended, so the next model
+call may duplicate text or diverge from the interrupted generation.
 
 The buffer cap is measured in UTF-8 bytes. Once appending a recognized text
 chunk would exceed the cap, continuation is disabled for that request and the

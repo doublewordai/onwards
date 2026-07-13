@@ -597,12 +597,14 @@ fn completion_event(completion: &Value) -> CompletionEvent<'_> {
         return CompletionEvent::Unrecognized;
     };
     let Some(choices) = object.get("choices").and_then(Value::as_array) else {
-        return choice_less_completion_metadata(completion)
-            .then_some(CompletionEvent::Recognized {
+        return if choice_less_completion_metadata(completion) {
+            CompletionEvent::Recognized {
                 text: None,
                 terminal: false,
-            })
-            .unwrap_or(CompletionEvent::Unrecognized);
+            }
+        } else {
+            CompletionEvent::Unrecognized
+        };
     };
 
     if choices.is_empty() && choice_less_completion_metadata(completion) {

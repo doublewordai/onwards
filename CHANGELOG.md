@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- document best-effort continuation for eligible `/v1/completions` streams
+- add best-effort prefix continuation for eligible `/v1/completions` streams
 
 ## [0.34.6](https://github.com/doublewordai/onwards/compare/v0.34.5...v0.34.6) - 2026-07-10
 
