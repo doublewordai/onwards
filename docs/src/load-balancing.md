@@ -54,12 +54,13 @@ When fallback triggers, the next provider is selected based on strategy (weighte
 ### Stream continuation
 
 Stream continuation is opt-in and applies only to eligible `POST /v1/completions`
-streams. It forwards the already emitted text to another provider when the
-initial provider stops before sending a terminal event. The prefix is kept in
-memory for the lifetime of the request; it is not persisted and is lost if the
-process restarts. The output is best-effort: an interruption or exhausted
-continuation budget can leave the client with a partial stream, and the proxy
-does not synthesize a `[DONE]` event after exhaustion.
+streams. It forwards the already emitted text to a selected provider, which may
+be the same provider, when the initial provider stops before sending a terminal
+event. The prefix is kept in memory for the lifetime of the request; it is not
+persisted and is lost if the process restarts. The output is best-effort: an
+interruption or exhausted continuation budget can leave the client with a
+partial stream, and the proxy does not synthesize a `[DONE]` event after
+exhaustion.
 
 Configure it inside `fallback`:
 
@@ -109,12 +110,17 @@ Only a narrow completion shape is supported: a string `prompt`, `stream: true`,
 `n` omitted or `1`, and `echo` omitted or `false`. Chat and Responses requests,
 tool-calling streams, structured-output streams, multi-choice requests, prompt
 token-array requests, and `echo: true` are unsupported and pass through without
-continuation. The upstream response must be a successful response with the
-exact `text/event-stream` media type (case-insensitive; parameters are allowed)
-and no content encoding or `Content-Encoding: identity`. Onwards sends
+continuation. Requests containing `tools`, `tool_choice`, `functions`,
+`function_call`, `response_format`, `json_schema`, `grammar`, or `guided_*`
+controls are also excluded. The upstream response must be a successful response
+with the exact `text/event-stream` media type (case-insensitive; parameters are
+allowed) and no content encoding or `Content-Encoding: identity`. Onwards sends
 `Accept-Encoding: identity` for eligible requests and only continues unencoded
 responses. An encoded stream is left untouched; an encoded or non-SSE
 continuation response is rejected rather than spliced into the client stream.
+In strict mode, body sanitization cannot be guaranteed for an encoded initial
+response that ignores the identity request because preserving its encoded
+representation requires forwarding it unwrapped.
 
 This is prefix-based continuation, not native token-offset resume. Onwards
 reissues the original prompt with the emitted text appended, so the next model

@@ -2234,6 +2234,7 @@ dependencies = [
  "hyper-tls",
  "hyper-util",
  "metrics",
+ "mime",
  "notify",
  "openai-reassembler",
  "opentelemetry",

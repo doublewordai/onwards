@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::client::HttpClient;
 use crate::handlers::{UpstreamRequestMetadata, build_upstream_request};
 use crate::load_balancer::{ProviderPool, SelectionState};
-use crate::sse::SseBufferedStream;
+use crate::sse::{SseBufferedStream, SseFramingError, SseStreamError, event_data};
 use crate::target::ConcurrencyGuard;
 use crate::target::StreamContinuationConfig;
 
@@ -40,8 +40,23 @@ pub(crate) fn is_event_stream(headers: &HeaderMap) -> bool {
     content_type
         .to_str()
         .ok()
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+        .and_then(|value| {
+            value
+                .parse::<mime::Mime>()
+                .ok()
+                .map(|media_type| (value, media_type))
+        })
+        .is_some_and(|(raw_value, media_type)| {
+            media_type.type_() == mime::TEXT
+                && media_type
+                    .subtype()
+                    .as_str()
+                    .eq_ignore_ascii_case("event-stream")
+                && (!raw_value.contains(';') || media_type.params().next().is_some())
+                && media_type
+                    .params()
+                    .all(|(_, value)| !value.as_str().is_empty())
+        })
 }
 
 pub(crate) fn has_identity_content_encoding(headers: &HeaderMap) -> bool {
@@ -60,6 +75,8 @@ pub struct EventObservation {
     pub event: Bytes,
     pub terminal: bool,
     pub done: bool,
+    pub safe: bool,
+    pub accepted: bool,
 }
 
 /// Errors raised while building a continuation request or rewriting an event.
@@ -100,6 +117,26 @@ impl CompletionContinuation {
         }
 
         let request: Value = serde_json::from_slice(body).ok()?;
+        let request_object = request.as_object()?;
+        const UNSUPPORTED_CONTROLS: &[&str] = &[
+            "tools",
+            "tool_choice",
+            "functions",
+            "function_call",
+            "response_format",
+            "json_schema",
+            "grammar",
+            "guided_json",
+            "guided_regex",
+            "guided_choice",
+            "guided_grammar",
+        ];
+        if UNSUPPORTED_CONTROLS
+            .iter()
+            .any(|key| request_object.contains_key(*key))
+        {
+            return None;
+        }
         let prompt = request.get("prompt")?.as_str()?.to_owned();
         let supported_n = match request.get("n") {
             None => true,
@@ -146,46 +183,30 @@ impl CompletionContinuation {
                 event: Bytes::copy_from_slice(event),
                 terminal: self.terminal,
                 done: false,
+                safe: true,
+                accepted: false,
             });
         };
 
+        let Ok(data) = std::str::from_utf8(&data) else {
+            return Ok(self.reject_event(event));
+        };
         if data == "[DONE]" {
             self.terminal = true;
             return Ok(EventObservation {
                 event: Bytes::copy_from_slice(event),
                 terminal: true,
                 done: true,
+                safe: true,
+                accepted: true,
             });
         }
 
-        let Ok(mut completion) = serde_json::from_str::<Value>(&data) else {
-            return Ok(EventObservation {
-                event: Bytes::copy_from_slice(event),
-                terminal: self.terminal,
-                done: false,
-            });
+        let Ok(mut completion) = serde_json::from_str::<Value>(data) else {
+            return Ok(self.reject_event(event));
         };
         let (text, terminal) = match completion_event(&completion) {
-            CompletionEvent::Unrecognized => {
-                if let Some(choices) = completion.get("choices").and_then(Value::as_array) {
-                    self.continuable = false;
-                    self.terminal |= choice_finish_reason(choices);
-                }
-                return Ok(EventObservation {
-                    event: Bytes::copy_from_slice(event),
-                    terminal: self.terminal,
-                    done: false,
-                });
-            }
-            CompletionEvent::Ambiguous { terminal } => {
-                self.continuable = false;
-                self.terminal |= terminal;
-                return Ok(EventObservation {
-                    event: Bytes::copy_from_slice(event),
-                    terminal: self.terminal,
-                    done: false,
-                });
-            }
+            CompletionEvent::Unsafe => return Ok(self.reject_event(event)),
             CompletionEvent::Recognized { text, terminal } => (text, terminal),
         };
 
@@ -206,12 +227,18 @@ impl CompletionContinuation {
             event,
             terminal: self.terminal,
             done: false,
+            safe: true,
+            accepted: true,
         })
     }
 
     /// Returns whether an interrupted response may issue another completion request.
     pub fn is_continuable(&self) -> bool {
         self.continuable && !self.terminal
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
     }
 
     /// Builds the next request with the emitted text appended to its prompt.
@@ -249,6 +276,17 @@ impl CompletionContinuation {
         self.generated_text.push_str(text);
     }
 
+    fn reject_event(&mut self, event: &[u8]) -> EventObservation {
+        self.continuable = false;
+        EventObservation {
+            event: Bytes::copy_from_slice(event),
+            terminal: self.terminal,
+            done: false,
+            safe: false,
+            accepted: false,
+        }
+    }
+
     fn establish_identity(&mut self, completion: &Value) {
         self.id = completion.get("id").cloned().or_else(|| self.id.take());
         self.model = completion
@@ -282,6 +320,7 @@ enum StreamInterruption {
     Done,
     Eof,
     Body(std::io::Error),
+    Framing(SseFramingError),
     IdleTimeout,
 }
 
@@ -290,6 +329,7 @@ impl StreamInterruption {
         match self {
             Self::Done | Self::Eof => None,
             Self::Body(error) => Some(error),
+            Self::Framing(error) => Some(std::io::Error::other(error)),
             Self::IdleTimeout => Some(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "upstream completion stream idle timeout",
@@ -302,7 +342,18 @@ impl StreamInterruption {
             Self::Done => "done",
             Self::Eof => "eof",
             Self::Body(_) => "body_error",
+            Self::Framing(_) => "framing_error",
             Self::IdleTimeout => "idle_timeout",
+        }
+    }
+
+    fn exhausted_reason(&self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Eof => "exhausted_eof",
+            Self::Body(_) => "exhausted_body_error",
+            Self::Framing(_) => "framing_error",
+            Self::IdleTimeout => "exhausted_idle_timeout",
         }
     }
 }
@@ -323,9 +374,13 @@ where
     let fallback = pool.fallback().cloned().unwrap_or_default();
     let mut selection = SelectionState::new(config.max_attempts, fallback.with_replacement);
     let stream = async_stream::stream! {
+        use tracing::Instrument;
+
         let mut current_body = initial_body;
         let mut current_guard = Some(initial_guard);
         let mut rewrite_identity = false;
+        let mut awaiting_resumption_event = false;
+        let mut finish_reason_recorded = false;
         let mut continuation_attempt = 0_u32;
         let mut total_backoff_ms = 0_u64;
 
@@ -350,14 +405,48 @@ where
                                 return;
                             }
                         };
+                        if rewrite_identity && !observation.safe {
+                            metrics::counter!(
+                                "onwards_stream_continuation_failures_total",
+                                "reason" => "unsafe_continuation_event"
+                            )
+                            .increment(1);
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::other(
+                                "unsafe completion event from continuation provider",
+                            ));
+                            return;
+                        }
+                        if !rewrite_identity && !observation.safe {
+                            metrics::counter!(
+                                "onwards_stream_continuation_failures_total",
+                                "reason" => "unsafe_initial_event"
+                            )
+                            .increment(1);
+                        }
+                        if rewrite_identity && awaiting_resumption_event && observation.accepted {
+                            awaiting_resumption_event = false;
+                            metrics::counter!("onwards_stream_continuation_resumptions_total")
+                                .increment(1);
+                        }
+                        if observation.terminal && !observation.done && !finish_reason_recorded {
+                            finish_reason_recorded = true;
+                            metrics::counter!(
+                                "onwards_stream_continuation_terminal_total",
+                                "reason" => "finish_reason"
+                            )
+                            .increment(1);
+                        }
                         let done = observation.done;
                         yield Ok::<Bytes, std::io::Error>(observation.event);
                         if done {
                             break StreamInterruption::Done;
                         }
                     }
-                    Some(Err(error)) => {
+                    Some(Err(SseStreamError::Source(error))) => {
                         break StreamInterruption::Body(std::io::Error::other(error));
+                    }
+                    Some(Err(SseStreamError::Framing(error))) => {
+                        break StreamInterruption::Framing(error);
                     }
                     None => break StreamInterruption::Eof,
                 }
@@ -381,6 +470,23 @@ where
                 break;
             }
 
+            if matches!(interruption, StreamInterruption::Framing(_)) {
+                metrics::counter!(
+                    "onwards_stream_continuation_failures_total",
+                    "reason" => "framing_error"
+                )
+                .increment(1);
+                if let Some(error) = interruption.into_error() {
+                    yield Err::<Bytes, std::io::Error>(error);
+                }
+                break;
+            }
+
+            if continuation.is_terminal() {
+                break;
+            }
+
+            let exhausted_reason = interruption.exhausted_reason();
             let final_error = interruption.into_error();
             if !continuation.is_continuable() {
                 if let Some(error) = final_error {
@@ -393,6 +499,11 @@ where
             let mut next_guard = None;
             loop {
                 if continuation_attempt as usize >= config.max_attempts {
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => "max_attempts"
+                    )
+                    .increment(1);
                     break;
                 }
                 let retry_index = continuation_attempt.saturating_add(1);
@@ -426,12 +537,19 @@ where
                 continuation_attempt = continuation_attempt.saturating_add(1);
                 metrics::counter!("onwards_stream_continuation_attempts_total").increment(1);
                 let target = target.clone();
+                let attempt_span = tracing::info_span!(
+                    "onwards.stream_continuation_attempt",
+                    attempt = continuation_attempt,
+                    outcome = tracing::field::Empty,
+                    http.response.status_code = tracing::field::Empty,
+                );
 
                 if target
                     .limiter
                     .as_ref()
                     .is_some_and(|limiter| limiter.check().is_err())
                 {
+                    attempt_span.record("outcome", "rate_limit");
                     drop(guard);
                     metrics::counter!(
                         "onwards_stream_continuation_failures_total",
@@ -482,15 +600,19 @@ where
                     upstream = %upstream_uri,
                     "Requesting completion stream continuation"
                 );
+                let request_future = http_client
+                    .request(request)
+                    .instrument(attempt_span.clone());
                 let response = if let Some(timeout_secs) = target.request_timeout_secs {
                     match tokio::time::timeout(
                         Duration::from_secs(timeout_secs),
-                        http_client.request(request),
+                        request_future,
                     )
                     .await
                     {
                         Ok(response) => response,
                         Err(_) => {
+                            attempt_span.record("outcome", "header_timeout");
                             drop(guard);
                             metrics::counter!(
                                 "onwards_stream_continuation_failures_total",
@@ -501,12 +623,13 @@ where
                         }
                     }
                 } else {
-                    http_client.request(request).await
+                    request_future.await
                 };
 
                 let response = match response {
                     Ok(response) => response,
                     Err(error) => {
+                        attempt_span.record("outcome", "network_error");
                         drop(guard);
                         metrics::counter!(
                             "onwards_stream_continuation_failures_total",
@@ -522,7 +645,9 @@ where
                     }
                 };
                 let status = response.status().as_u16();
+                attempt_span.record("http.response.status_code", status);
                 if !(200..300).contains(&status) {
+                    attempt_span.record("outcome", "status");
                     drop(response);
                     drop(guard);
                     metrics::counter!(
@@ -536,6 +661,7 @@ where
                     break;
                 }
                 if !is_event_stream(response.headers()) {
+                    attempt_span.record("outcome", "content_type");
                     drop(response);
                     drop(guard);
                     metrics::counter!(
@@ -546,6 +672,7 @@ where
                     continue;
                 }
                 if !has_identity_content_encoding(response.headers()) {
+                    attempt_span.record("outcome", "content_encoding");
                     drop(response);
                     drop(guard);
                     metrics::counter!(
@@ -558,7 +685,7 @@ where
 
                 next_body = Some(response.into_body());
                 next_guard = Some(guard);
-                metrics::counter!("onwards_stream_continuation_resumptions_total").increment(1);
+                attempt_span.record("outcome", "headers_accepted");
                 break;
             }
 
@@ -567,8 +694,14 @@ where
                     current_body = body;
                     current_guard = Some(guard);
                     rewrite_identity = true;
+                    awaiting_resumption_event = true;
                 }
                 _ => {
+                    metrics::counter!(
+                        "onwards_stream_continuation_failures_total",
+                        "reason" => exhausted_reason
+                    )
+                    .increment(1);
                     if let Some(error) = final_error {
                         yield Err::<Bytes, std::io::Error>(error);
                     }
@@ -586,25 +719,35 @@ enum CompletionEvent<'a> {
         text: Option<&'a str>,
         terminal: bool,
     },
-    Ambiguous {
-        terminal: bool,
-    },
-    Unrecognized,
+    Unsafe,
 }
 
 fn completion_event(completion: &Value) -> CompletionEvent<'_> {
     let Some(object) = completion.as_object() else {
-        return CompletionEvent::Unrecognized;
+        return CompletionEvent::Unsafe;
     };
-    let Some(choices) = object.get("choices").and_then(Value::as_array) else {
+    if object.contains_key("error") {
+        return CompletionEvent::Unsafe;
+    }
+    if object
+        .get("object")
+        .is_some_and(|value| value.as_str() != Some("text_completion"))
+    {
+        return CompletionEvent::Unsafe;
+    }
+
+    let Some(choices_value) = object.get("choices") else {
         return if choice_less_completion_metadata(completion) {
             CompletionEvent::Recognized {
                 text: None,
                 terminal: false,
             }
         } else {
-            CompletionEvent::Unrecognized
+            CompletionEvent::Unsafe
         };
+    };
+    let Some(choices) = choices_value.as_array() else {
+        return CompletionEvent::Unsafe;
     };
 
     if choices.is_empty() && choice_less_completion_metadata(completion) {
@@ -615,27 +758,32 @@ fn completion_event(completion: &Value) -> CompletionEvent<'_> {
     }
 
     if choices.len() != 1 {
-        return CompletionEvent::Ambiguous {
-            terminal: choice_finish_reason(choices),
-        };
+        return CompletionEvent::Unsafe;
     }
 
     let Some(choice) = choices.first().and_then(Value::as_object) else {
-        return CompletionEvent::Unrecognized;
+        return CompletionEvent::Unsafe;
     };
-    let text = choice.get("text").and_then(Value::as_str);
-    let finish_reason = choice
-        .get("finish_reason")
-        .is_some_and(|reason| !reason.is_null());
-    let explicitly_completion =
-        object.get("object").and_then(Value::as_str) == Some("text_completion");
-    if text.is_none() && !(explicitly_completion && choice.contains_key("finish_reason")) {
-        return CompletionEvent::Unrecognized;
+    const SUPPORTED_CHOICE_FIELDS: &[&str] = &["index", "text", "finish_reason", "logprobs"];
+    if choice
+        .keys()
+        .any(|key| !SUPPORTED_CHOICE_FIELDS.contains(&key.as_str()))
+        || choice.get("index").and_then(Value::as_u64) != Some(0)
+    {
+        return CompletionEvent::Unsafe;
     }
+    let Some(text) = choice.get("text").and_then(Value::as_str) else {
+        return CompletionEvent::Unsafe;
+    };
+    let terminal = match choice.get("finish_reason") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(_)) => true,
+        Some(_) => return CompletionEvent::Unsafe,
+    };
 
     CompletionEvent::Recognized {
-        text,
-        terminal: finish_reason,
+        text: Some(text),
+        terminal,
     }
 }
 
@@ -647,33 +795,6 @@ fn choice_less_completion_metadata(completion: &Value) -> bool {
         && completion.contains_key("id")
         && completion.contains_key("model")
         && completion.contains_key("created")
-}
-
-fn choice_finish_reason(choices: &[Value]) -> bool {
-    choices.iter().any(|choice| {
-        choice
-            .get("finish_reason")
-            .is_some_and(|reason| !reason.is_null())
-    })
-}
-
-fn event_data(event: &[u8]) -> Option<String> {
-    let mut data = Vec::new();
-    let mut found_data = false;
-
-    for line in event.split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(value) = line.strip_prefix(b"data:") else {
-            continue;
-        };
-        if found_data {
-            data.push(b'\n');
-        }
-        found_data = true;
-        data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
-    }
-
-    found_data.then(|| String::from_utf8(data).ok()).flatten()
 }
 
 fn serialize_sse(completion: &Value) -> Result<Vec<u8>, ContinuationError> {
@@ -758,11 +879,54 @@ mod tests {
     }
 
     #[test]
+    fn advanced_generation_controls_are_ineligible() {
+        let config = StreamContinuationConfig {
+            enabled: true,
+            endpoints: vec!["/v1/completions".to_string()],
+            max_attempts: 1,
+            max_buffered_bytes: 1024,
+            idle_timeout_ms: None,
+        };
+
+        for key in [
+            "tools",
+            "tool_choice",
+            "functions",
+            "function_call",
+            "response_format",
+            "json_schema",
+            "grammar",
+            "guided_json",
+            "guided_regex",
+            "guided_choice",
+            "guided_grammar",
+        ] {
+            let mut request = serde_json::json!({
+                "prompt": "hello",
+                "stream": true
+            });
+            request[key] = serde_json::json!({"enabled": true});
+            let body = serde_json::to_vec(&request).unwrap();
+
+            assert!(
+                CompletionContinuation::from_request(
+                    "/v1/completions",
+                    &Method::POST,
+                    &body,
+                    &config,
+                )
+                .is_none(),
+                "{key} must disable continuation"
+            );
+        }
+    }
+
+    #[test]
     fn interrupted_completion_builds_prefix_request() {
         let mut state = eligible_state(1024);
         state
             .observe_event(
-                br#"data: {"id":"cmpl-a","created":1,"model":"m","choices":[{"text":"hello","finish_reason":null}]}
+                br#"data: {"id":"cmpl-a","created":1,"model":"m","choices":[{"index":0,"text":"hello","finish_reason":null}]}
 
 "#,
                 false,
@@ -789,7 +953,7 @@ mod tests {
         assert!(
             state
                 .observe_event(
-                    br#"data: {"choices":[{"text":"","finish_reason":"stop"}]}
+                    br#"data: {"choices":[{"index":0,"text":"","finish_reason":"stop"}]}
 
 "#,
                     false,
@@ -805,7 +969,7 @@ mod tests {
         let mut state = eligible_state(1024);
         state
             .observe_event(
-                br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"text":"one","finish_reason":null}]}
+                br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"index":0,"text":"one","finish_reason":null}]}
 
 "#,
                 false,
@@ -814,7 +978,7 @@ mod tests {
 
         let observation = state
             .observe_event(
-                b"data: {\"id\":\"cmpl-next\",\"created\":2,\ndata: \"model\":\"next\",\"choices\":[{\"text\":\"two\",\"finish_reason\":null}]}\n\n",
+                b"data: {\"id\":\"cmpl-next\",\"created\":2,\ndata: \"model\":\"next\",\"choices\":[{\"index\":0,\"text\":\"two\",\"finish_reason\":null}]}\n\n",
 
                 true,
             )
@@ -823,34 +987,34 @@ mod tests {
         let rewritten = String::from_utf8(observation.event.to_vec()).unwrap();
         assert_eq!(
             rewritten,
-            "data: {\"choices\":[{\"finish_reason\":null,\"text\":\"two\"}],\"created\":1,\"id\":\"cmpl-first\",\"model\":\"first\"}\n\n"
+            "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"text\":\"two\"}],\"created\":1,\"id\":\"cmpl-first\",\"model\":\"first\"}\n\n"
         );
     }
 
     #[test]
-    fn preserves_comments_and_malformed_events() {
+    fn comments_are_safe_but_malformed_events_disable_continuation() {
         let mut state = eligible_state(1024);
-        for event in [
-            b": keepalive\n\n".as_slice(),
-            b"data: {not-json}\n\n".as_slice(),
-            b"event: ping\ndata: unknown\n\n".as_slice(),
-        ] {
-            let observation = state.observe_event(event, true).unwrap();
-            assert_eq!(observation.event.as_ref(), event);
-            assert!(!observation.terminal);
-        }
+        let comment = b": keepalive\n\n";
+        let observation = state.observe_event(comment, false).unwrap();
+        assert_eq!(observation.event.as_ref(), comment);
+        assert!(state.is_continuable());
+
+        let malformed = b"data: {not-json}\n\n";
+        let observation = state.observe_event(malformed, false).unwrap();
+        assert_eq!(observation.event.as_ref(), malformed);
+        assert!(!state.is_continuable());
     }
 
     #[test]
     fn multiple_choices_disable_continuation_without_appending_a_prefix() {
         let mut state = eligible_state(1024);
-        let event = br#"data: {"choices":[{"text":"one","finish_reason":null},{"text":"two","finish_reason":"stop"}]}
+        let event = br#"data: {"choices":[{"index":0,"text":"one","finish_reason":null},{"index":1,"text":"two","finish_reason":"stop"}]}
 
 "#;
         let observation = state.observe_event(event, true).unwrap();
 
         assert_eq!(observation.event.as_ref(), event);
-        assert!(observation.terminal);
+        assert!(!observation.terminal);
         assert!(!state.is_continuable());
         assert!(state.generated_text.is_empty());
     }
@@ -860,7 +1024,7 @@ mod tests {
         let mut state = eligible_state(5);
         state
             .observe_event(
-                br#"data: {"choices":[{"text":"hello","finish_reason":null}]}
+                br#"data: {"choices":[{"index":0,"text":"hello","finish_reason":null}]}
 
 "#,
                 false,
@@ -868,7 +1032,7 @@ mod tests {
             .unwrap();
         state
             .observe_event(
-                br#"data: {"choices":[{"text":"!","finish_reason":null}]}
+                br#"data: {"choices":[{"index":0,"text":"!","finish_reason":null}]}
 
 "#,
                 false,
@@ -882,7 +1046,7 @@ mod tests {
     #[test]
     fn initial_recognized_event_receives_stable_fallback_identity() {
         let mut state = eligible_state(1024);
-        let event = br#"data: {"choices":[{"text":"hello","finish_reason":null}]}
+        let event = br#"data: {"choices":[{"index":0,"text":"hello","finish_reason":null}]}
 
 "#;
         let observation = state.observe_event(event, false).unwrap();
@@ -897,26 +1061,20 @@ mod tests {
 
     #[test]
     fn unrecognized_choice_events_pass_through_and_disable_continuation() {
-        for (event, terminal) in [
-            (
-                br#"data: {"id":"chat-next","choices":[{"delta":{"content":"two"},"finish_reason":"stop"}]}
+        for event in [
+            br#"data: {"id":"chat-next","choices":[{"index":0,"delta":{"content":"two"},"finish_reason":"stop"}]}
 
 "#
-                .as_slice(),
-                true,
-            ),
-            (
-                br#"data: {"id":"empty-choice","choices":[{}]}
+            .as_slice(),
+            br#"data: {"id":"empty-choice","choices":[{}]}
 
 "#
-                .as_slice(),
-                false,
-            ),
+            .as_slice(),
         ] {
             let mut state = eligible_state(1024);
             state
                 .observe_event(
-                    br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"text":"one","finish_reason":null}]}
+                br#"data: {"id":"cmpl-first","created":1,"model":"first","choices":[{"index":0,"text":"one","finish_reason":null}]}
 
 "#,
                     false,
@@ -924,13 +1082,13 @@ mod tests {
                 .unwrap();
             let observation = state.observe_event(event, true).unwrap();
             assert_eq!(observation.event.as_ref(), event);
-            assert_eq!(observation.terminal, terminal);
+            assert!(!observation.terminal, "unsafe finish reasons are not trusted");
             assert!(!state.is_continuable());
         }
     }
 
     #[test]
-    fn unrecognized_json_without_choices_passes_through_without_disabling_continuation() {
+    fn unrecognized_json_without_choices_passes_through_and_disables_continuation() {
         let mut state = eligible_state(1024);
         let event = br#"data: {"id":"other","type":"notification","payload":{"value":1}}
 
@@ -939,7 +1097,85 @@ mod tests {
         let observation = state.observe_event(event, true).unwrap();
         assert_eq!(observation.event.as_ref(), event);
         assert!(!observation.terminal);
-        assert!(state.is_continuable());
+        assert!(!state.is_continuable());
+    }
+
+    #[test]
+    fn unsafe_completion_shapes_fail_closed_without_changing_initial_bytes() {
+        for event in [
+            b"data: {not-json}\n\n".as_slice(),
+            br#"data: {"error":{"message":"failed"}}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"index":0,"text":"x","finish_reason":null}],"error":{"message":"failed"}}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"index":0,"delta":{"content":"x"},"finish_reason":null}]}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"index":0,"message":{"content":"x"},"finish_reason":null}]}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"index":0,"text":"x","finish_reason":null,"tool_calls":[]}]}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"text":"x","finish_reason":null}]}
+
+"#
+            .as_slice(),
+            br#"data: {"choices":[{"index":1,"text":"x","finish_reason":null}]}
+
+"#
+            .as_slice(),
+            br#"data: {"type":"notification","payload":{"value":1}}
+
+"#
+            .as_slice(),
+        ] {
+            let mut state = eligible_state(1024);
+            let observation = state.observe_event(event, false).unwrap();
+
+            assert_eq!(observation.event.as_ref(), event);
+            assert!(!state.is_continuable(), "unsafe event: {event:?}");
+        }
+    }
+
+    #[test]
+    fn done_without_post_colon_space_and_bom_are_recognized() {
+        let mut state = eligible_state(1024);
+        let event = b"\xef\xbb\xbfdata:[DONE]\r\n\r\n";
+        let observation = state.observe_event(event, false).unwrap();
+
+        assert_eq!(observation.event.as_ref(), event);
+        assert!(observation.done);
+        assert!(observation.terminal);
+        assert!(!state.is_continuable());
+    }
+
+    #[test]
+    fn observation_flags_distinguish_comments_content_and_unsafe_events() {
+        let mut state = eligible_state(1024);
+        let comment = state.observe_event(b": ping\n\n", false).unwrap();
+        assert!(comment.safe);
+        assert!(!comment.accepted);
+
+        let content = state
+            .observe_event(
+                b"data:{\"choices\":[{\"index\":0,\"text\":\"x\",\"finish_reason\":null}]}\n\n",
+                false,
+            )
+            .unwrap();
+        assert!(content.safe);
+        assert!(content.accepted);
+
+        let unsafe_event = state.observe_event(b"data:{not-json}\n\n", false).unwrap();
+        assert!(!unsafe_event.safe);
+        assert!(!unsafe_event.accepted);
     }
 
     #[test]
@@ -947,7 +1183,7 @@ mod tests {
         let mut state = eligible_state(1024);
         let initial = state
             .observe_event(
-                br#"data: {"id":"cmpl-first","choices":[{"text":"one","finish_reason":null}]}
+                br#"data: {"id":"cmpl-first","choices":[{"index":0,"text":"one","finish_reason":null}]}
 
 "#,
                 false,
@@ -958,7 +1194,7 @@ mod tests {
 
         for (model, created) in [("provider-a", 2), ("provider-b", 3)] {
             let event = format!(
-                "data: {{\"id\":\"cmpl-next\",\"created\":{created},\"model\":\"{model}\",\"choices\":[{{\"text\":\"two\",\"finish_reason\":null}}]}}\n\n"
+                "data: {{\"id\":\"cmpl-next\",\"created\":{created},\"model\":\"{model}\",\"choices\":[{{\"index\":0,\"text\":\"two\",\"finish_reason\":null}}]}}\n\n"
             );
             let observation = state.observe_event(event.as_bytes(), true).unwrap();
             let rewritten: Value =
@@ -992,6 +1228,39 @@ mod tests {
     }
 
     #[test]
+    fn event_stream_media_type_requires_one_fully_valid_mime_value() {
+        for valid in [
+            "text/event-stream",
+            "Text/Event-Stream; charset=utf-8",
+            "TEXT/EVENT-STREAM; Charset=\"utf-8\"",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, valid.parse().unwrap());
+            assert!(is_event_stream(&headers), "valid MIME rejected: {valid}");
+        }
+
+        for invalid in [
+            "text/event-stream;",
+            "text/event-stream; charset",
+            "text/event-stream; charset=",
+            "text/event-stream, application/json",
+            "text/event-stream; charset=utf-8, application/json",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, invalid.parse().unwrap());
+            assert!(
+                !is_event_stream(&headers),
+                "invalid MIME accepted: {invalid}"
+            );
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.append(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        headers.append(CONTENT_TYPE, "text/event-stream".parse().unwrap());
+        assert!(!is_event_stream(&headers));
+    }
+
+    #[test]
     fn unambiguous_choice_less_completion_metadata_captures_initial_identity() {
         let mut state = eligible_state(1024);
         state
@@ -1005,7 +1274,7 @@ mod tests {
 
         let observation = state
             .observe_event(
-                br#"data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"text":"two","finish_reason":null}]}
+                br#"data: {"id":"cmpl-next","created":2,"model":"next","choices":[{"index":0,"text":"two","finish_reason":null}]}
 
 "#,
                 true,
@@ -1020,7 +1289,8 @@ mod tests {
 
     #[test]
     fn multibyte_text_at_the_buffer_boundary_is_retained_but_overflow_is_not() {
-        let event = "data: {\"choices\":[{\"text\":\"éé\",\"finish_reason\":null}]}\n\n";
+        let event =
+            "data: {\"choices\":[{\"index\":0,\"text\":\"éé\",\"finish_reason\":null}]}\n\n";
 
         let mut exact_boundary = eligible_state(4);
         exact_boundary

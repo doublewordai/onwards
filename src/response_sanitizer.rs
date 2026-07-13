@@ -300,8 +300,8 @@ impl ResponseSanitizer {
         let mut sanitized_lines = Vec::new();
 
         for line in body_str.lines() {
-            if let Some(data_part) = line.strip_prefix("data: ") {
-                // Skip "data: " prefix
+            if let Some(data_part) = line.strip_prefix("data:") {
+                let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
 
                 if data_part.trim() == "[DONE]" {
                     // Preserve [DONE] marker as-is
@@ -376,7 +376,8 @@ impl ResponseSanitizer {
         let mut sanitized_lines = Vec::new();
 
         for line in body_str.lines() {
-            if let Some(data_part) = line.strip_prefix("data: ") {
+            if let Some(data_part) = line.strip_prefix("data:") {
+                let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
                 if data_part.trim() == "[DONE]" {
                     sanitized_lines.push(line.to_string());
                     continue;
@@ -572,6 +573,20 @@ mod tests {
             "Should have exactly 2 trailing newlines, got {}",
             trailing_count
         );
+    }
+
+    #[test]
+    fn streaming_sanitizers_preserve_done_without_a_post_colon_space() {
+        let sanitizer = ResponseSanitizer {
+            original_model: None,
+        };
+
+        for result in [
+            sanitizer.sanitize_streaming(b"data:[DONE]\n\n"),
+            sanitizer.sanitize_completion_streaming(b"data:[DONE]\n\n"),
+        ] {
+            assert_eq!(result.unwrap().unwrap().as_ref(), b"data:[DONE]\n\n");
+        }
     }
 
     #[test]

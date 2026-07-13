@@ -7,6 +7,7 @@ use crate::AppState;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::load_balancer::ProviderPool;
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RoutingAction, Target};
@@ -17,8 +18,8 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
         header::{
-            ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, TRAILER,
-            TRANSFER_ENCODING,
+            ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+            TRAILER, TRANSFER_ENCODING,
         },
     },
     response::{IntoResponse, Response},
@@ -102,24 +103,16 @@ enum SseEventKind {
 /// multi-line, and non-spaced (`data:{...}`) framing are all handled. A frame
 /// with no `data:` field is a comment/keep-alive.
 fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
-    let Ok(text) = std::str::from_utf8(chunk) else {
-        // Non-UTF-8 can't be an error envelope we understand — forward as-is.
+    let Some(data) = crate::sse::event_data(chunk) else {
+        return if std::str::from_utf8(chunk).is_ok() {
+            SseEventKind::Comment
+        } else {
+            SseEventKind::Data
+        };
+    };
+    let Ok(data) = std::str::from_utf8(&data) else {
         return SseEventKind::Data;
     };
-    let mut data = String::new();
-    let mut has_data = false;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            has_data = true;
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-    }
-    if !has_data {
-        return SseEventKind::Comment;
-    }
     if data.trim() == "[DONE]" {
         return SseEventKind::Data;
     }
@@ -347,6 +340,27 @@ pub(crate) struct CanonicalRequestPath(pub(crate) &'static str);
 
 #[derive(Clone, Copy)]
 pub(crate) struct PreserveEncodedCompletion;
+
+#[derive(Clone, Copy)]
+struct CompositeResponsePolicy {
+    trusted: bool,
+    sanitize_response: bool,
+}
+
+impl CompositeResponsePolicy {
+    fn for_pool(pool: &ProviderPool) -> Self {
+        Self {
+            trusted: pool
+                .providers()
+                .iter()
+                .all(|provider| provider.target.trusted.unwrap_or_else(|| pool.is_trusted())),
+            sanitize_response: pool
+                .providers()
+                .iter()
+                .any(|provider| provider.target.sanitize_response),
+        }
+    }
+}
 
 impl UpstreamRequestMetadata {
     fn new(method: Method, path_and_query: String, headers: HeaderMap, pool_trusted: bool) -> Self {
@@ -776,6 +790,9 @@ where
             )
             .map(|continuation| (continuation, config.clone()))
         });
+    let composite_response_policy = completion_continuation
+        .as_ref()
+        .map(|_| CompositeResponsePolicy::for_pool(&pool));
     let request_metadata = UpstreamRequestMetadata::new(
         method.clone(),
         path_and_query.clone(),
@@ -1273,12 +1290,14 @@ where
             Scan2xx::Clean => {}
         }
 
+        let mut composite_content_type = None;
         if is_sse
             && is_identity_encoded
             && (200..300).contains(&status)
             && let Some((continuation, config)) = completion_continuation.take()
         {
             let (mut parts, body) = response.into_parts();
+            composite_content_type = parts.headers.get(CONTENT_TYPE).cloned();
             clear_composite_representation_headers(&mut parts.headers);
             let body = crate::stream_continuation::wrap_completion_stream(
                 body,
@@ -1293,13 +1312,24 @@ where
             );
             response = Response::from_parts(parts, body);
         }
+        let response_sanitize = composite_content_type
+            .as_ref()
+            .and(composite_response_policy)
+            .map_or(target.sanitize_response, |policy| policy.sanitize_response);
+        let response_trusted = composite_content_type
+            .as_ref()
+            .and(composite_response_policy)
+            .map_or_else(
+                || target.trusted.unwrap_or_else(|| pool.is_trusted()),
+                |policy| policy.trusted,
+            );
 
         // Determine if SSE buffering is needed for non-strict sanitization
         // Note: Strict mode handlers apply their own buffering before their sanitizers,
         // so we skip buffering here to avoid double-wrapping
         let needs_sse_buffering = !state.targets.strict_mode
             && state.response_transform_fn.is_some()
-            && target.sanitize_response
+            && response_sanitize
             && !preserve_encoded_completion
             && (200..300).contains(&status);
 
@@ -1319,7 +1349,7 @@ where
         // Per-target opt-in via sanitize_response flag, only for 2xx responses
         // Skip if strict mode is enabled - strict handlers do their own sanitization
         if let Some(ref transform_fn) = state.response_transform_fn
-            && target.sanitize_response
+            && response_sanitize
             && (200..300).contains(&status)
             && !state.targets.strict_mode
             && !preserve_encoded_completion
@@ -1468,6 +1498,11 @@ where
             );
         }
 
+        if let Some(content_type) = composite_content_type {
+            clear_composite_representation_headers(response.headers_mut());
+            response.headers_mut().insert(CONTENT_TYPE, content_type);
+        }
+
         record_response_status(response.status().as_u16());
         debug!(
             "Returning response with status {}, content-length: {:?}, strict_mode: {}",
@@ -1475,10 +1510,9 @@ where
             response.headers().get(CONTENT_LENGTH),
             state.targets.strict_mode
         );
-        let resolved_trust = target.trusted.unwrap_or_else(|| pool.is_trusted());
         response
             .extensions_mut()
-            .insert(ResolvedTrust(resolved_trust));
+            .insert(ResolvedTrust(response_trusted));
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
@@ -1693,6 +1727,11 @@ mod tests {
             Data
         );
         assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        assert_eq!(classify_sse_event(b"\xef\xbb\xbfdata:[DONE]\r\r"), Data);
+        assert_eq!(
+            classify_sse_event(b"\xef\xbb\xbfdata:{\"error\":\rdata:{\"code\":429}}\r\r"),
+            Error(429)
+        );
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);

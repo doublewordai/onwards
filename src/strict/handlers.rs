@@ -1021,7 +1021,8 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                             buffer = buffer[event_end + 2..].to_string();
 
                             for line in event_text.lines() {
-                                if let Some(data) = line.strip_prefix("data: ") {
+                                if let Some(data) = line.strip_prefix("data:") {
+                                    let data = data.strip_prefix(' ').unwrap_or(data);
                                     if data.trim() == "[DONE]" {
                                         trace!("Received [DONE] marker");
                                         continue;
@@ -1470,7 +1471,8 @@ async fn sanitize_streaming_chat_response(
                 // Process SSE line-by-line for streaming chunks,
                 // preserving empty lines and ignoring comment/event-type lines
                 for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
+                    if let Some(data_part) = line.strip_prefix("data:") {
+                        let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
                         // This is a data line
 
                         // Handle [DONE] marker
@@ -1683,7 +1685,8 @@ async fn sanitize_streaming_completions_response(
                 let mut sanitized_lines = Vec::new();
 
                 for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
+                    if let Some(data_part) = line.strip_prefix("data:") {
+                        let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
                         if data_part.trim() == "[DONE]" {
                             sanitized_lines.push(line.to_string());
                             continue;
@@ -1968,7 +1971,8 @@ async fn sanitize_streaming_responses_response(
 
                 // Process SSE line-by-line for streaming chunks
                 for line in chunk_str.lines() {
-                    if let Some(data_part) = line.strip_prefix("data: ") {
+                    if let Some(data_part) = line.strip_prefix("data:") {
+                        let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
                         // This is a data line
 
                         // Handle [DONE] marker
@@ -2314,6 +2318,30 @@ mod tests {
     use dashmap::DashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn strict_streaming_sanitizers_preserve_done_without_post_colon_space() {
+        let completion = Response::builder()
+            .body(Body::from("data:[DONE]\n\n"))
+            .unwrap();
+        let chat = Response::builder()
+            .body(Body::from("data:[DONE]\n\n"))
+            .unwrap();
+        let responses = Response::builder()
+            .body(Body::from("data:[DONE]\n\n"))
+            .unwrap();
+
+        for response in [
+            sanitize_streaming_completions_response(completion, "m".to_string(), false).await,
+            sanitize_streaming_chat_response(chat, "m".to_string(), false).await,
+            sanitize_streaming_responses_response(responses, "m".to_string(), false, None).await,
+        ] {
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"data:[DONE]\n\n");
+        }
+    }
 
     // --- ZDR no-payload-logging regression tests (COR-497) ---
 

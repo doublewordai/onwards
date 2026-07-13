@@ -1080,6 +1080,7 @@ impl Targets {
             // Convert provider specs to providers
             // Pool-level sanitize_response enables sanitization for all providers
             let pool_sanitize = pool_config.sanitize_response;
+            let pool_response_headers = pool_config.response_headers;
             let providers: Vec<Provider> = pool_config
                 .providers
                 .into_iter()
@@ -1091,6 +1092,12 @@ impl Targets {
                         .map(|cl| cl.max_concurrent_requests);
                     // Enable sanitization if either pool or provider level is true
                     spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+                    let mut response_headers = pool_response_headers.clone().unwrap_or_default();
+                    if let Some(provider_headers) = spec.response_headers.take() {
+                        response_headers.extend(provider_headers);
+                    }
+                    spec.response_headers =
+                        (!response_headers.is_empty()).then_some(response_headers);
                     let target: Target = spec.into();
                     match concurrency_limit {
                         Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
