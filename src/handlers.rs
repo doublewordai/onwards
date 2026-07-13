@@ -532,7 +532,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
-    let canonical_reasoning = if !body_bytes.is_empty() {
+    let canonical_reasoning = if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
             OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
         })?;

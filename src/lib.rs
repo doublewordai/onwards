@@ -3328,6 +3328,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_non_reasoning_routes_allow_non_json_payloads() {
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "whisper-1".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://audio.example.com".parse().unwrap())
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+        let payload = "--boundary\r\ncontent-disposition: form-data\r\n\r\naudio\r\n--boundary--";
+
+        let response = server
+            .post("/v1/audio/transcriptions")
+            .add_header("model-override", "whisper-1")
+            .add_header("content-type", "multipart/form-data; boundary=boundary")
+            .text(payload)
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body, payload.as_bytes());
+    }
+
+    #[tokio::test]
     async fn test_invalid_reasoning_effort_returns_parameter_specific_400() {
         let reasoning_translation = serde_json::from_value(json!({
             "chat_completions": {

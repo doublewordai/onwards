@@ -166,6 +166,10 @@ impl ApiSurface {
     }
 }
 
+pub(crate) fn uses_reasoning_contract(path: &str) -> bool {
+    !matches!(ApiSurface::from_path(path), ApiSurface::Other)
+}
+
 impl ReasoningTranslationConfig {
     /// Validate all target paths and mapped values before accepting configuration.
     pub fn validate(&self) -> Result<(), ReasoningError> {
@@ -436,21 +440,25 @@ fn remove_json_pointer(body: &mut Value, path: &str) {
     let Ok(segments) = pointer_segments(path) else {
         return;
     };
-    let mut current = body;
-    for segment in &segments[..segments.len() - 1] {
-        let Some(next) = current
-            .as_object_mut()
-            .and_then(|object| object.get_mut(segment))
-        else {
-            return;
-        };
-        current = next;
+    remove_json_pointer_segments(body, &segments);
+}
+
+fn remove_json_pointer_segments(current: &mut Value, segments: &[String]) -> bool {
+    let Some(object) = current.as_object_mut() else {
+        return false;
+    };
+    if segments.len() == 1 {
+        return object.remove(&segments[0]).is_some() && object.is_empty();
     }
-    if let Some(object) = current.as_object_mut()
-        && let Some(last) = segments.last()
-    {
-        object.remove(last);
+
+    let child_is_empty = object
+        .get_mut(&segments[0])
+        .is_some_and(|child| remove_json_pointer_segments(child, &segments[1..]));
+    if child_is_empty {
+        object.remove(&segments[0]);
+        return object.is_empty();
     }
+    false
 }
 
 fn json_depth(value: &Value) -> usize {
@@ -535,6 +543,48 @@ mod tests {
         config.apply("/v1/chat/completions", &mut body).unwrap();
 
         assert_eq!(body["thinking"], json!({"type": "enabled"}));
+    }
+
+    #[test]
+    fn responses_translation_removes_empty_canonical_parent() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "responses": {
+                "target_path": "/thinking",
+                "values": {"low": {"type": "enabled"}}
+            }
+        }))
+        .unwrap();
+        let mut body = json!({
+            "model": "model",
+            "input": "Hello",
+            "reasoning": {"effort": "low"}
+        });
+
+        config.apply("/v1/responses", &mut body).unwrap();
+
+        assert!(body.get("reasoning").is_none());
+        assert_eq!(body["thinking"], json!({"type": "enabled"}));
+    }
+
+    #[test]
+    fn responses_translation_preserves_canonical_reasoning_siblings() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "responses": {
+                "target_path": "/thinking",
+                "values": {"low": true}
+            }
+        }))
+        .unwrap();
+        let mut body = json!({
+            "model": "model",
+            "input": "Hello",
+            "reasoning": {"effort": "low", "summary": "auto"}
+        });
+
+        config.apply("/v1/responses", &mut body).unwrap();
+
+        assert_eq!(body["reasoning"], json!({"summary": "auto"}));
+        assert_eq!(body["thinking"], json!(true));
     }
 
     #[test]
