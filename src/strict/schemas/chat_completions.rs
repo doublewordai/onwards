@@ -160,6 +160,10 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
 
+    /// Canonical OpenAI reasoning effort.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<serde_json::Value>,
+
     /// Presence penalty (-2.0 to 2.0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,

@@ -140,12 +140,16 @@ impl OnwardsErrorResponse {
     }
 
     pub fn bad_request(message: &str, param: Option<&str>) -> Self {
+        Self::invalid_request(message, param, "bad_request")
+    }
+
+    pub fn invalid_request(message: &str, param: Option<&str>, code: &str) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
                 message: message.to_owned(),
                 r#type: "invalid_request_error".to_string(),
                 param: param.map(|s| s.to_string()),
-                code: "bad_request".to_string(),
+                code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
         }

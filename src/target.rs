@@ -15,6 +15,7 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
+use crate::reasoning::ReasoningTranslationConfig;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -97,6 +98,10 @@ pub struct ProviderSpec {
     /// `Some(false)` overrides the inherited value.
     #[serde(default)]
     pub propagate_trace_context: Option<bool>,
+
+    /// Translate canonical OpenAI reasoning controls into this provider's request shape.
+    #[serde(default)]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 /// Configuration for Open Responses API behavior
@@ -383,6 +388,10 @@ pub struct TargetSpec {
     /// reading the full response body (which may be streamed over a longer period).
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+
+    /// Translate canonical OpenAI reasoning controls into this provider's request shape.
+    #[serde(default)]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -469,6 +478,7 @@ impl TargetSpecOrList {
                         // format), per-provider trace-context overrides are honoured;
                         // an unset value still inherits the resolved trusted value.
                         propagate_trace_context: t.propagate_trace_context,
+                        reasoning_translation: t.reasoning_translation,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -509,6 +519,7 @@ impl TargetSpecOrList {
                     // this, setting propagate_trace_context on the single-provider
                     // YAML form would be silently dropped.
                     propagate_trace_context: spec.propagate_trace_context,
+                    reasoning_translation: spec.reasoning_translation,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -563,6 +574,7 @@ impl From<TargetSpec> for Target {
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
+            reasoning_translation: value.reasoning_translation,
         }
     }
 }
@@ -588,6 +600,7 @@ impl From<ProviderSpec> for Target {
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
+            reasoning_translation: value.reasoning_translation,
         }
     }
 }
@@ -736,6 +749,8 @@ pub struct Target {
     /// Per-provider override for W3C trace context propagation on outbound
     /// requests. None means inherit from the resolved trusted value.
     pub propagate_trace_context: Option<bool>,
+    /// Provider-specific translation for canonical OpenAI reasoning controls.
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 impl Target {
@@ -2277,6 +2292,7 @@ mod tests {
                 request_timeout_secs: None,
                 trusted: None,
                 propagate_trace_context: None,
+                reasoning_translation: None,
             }],
         };
 

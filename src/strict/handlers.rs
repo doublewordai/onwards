@@ -27,6 +27,7 @@ use super::schemas::responses::{
 use super::streaming::{StreamingState, parse_chat_chunk};
 use crate::AppState;
 use crate::client::HttpClient;
+use crate::errors::OnwardsErrorResponse;
 use crate::extract_model_from_request;
 use crate::handlers::{ResolvedTrust, target_message_handler};
 use crate::traits::RequestContext;
@@ -212,6 +213,11 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
             );
         }
     };
+    if let Err(error) = crate::reasoning::validate_canonical_reasoning("/responses", &request_value)
+    {
+        return OnwardsErrorResponse::invalid_request(error.message(), error.param(), error.code())
+            .into_response();
+    }
 
     let response_id = match state
         .response_store
@@ -407,6 +413,29 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Response {
+    let unsupported_reasoning_param = [
+        (request.reasoning_effort.is_some(), "reasoning_effort"),
+        (request.reasoning.is_some(), "reasoning"),
+        (request.thinking.is_some(), "thinking"),
+        (
+            request.chat_template_kwargs.is_some(),
+            "chat_template_kwargs",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(present, param)| present.then_some(param));
+    if let Some(param) = unsupported_reasoning_param {
+        let message = format!(
+            "Parameter '{param}' is not supported by /v1/completions. Use /v1/chat/completions or /v1/responses."
+        );
+        return OnwardsErrorResponse::invalid_request(
+            &message,
+            Some(param),
+            "unsupported_parameter",
+        )
+        .into_response();
+    }
+
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
 
@@ -2297,7 +2326,7 @@ fn standard_error_response(status: StatusCode) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::{Target, Targets};
+    use crate::target::{OpenResponsesConfig, Target, Targets};
     use crate::test_utils::MockHttpClient;
     use axum::body::Body;
     use axum::http::Request;
@@ -3622,6 +3651,91 @@ mod tests {
         assert!(!body_str.contains("provider"));
         assert!(!body_str.contains("cost"));
         assert!(!body_str.contains("internal_trace_id"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_responses_validates_reasoning_before_adapter_conversion() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","input":"Hello","reasoning":{"effort":"ultra"}}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "reasoning.effort");
+        assert_eq!(body["error"]["code"], "invalid_value");
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_strict_chat_invalid_reasoning_type_returns_parameter_specific_400() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4o","messages":[],"reasoning_effort":false}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "reasoning_effort");
+        assert_eq!(body["error"]["code"], "invalid_type");
+        assert!(mock_client.get_requests().is_empty());
     }
 
     /// Test that responses API rewrites the model field

@@ -182,6 +182,22 @@ pub struct CompletionRequest {
     /// Random seed for deterministic sampling
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<i64>,
+
+    /// Captured only to return a useful compatibility error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<serde_json::Value>,
+
+    /// Captured only to return a useful compatibility error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
+
+    /// Captured only to return a useful compatibility error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<serde_json::Value>,
+
+    /// Captured only to return a useful compatibility error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_kwargs: Option<serde_json::Value>,
 }
 
 /// Response from POST /v1/completions (non-streaming)

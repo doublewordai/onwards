@@ -52,6 +52,7 @@ pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
 pub mod models;
+pub mod reasoning;
 pub mod response_id;
 #[cfg(feature = "multi-step")]
 pub mod response_loop;
@@ -3274,6 +3275,273 @@ mod tests {
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri.contains("api.single.com"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_provider_reasoning_translation_applies_to_upstream_body() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "high": true}
+            }
+        }))
+        .unwrap();
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "kimi-k2.5".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://sglang.example.com".parse().unwrap())
+                    .reasoning_translation(reasoning_translation)
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "kimi-k2.5",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "none"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let requests = mock_client.get_requests();
+        let upstream_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            upstream_body.pointer("/chat_template_kwargs/thinking"),
+            Some(&json!(false))
+        );
+        assert!(upstream_body.get("reasoning_effort").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_invalid_reasoning_effort_returns_parameter_specific_400() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "high": true}
+            }
+        }))
+        .unwrap();
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "kimi-k2.5".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://sglang.example.com".parse().unwrap())
+                    .reasoning_translation(reasoning_translation)
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "kimi-k2.5",
+                "messages": [],
+                "reasoning_effort": "ultra"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["param"], "reasoning_effort");
+        assert_eq!(body["error"]["code"], "invalid_value");
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_effort_must_be_supported_by_every_pool_provider() {
+        let supports_high = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "high": true}
+            }
+        }))
+        .unwrap();
+        let binary_disabled_only = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/thinking",
+                "values": {"none": {"type": "disabled"}}
+            }
+        }))
+        .unwrap();
+        let providers = vec![
+            Provider::new(
+                Target::builder()
+                    .url("https://first.example.com".parse().unwrap())
+                    .reasoning_translation(supports_high)
+                    .build(),
+                1,
+            ),
+            Provider::new(
+                Target::builder()
+                    .url("https://fallback.example.com".parse().unwrap())
+                    .reasoning_translation(binary_disabled_only)
+                    .build(),
+                1,
+            ),
+        ];
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "reasoning-model".to_string(),
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                None,
+                target::LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "reasoning-model",
+                "messages": [],
+                "reasoning_effort": "high"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "unsupported_value");
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_translation_is_rebuilt_for_each_fallback_attempt() {
+        let sglang = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false}
+            }
+        }))
+        .unwrap();
+        let object_shape = serde_json::from_value(json!({
+            "chat_completions": {
+                "target_path": "/thinking",
+                "values": {"none": {"type": "disabled"}}
+            }
+        }))
+        .unwrap();
+        let providers = vec![
+            Provider::new(
+                Target::builder()
+                    .url("https://first.example.com".parse().unwrap())
+                    .reasoning_translation(sglang)
+                    .build(),
+                1,
+            ),
+            Provider::new(
+                Target::builder()
+                    .url("https://fallback.example.com".parse().unwrap())
+                    .reasoning_translation(object_shape)
+                    .build(),
+                1,
+            ),
+        ];
+        let fallback = Some(target::FallbackConfig {
+            enabled: true,
+            on_status: vec![429],
+            ..Default::default()
+        });
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "reasoning-model".to_string(),
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                fallback,
+                target::LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let ok_chunk = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"reasoning-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n".to_string();
+        let done = "data: [DONE]\n\n".to_string();
+        let mock_client = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![ok_chunk, done]],
+        );
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "reasoning-model",
+                "stream": true,
+                "messages": [],
+                "reasoning_effort": "none"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert!(response.text().contains("hi"));
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first.pointer("/chat_template_kwargs/thinking"),
+            Some(&json!(false))
+        );
+        assert_eq!(second.pointer("/thinking/type"), Some(&json!("disabled")));
+        assert!(second.get("chat_template_kwargs").is_none());
+        assert!(first.get("reasoning_effort").is_none());
+        assert!(second.get("reasoning_effort").is_none());
     }
 
     mod response_sanitization {

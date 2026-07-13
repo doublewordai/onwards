@@ -25,9 +25,39 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `response_headers` | object | No | Key-value pairs to add or override in the response headers |
 | `sanitize_response` | bool | No | Enforce strict OpenAI schema compliance for responses only (see [Sanitization](sanitization.md)) |
 | `propagate_trace_context` | optional bool | No | Inject W3C `traceparent` / `tracestate` headers on outbound requests; omit to inherit from the resolved `trusted` value. **Provider-scoped:** valid on a single-provider target and on each entry of a pool's `providers` array — *not* as a top-level key on a pool that uses `providers`. See [Trace context propagation](load-balancing.md#trace-context-propagation). |
+| `reasoning_translation` | object | No | Translate canonical OpenAI reasoning efforts into this provider's request shape. Provider-scoped in load-balanced pools. |
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |
+
+## Reasoning translation
+
+Clients use `reasoning_effort` on Chat Completions and `reasoning.effort` on Responses. A provider can map those canonical values to a different JSON field without exposing provider-specific controls to clients:
+
+```json
+{
+  "targets": {
+    "reasoning-model": {
+      "url": "https://inference.example.com/v1",
+      "reasoning_translation": {
+        "chat_completions": {
+          "target_path": "/chat_template_kwargs/thinking",
+          "values": {
+            "none": false,
+            "low": true,
+            "medium": true,
+            "high": true
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Each surface accepts a constrained absolute JSON pointer and a map from canonical effort names to arbitrary JSON values. Supported efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. An omitted client effort injects nothing. If a requested effort is missing from any provider in a fallback pool, the request is rejected before an upstream attempt is made.
+
+Provider-native reasoning controls in client requests are rejected. Legacy Completions does not support reasoning controls.
 
 ## Rate limit object
 
