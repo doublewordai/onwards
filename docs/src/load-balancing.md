@@ -115,12 +115,13 @@ continuation. Requests containing `tools`, `tool_choice`, `functions`,
 controls are also excluded. The upstream response must be a successful response
 with the exact `text/event-stream` media type (case-insensitive; parameters are
 allowed) and no content encoding or `Content-Encoding: identity`. Onwards sends
-`Accept-Encoding: identity` for eligible requests and only continues unencoded
-responses. An encoded stream is left untouched; an encoded or non-SSE
-continuation response is rejected rather than spliced into the client stream.
-In strict mode, body sanitization cannot be guaranteed for an encoded initial
-response that ignores the identity request because preserving its encoded
-representation requires forwarding it unwrapped.
+`Accept-Encoding: identity` for eligible requests and for every strict-mode
+completion request, and only continues unencoded responses. An encoded eligible
+stream is left untouched; an encoded or non-SSE continuation response is
+rejected rather than spliced into the client stream. In strict mode, body
+sanitization cannot be guaranteed for any encoded completion response that
+ignores the identity request because preserving its encoded representation
+requires forwarding it unwrapped.
 
 This is prefix-based continuation, not native token-offset resume. Onwards
 reissues the original prompt with the emitted text appended, so the next model

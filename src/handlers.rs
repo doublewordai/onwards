@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::load_balancer::ProviderPool;
 use crate::models::ListModelResponse;
-use crate::sse::SseBufferedStream;
+use crate::sse::CheckedSseStream;
 use crate::target::{ConcurrencyGuard, RoutingAction, Target};
 use axum::{
     Json,
@@ -94,7 +94,7 @@ enum SseEventKind {
 }
 
 /// Classify a single SSE event (a complete frame already reassembled by
-/// [`SseBufferedStream`]).
+/// the checked SSE framer).
 ///
 /// Some providers open a `200 OK` stream and send the error as the
 /// first `data:` frame (`data: {"error":{"code":429,...}}`) rather than content.
@@ -103,12 +103,10 @@ enum SseEventKind {
 /// multi-line, and non-spaced (`data:{...}`) framing are all handled. A frame
 /// with no `data:` field is a comment/keep-alive.
 fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
-    let Some(data) = crate::sse::event_data(chunk) else {
-        return if std::str::from_utf8(chunk).is_ok() {
-            SseEventKind::Comment
-        } else {
-            SseEventKind::Data
-        };
+    let data = match crate::sse::parse_sse_event(chunk) {
+        crate::sse::ParsedSseEvent::Comment => return SseEventKind::Comment,
+        crate::sse::ParsedSseEvent::Data(data) => data,
+        crate::sse::ParsedSseEvent::Invalid => return SseEventKind::Data,
     };
     let Ok(data) = std::str::from_utf8(&data) else {
         return SseEventKind::Data;
@@ -379,6 +377,13 @@ impl UpstreamRequestMetadata {
         self
     }
 
+    pub(crate) fn set_span_parent(&self, span: &tracing::Span) {
+        if let Some(parent) = self.trace_context.clone() {
+            use tracing_opentelemetry::OpenTelemetrySpanExt;
+            let _ = span.set_parent(parent);
+        }
+    }
+
     fn with_identity_encoding(mut self) -> Self {
         self.headers
             .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
@@ -497,7 +502,7 @@ pub async fn target_message_handler<T>(
     mut req: axum::extract::Request,
 ) -> Result<Response, OnwardsErrorResponse>
 where
-    T: HttpClient + Clone + Send + Sync + 'static,
+    T: HttpClient + Send + 'static,
 {
     // Create the tracing span BEFORE entering it so that set_parent() correctly
     // updates the OTel parent context. With #[instrument], the OTel span is started
@@ -523,6 +528,8 @@ where
     }
 
     async move {
+
+    let mut http_client = Some(state.http_client);
 
     // Track inflight requests for observability. The guard is moved into GuardedStream
     // on the success path so the gauge stays incremented for the full lifetime of
@@ -782,11 +789,12 @@ where
         .filter(|fallback| fallback.enabled)
         .and_then(|fallback| fallback.stream_continuation.as_ref())
         .and_then(|config| {
-            crate::stream_continuation::CompletionContinuation::from_request(
+            crate::stream_continuation::CompletionContinuation::from_request_with_resolved_model(
                 &canonical_request_path,
                 &method,
                 &body_bytes,
                 config,
+                Some(&model_name),
             )
             .map(|continuation| (continuation, config.clone()))
         });
@@ -798,8 +806,11 @@ where
         path_and_query.clone(),
         original_headers.clone(),
         pool.is_trusted(),
-    );
-    let request_metadata = if completion_continuation.is_some() {
+    )
+    .with_current_trace_context();
+    let request_metadata = if completion_continuation.is_some()
+        || (state.targets.strict_mode && is_completion_path)
+    {
         request_metadata.with_identity_encoding()
     } else {
         request_metadata
@@ -935,7 +946,13 @@ where
         let request_result = async {
             if let Some(timeout_secs) = target.request_timeout_secs {
                 let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+                match tokio::time::timeout(
+                    timeout_duration,
+                    http_client
+                        .as_ref()
+                        .expect("HTTP client remains available before response success")
+                        .request(attempt_req),
+                )
                     .await
                 {
                     Err(_) => {
@@ -950,7 +967,12 @@ where
                 }
             } else {
                 // No timeout configured
-                state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
+                http_client
+                    .as_ref()
+                    .expect("HTTP client remains available before response success")
+                    .request(attempt_req)
+                    .await
+                    .map_err(UpstreamOutcome::Error)
             }
         }
         .instrument(upstream_span.clone())
@@ -1057,7 +1079,8 @@ where
         let preserve_encoded_completion = (200..300).contains(&status)
             && is_sse
             && !is_identity_encoded
-            && completion_continuation.is_some();
+            && (completion_continuation.is_some()
+                || (state.targets.strict_mode && is_completion_path));
         if preserve_encoded_completion {
             response
                 .extensions_mut()
@@ -1078,7 +1101,7 @@ where
         // the status-based fallback above.
         //
         // Gated to strict_mode: the only mode where the body is *already* buffered
-        // (unary) or routed through `SseBufferedStream` (streaming) by the strict
+        // (unary) or routed through checked SSE framing (streaming) by the strict
         // sanitizer downstream. So this adds no new buffering and no change to
         // streaming behaviour — it just inspects the body a little earlier so a
         // retry stays possible. Pure-passthrough / sanitize-without-transform
@@ -1118,7 +1141,7 @@ where
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
+                let mut events = CheckedSseStream::new(body.into_data_stream());
                 // `peeked` / `embedded` live outside the peek future so a partial
                 // peek survives a budget timeout (consumed frames are not lost).
                 let mut peeked = Vec::new();
@@ -1307,8 +1330,10 @@ where
                 continuation,
                 config,
                 pool.clone(),
-                state.http_client.clone(),
-                request_metadata.clone().with_current_trace_context(),
+                http_client
+                    .take()
+                    .expect("HTTP client moved once into composite response"),
+                request_metadata.clone(),
             );
             response = Response::from_parts(parts, body);
         }
@@ -1340,7 +1365,7 @@ where
             debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
-            let buffered = SseBufferedStream::new(byte_stream);
+            let buffered = CheckedSseStream::new(byte_stream);
             let new_body = axum::body::Body::from_stream(buffered);
             response = Response::from_parts(parts, new_body);
         }
@@ -1640,6 +1665,24 @@ pub async fn models<T: HttpClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct NonCloneHttpClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for NonCloneHttpClient {
+        async fn request(
+            &self,
+            _req: axum::extract::Request,
+        ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!("compile-time API compatibility test")
+        }
+    }
+
+    #[test]
+    fn target_message_handler_accepts_non_clone_http_clients() {
+        let _handler = target_message_handler::<NonCloneHttpClient>;
+    }
 
     #[test]
     fn embedded_error_status_detects_provider_envelope() {

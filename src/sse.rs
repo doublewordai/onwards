@@ -69,34 +69,153 @@ impl<E: Error + 'static> Error for SseStreamError<E> {
     }
 }
 
-/// A stream wrapper that buffers SSE events until they are complete.
-///
-/// SSE events are delimited by a blank line. LF, CRLF, bare CR, and mixed line
-/// endings are accepted, including line endings fragmented across body chunks.
-/// An optional UTF-8 BOM at the beginning of the stream is preserved.
-///
-/// The buffer is capped at [`MAX_SSE_BUFFER_SIZE`] bytes to prevent memory
-/// exhaustion from malicious or buggy upstream providers.
-pub struct SseBufferedStream<S> {
-    inner: S,
-    buffer: BytesMut,
-    source_done: bool,
-    terminated: bool,
+#[derive(Default)]
+struct EventBoundaryScanner {
+    line_has_bytes: bool,
+    pending_cr: bool,
 }
 
-impl<S> SseBufferedStream<S> {
-    /// Wrap an existing stream with SSE buffering.
-    pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            buffer: BytesMut::new(),
-            source_done: false,
-            terminated: false,
+enum ScanOutcome {
+    Boundary(usize),
+    NeedMore(usize),
+    Limit,
+}
+
+impl EventBoundaryScanner {
+    fn scan(&mut self, input: &[u8], remaining: usize) -> ScanOutcome {
+        let mut consumed = 0;
+
+        while consumed < input.len() {
+            let byte = input[consumed];
+            if self.pending_cr {
+                if byte == b'\n' {
+                    if consumed == remaining {
+                        return ScanOutcome::Limit;
+                    }
+                    let blank_line = !self.line_has_bytes;
+                    self.pending_cr = false;
+                    self.line_has_bytes = false;
+                    consumed += 1;
+                    if blank_line {
+                        return ScanOutcome::Boundary(consumed);
+                    }
+                    continue;
+                }
+
+                let blank_line = !self.line_has_bytes;
+                self.pending_cr = false;
+                self.line_has_bytes = false;
+                if blank_line {
+                    return ScanOutcome::Boundary(consumed);
+                }
+            }
+
+            if consumed == remaining {
+                return ScanOutcome::Limit;
+            }
+
+            match byte {
+                b'\r' => self.pending_cr = true,
+                b'\n' => {
+                    let blank_line = !self.line_has_bytes;
+                    self.line_has_bytes = false;
+                    consumed += 1;
+                    if blank_line {
+                        return ScanOutcome::Boundary(consumed);
+                    }
+                    continue;
+                }
+                _ => self.line_has_bytes = true,
+            }
+            consumed += 1;
         }
+
+        ScanOutcome::NeedMore(consumed)
+    }
+
+    fn finish_eof(&mut self) -> bool {
+        if !self.pending_cr {
+            return false;
+        }
+        let blank_line = !self.line_has_bytes;
+        self.pending_cr = false;
+        self.line_has_bytes = false;
+        blank_line
     }
 }
 
-impl<S, E> Stream for SseBufferedStream<S>
+/// Internal SSE framing that keeps source failures distinct from framing failures.
+pub(crate) struct CheckedSseStream<S> {
+    inner: S,
+    buffer: BytesMut,
+    pending_chunk: Option<Bytes>,
+    pending_offset: usize,
+    scanner: EventBoundaryScanner,
+    source_done: bool,
+    terminated: bool,
+    incomplete_bytes: Option<Bytes>,
+    #[cfg(test)]
+    scanned_bytes: usize,
+}
+
+impl<S> CheckedSseStream<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Self {
+            inner,
+            buffer: BytesMut::new(),
+            pending_chunk: None,
+            pending_offset: 0,
+            scanner: EventBoundaryScanner::default(),
+            source_done: false,
+            terminated: false,
+            incomplete_bytes: None,
+            #[cfg(test)]
+            scanned_bytes: 0,
+        }
+    }
+
+    fn append_pending(&mut self) -> ScanOutcome {
+        let chunk = self.pending_chunk.as_ref().expect("pending chunk checked");
+        let input = &chunk[self.pending_offset..];
+        let outcome = self
+            .scanner
+            .scan(input, MAX_SSE_BUFFER_SIZE - self.buffer.len());
+        let consumed = match outcome {
+            ScanOutcome::Boundary(consumed) | ScanOutcome::NeedMore(consumed) => consumed,
+            ScanOutcome::Limit => 0,
+        };
+
+        if consumed > 0 {
+            self.buffer.extend_from_slice(&input[..consumed]);
+            self.pending_offset += consumed;
+            #[cfg(test)]
+            {
+                self.scanned_bytes += consumed;
+            }
+        }
+        if self.pending_offset == chunk.len() {
+            self.pending_chunk = None;
+            self.pending_offset = 0;
+        }
+        outcome
+    }
+
+    fn take_incomplete_bytes(&mut self) -> Option<Bytes> {
+        self.incomplete_bytes.take()
+    }
+
+    #[cfg(test)]
+    fn scanned_bytes_for_test(&self) -> usize {
+        self.scanned_bytes
+    }
+
+    #[cfg(test)]
+    fn buffer_capacity_for_test(&self) -> usize {
+        self.buffer.capacity()
+    }
+}
+
+impl<S, E> Stream for CheckedSseStream<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
 {
@@ -110,28 +229,24 @@ where
                 return Poll::Ready(None);
             }
 
-            if let Some(end) = find_event_boundary(&this.buffer, this.source_done) {
-                if end > MAX_SSE_BUFFER_SIZE {
-                    this.buffer.clear();
-                    this.terminated = true;
-                    return Poll::Ready(Some(Err(SseStreamError::Framing(
-                        SseFramingError::BufferOverflow {
-                            limit: MAX_SSE_BUFFER_SIZE,
-                        },
-                    ))));
+            if this.pending_chunk.is_some() {
+                match this.append_pending() {
+                    ScanOutcome::Boundary(_) => {
+                        this.scanner = EventBoundaryScanner::default();
+                        return Poll::Ready(Some(Ok(this.buffer.split().freeze())));
+                    }
+                    ScanOutcome::NeedMore(_) => continue,
+                    ScanOutcome::Limit => {
+                        this.buffer.clear();
+                        this.pending_chunk = None;
+                        this.terminated = true;
+                        return Poll::Ready(Some(Err(SseStreamError::Framing(
+                            SseFramingError::BufferOverflow {
+                                limit: MAX_SSE_BUFFER_SIZE,
+                            },
+                        ))));
+                    }
                 }
-                let complete = this.buffer.split_to(end);
-                return Poll::Ready(Some(Ok(complete.freeze())));
-            }
-
-            if this.buffer.len() > MAX_SSE_BUFFER_SIZE {
-                this.buffer.clear();
-                this.terminated = true;
-                return Poll::Ready(Some(Err(SseStreamError::Framing(
-                    SseFramingError::BufferOverflow {
-                        limit: MAX_SSE_BUFFER_SIZE,
-                    },
-                ))));
             }
 
             if this.source_done {
@@ -139,7 +254,11 @@ where
                     this.terminated = true;
                     return Poll::Ready(None);
                 }
-                this.buffer.clear();
+                if this.scanner.finish_eof() {
+                    this.scanner = EventBoundaryScanner::default();
+                    return Poll::Ready(Some(Ok(this.buffer.split().freeze())));
+                }
+                this.incomplete_bytes = Some(this.buffer.split().freeze());
                 this.terminated = true;
                 return Poll::Ready(Some(Err(SseStreamError::Framing(
                     SseFramingError::IncompleteEvent,
@@ -148,7 +267,9 @@ where
 
             match Pin::new(&mut this.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
-                    this.buffer.extend_from_slice(&chunk);
+                    if !chunk.is_empty() {
+                        this.pending_chunk = Some(chunk);
+                    }
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.buffer.clear();
@@ -166,39 +287,66 @@ where
     }
 }
 
-/// Find the byte immediately after the first complete event boundary.
-fn find_event_boundary(buf: &[u8], source_done: bool) -> Option<usize> {
-    let mut line_start = 0;
-    let mut index = 0;
+/// A stream wrapper that buffers SSE events until they are complete.
+///
+/// This public wrapper preserves its original source error type. Internal proxy
+/// paths use checked framing when incomplete or oversized events must be
+/// distinguishable from source EOF.
+pub struct SseBufferedStream<S> {
+    checked: CheckedSseStream<S>,
+}
 
-    while index < buf.len() {
-        let line_end = match buf[index] {
-            b'\n' => index + 1,
-            b'\r' if index + 1 < buf.len() && buf[index + 1] == b'\n' => index + 2,
-            b'\r' if index + 1 < buf.len() || source_done => index + 1,
-            b'\r' => return None,
-            _ => {
-                index += 1;
-                continue;
-            }
-        };
-
-        if index == line_start {
-            return Some(line_end);
+impl<S> SseBufferedStream<S> {
+    /// Wrap an existing stream with SSE buffering.
+    pub fn new(inner: S) -> Self {
+        Self {
+            checked: CheckedSseStream::new(inner),
         }
-        line_start = line_end;
-        index = line_end;
     }
+}
 
+impl<S, E> Stream for SseBufferedStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.checked).poll_next(cx) {
+            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(event))),
+            Poll::Ready(Some(Err(SseStreamError::Source(error)))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(Some(Err(SseStreamError::Framing(SseFramingError::IncompleteEvent)))) => {
+                Poll::Ready(self.checked.take_incomplete_bytes().map(Ok))
+            }
+            Poll::Ready(Some(Err(SseStreamError::Framing(SseFramingError::BufferOverflow {
+                ..
+            })))) => Poll::Ready(None),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) fn framing_error_in_chain(error: &(dyn Error + 'static)) -> Option<SseFramingError> {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if let Some(framing) = source.downcast_ref::<SseFramingError>() {
+            return Some(*framing);
+        }
+        current = source.source();
+    }
     None
 }
 
-/// Collect an event's `data:` fields according to SSE line and colon rules.
-///
-/// The optional stream-start UTF-8 BOM is ignored for field-name matching. The
-/// caller still owns the original event bytes, so parsing never normalizes what
-/// is forwarded downstream.
-pub(crate) fn event_data(event: &[u8]) -> Option<Vec<u8>> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParsedSseEvent {
+    Comment,
+    Data(Vec<u8>),
+    Invalid,
+}
+
+/// Parse one framed event without normalizing the bytes forwarded downstream.
+pub(crate) fn parse_sse_event(event: &[u8]) -> ParsedSseEvent {
     let mut position = if event.starts_with(b"\xef\xbb\xbf") {
         3
     } else {
@@ -225,17 +373,29 @@ pub(crate) fn event_data(event: &[u8]) -> Option<Vec<u8>> {
             }
         }
 
-        let Some(value) = line.strip_prefix(b"data:") else {
+        if line.is_empty() || line.starts_with(b":") {
             continue;
+        }
+
+        let value = if line == b"data" {
+            &b""[..]
+        } else if let Some(value) = line.strip_prefix(b"data:") {
+            value.strip_prefix(b" ").unwrap_or(value)
+        } else {
+            return ParsedSseEvent::Invalid;
         };
         if found_data {
             data.push(b'\n');
         }
         found_data = true;
-        data.extend_from_slice(value.strip_prefix(b" ").unwrap_or(value));
+        data.extend_from_slice(value);
     }
 
-    found_data.then_some(data)
+    if found_data {
+        ParsedSseEvent::Data(data)
+    } else {
+        ParsedSseEvent::Comment
+    }
 }
 
 #[cfg(test)]
@@ -249,6 +409,72 @@ mod tests {
         chunks: Vec<&'static [u8]>,
     ) -> impl Stream<Item = Result<Bytes, Infallible>> + Unpin {
         futures_util::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))))
+    }
+
+    #[test]
+    fn public_buffered_stream_preserves_source_error_item_type() {
+        fn assert_item_type<S, E>(_stream: &SseBufferedStream<S>)
+        where
+            S: Stream<Item = Result<Bytes, E>> + Unpin,
+            SseBufferedStream<S>: Stream<Item = Result<Bytes, E>>,
+        {
+        }
+
+        let stream = SseBufferedStream::new(chunks_to_stream(Vec::new()));
+        assert_item_type::<_, Infallible>(&stream);
+    }
+
+    #[tokio::test]
+    async fn checked_stream_handles_highly_fragmented_input_in_linear_state() {
+        let expected = Bytes::from_static(b"data: fragmented\r\n\r\n");
+        let chunks = expected
+            .iter()
+            .copied()
+            .map(|byte| Ok::<_, Infallible>(Bytes::from(vec![byte])));
+        let mut stream = CheckedSseStream::new(futures_util::stream::iter(chunks));
+
+        let event = stream.next().await.unwrap().unwrap();
+        assert_eq!(event, expected);
+        assert_eq!(stream.scanned_bytes_for_test(), expected.len());
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn checked_stream_does_not_copy_a_huge_source_chunk() {
+        let huge = Bytes::from(vec![b'x'; MAX_SSE_BUFFER_SIZE * 8]);
+        let mut stream =
+            CheckedSseStream::new(futures_util::stream::iter([Ok::<_, Infallible>(huge)]));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(SseStreamError::Framing(
+                SseFramingError::BufferOverflow {
+                    limit: MAX_SSE_BUFFER_SIZE
+                }
+            )))
+        ));
+        assert!(stream.buffer_capacity_for_test() <= MAX_SSE_BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn checked_stream_copies_only_through_a_boundary_in_a_huge_chunk() {
+        let mut source = b"data: first\n\n".to_vec();
+        source.extend(std::iter::repeat_n(b'x', MAX_SSE_BUFFER_SIZE * 8));
+        let mut stream = CheckedSseStream::new(futures_util::stream::iter([Ok::<_, Infallible>(
+            Bytes::from(source),
+        )]));
+
+        assert_eq!(
+            stream.next().await.unwrap().unwrap().as_ref(),
+            b"data: first\n\n"
+        );
+        assert!(stream.buffer_capacity_for_test() < MAX_SSE_BUFFER_SIZE);
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(SseStreamError::Framing(
+                SseFramingError::BufferOverflow { .. }
+            )))
+        ));
     }
 
     #[tokio::test]
@@ -321,7 +547,7 @@ mod tests {
     #[tokio::test]
     async fn test_incomplete_event_at_stream_end_is_a_framing_error() {
         let chunks = vec![b"data: incomplete".as_slice()];
-        let stream = SseBufferedStream::new(chunks_to_stream(chunks));
+        let stream = CheckedSseStream::new(chunks_to_stream(chunks));
         let results: Vec<_> = stream.collect().await;
 
         assert_eq!(results.len(), 1);
@@ -447,7 +673,7 @@ mod tests {
         // Create a chunk larger than MAX_SSE_BUFFER_SIZE without \n\n
         let large_chunk = vec![b'x'; MAX_SSE_BUFFER_SIZE + 1];
         let chunks: Vec<&[u8]> = vec![&large_chunk];
-        let stream = SseBufferedStream::new(futures_util::stream::iter(
+        let stream = CheckedSseStream::new(futures_util::stream::iter(
             chunks
                 .into_iter()
                 .map(|c| Ok::<_, Infallible>(Bytes::from(c.to_vec()))),
@@ -468,7 +694,7 @@ mod tests {
         let source = futures_util::stream::iter(vec![Err::<Bytes, _>(std::io::Error::other(
             "source failed",
         ))]);
-        let results: Vec<_> = SseBufferedStream::new(source).collect().await;
+        let results: Vec<_> = CheckedSseStream::new(source).collect().await;
 
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], Err(SseStreamError::Source(_))));

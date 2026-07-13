@@ -14,7 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::client::HttpClient;
 use crate::handlers::{UpstreamRequestMetadata, build_upstream_request};
 use crate::load_balancer::{ProviderPool, SelectionState};
-use crate::sse::{SseBufferedStream, SseFramingError, SseStreamError, event_data};
+use crate::sse::{
+    CheckedSseStream, ParsedSseEvent, SseFramingError, SseStreamError, framing_error_in_chain,
+    parse_sse_event,
+};
 use crate::target::ConcurrencyGuard;
 use crate::target::StreamContinuationConfig;
 
@@ -112,6 +115,16 @@ impl CompletionContinuation {
         body: &[u8],
         config: &StreamContinuationConfig,
     ) -> Option<Self> {
+        Self::from_request_with_resolved_model(path, method, body, config, None)
+    }
+
+    pub(crate) fn from_request_with_resolved_model(
+        path: &str,
+        method: &Method,
+        body: &[u8],
+        config: &StreamContinuationConfig,
+        resolved_model: Option<&str>,
+    ) -> Option<Self> {
         if path != "/v1/completions" || method != Method::POST || !config.enabled_for_path(path) {
             return None;
         }
@@ -126,14 +139,11 @@ impl CompletionContinuation {
             "response_format",
             "json_schema",
             "grammar",
-            "guided_json",
-            "guided_regex",
-            "guided_choice",
-            "guided_grammar",
         ];
         if UNSUPPORTED_CONTROLS
             .iter()
             .any(|key| request_object.contains_key(*key))
+            || request_object.keys().any(|key| key.starts_with("guided_"))
         {
             return None;
         }
@@ -150,9 +160,9 @@ impl CompletionContinuation {
             return None;
         }
 
-        let fallback_model = request
-            .get("model")
-            .cloned()
+        let fallback_model = resolved_model
+            .map(|model| Value::String(model.to_owned()))
+            .or_else(|| request.get("model").cloned())
             .unwrap_or_else(|| Value::String("unknown".to_string()));
         let fallback_created = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -178,14 +188,27 @@ impl CompletionContinuation {
         event: &[u8],
         rewrite_identity: bool,
     ) -> Result<EventObservation, ContinuationError> {
-        let Some(data) = event_data(event) else {
-            return Ok(EventObservation {
-                event: Bytes::copy_from_slice(event),
-                terminal: self.terminal,
-                done: false,
-                safe: true,
-                accepted: false,
-            });
+        let data = match parse_sse_event(event) {
+            ParsedSseEvent::Comment => {
+                return Ok(EventObservation {
+                    event: Bytes::copy_from_slice(event),
+                    terminal: self.terminal,
+                    done: false,
+                    safe: true,
+                    accepted: false,
+                });
+            }
+            ParsedSseEvent::Data(data) => data,
+            ParsedSseEvent::Invalid => {
+                self.continuable = false;
+                return Ok(EventObservation {
+                    event: Bytes::copy_from_slice(event),
+                    terminal: self.terminal,
+                    done: false,
+                    safe: false,
+                    accepted: false,
+                });
+            }
         };
 
         let Ok(data) = std::str::from_utf8(&data) else {
@@ -324,6 +347,30 @@ enum StreamInterruption {
     IdleTimeout,
 }
 
+#[derive(Default)]
+struct TerminalMetricState {
+    recorded: bool,
+}
+
+impl TerminalMetricState {
+    fn observe_finish_reason(&mut self) -> Option<&'static str> {
+        self.record("finish_reason")
+    }
+
+    fn observe_done(&mut self) -> Option<&'static str> {
+        self.record("done")
+    }
+
+    fn record(&mut self, reason: &'static str) -> Option<&'static str> {
+        if self.recorded {
+            None
+        } else {
+            self.recorded = true;
+            Some(reason)
+        }
+    }
+}
+
 impl StreamInterruption {
     fn into_error(self) -> Option<std::io::Error> {
         match self {
@@ -369,7 +416,7 @@ pub(crate) fn wrap_completion_stream<T>(
     request_metadata: UpstreamRequestMetadata,
 ) -> Body
 where
-    T: HttpClient + Clone + Send + Sync + 'static,
+    T: HttpClient + Send + 'static,
 {
     let fallback = pool.fallback().cloned().unwrap_or_default();
     let mut selection = SelectionState::new(config.max_attempts, fallback.with_replacement);
@@ -380,12 +427,12 @@ where
         let mut current_guard = Some(initial_guard);
         let mut rewrite_identity = false;
         let mut awaiting_resumption_event = false;
-        let mut finish_reason_recorded = false;
+        let mut terminal_metric = TerminalMetricState::default();
         let mut continuation_attempt = 0_u32;
         let mut total_backoff_ms = 0_u64;
 
         loop {
-            let mut events = SseBufferedStream::new(current_body.into_data_stream());
+            let mut events = CheckedSseStream::new(current_body.into_data_stream());
             let interruption = loop {
                 let next = if let Some(timeout_ms) = config.idle_timeout_ms {
                     match tokio::time::timeout(Duration::from_millis(timeout_ms), events.next()).await {
@@ -428,11 +475,13 @@ where
                             metrics::counter!("onwards_stream_continuation_resumptions_total")
                                 .increment(1);
                         }
-                        if observation.terminal && !observation.done && !finish_reason_recorded {
-                            finish_reason_recorded = true;
+                        if observation.terminal
+                            && !observation.done
+                            && let Some(reason) = terminal_metric.observe_finish_reason()
+                        {
                             metrics::counter!(
                                 "onwards_stream_continuation_terminal_total",
-                                "reason" => "finish_reason"
+                                "reason" => reason
                             )
                             .increment(1);
                         }
@@ -443,6 +492,9 @@ where
                         }
                     }
                     Some(Err(SseStreamError::Source(error))) => {
+                        if let Some(framing) = framing_error_in_chain(&error) {
+                            break StreamInterruption::Framing(framing);
+                        }
                         break StreamInterruption::Body(std::io::Error::other(error));
                     }
                     Some(Err(SseStreamError::Framing(error))) => {
@@ -462,11 +514,17 @@ where
             );
 
             if matches!(interruption, StreamInterruption::Done) {
-                metrics::counter!(
-                    "onwards_stream_continuation_terminal_total",
-                    "reason" => interruption.reason()
-                )
-                .increment(1);
+                if let Some(reason) = terminal_metric.observe_done() {
+                    metrics::counter!(
+                        "onwards_stream_continuation_terminal_total",
+                        "reason" => reason
+                    )
+                    .increment(1);
+                }
+                break;
+            }
+
+            if continuation.is_terminal() {
                 break;
             }
 
@@ -479,10 +537,6 @@ where
                 if let Some(error) = interruption.into_error() {
                     yield Err::<Bytes, std::io::Error>(error);
                 }
-                break;
-            }
-
-            if continuation.is_terminal() {
                 break;
             }
 
@@ -543,6 +597,7 @@ where
                     outcome = tracing::field::Empty,
                     http.response.status_code = tracing::field::Empty,
                 );
+                request_metadata.set_span_parent(&attempt_span);
 
                 if target
                     .limiter
@@ -726,6 +781,22 @@ fn completion_event(completion: &Value) -> CompletionEvent<'_> {
     let Some(object) = completion.as_object() else {
         return CompletionEvent::Unsafe;
     };
+    const SUPPORTED_TOP_LEVEL_FIELDS: &[&str] = &[
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "usage",
+        "system_fingerprint",
+        "error",
+    ];
+    if object
+        .keys()
+        .any(|key| !SUPPORTED_TOP_LEVEL_FIELDS.contains(&key.as_str()))
+    {
+        return CompletionEvent::Unsafe;
+    }
     if object.contains_key("error") {
         return CompletionEvent::Unsafe;
     }
@@ -900,6 +971,7 @@ mod tests {
             "guided_regex",
             "guided_choice",
             "guided_grammar",
+            "guided_options_request",
         ] {
             let mut request = serde_json::json!({
                 "prompt": "hello",
@@ -1098,6 +1170,64 @@ mod tests {
         assert_eq!(observation.event.as_ref(), event);
         assert!(!observation.terminal);
         assert!(!state.is_continuable());
+    }
+
+    #[test]
+    fn hybrid_sse_fields_disable_continuation_without_changing_initial_bytes() {
+        for field in [
+            "event: completion",
+            "id: provider-event",
+            "retry: 1000",
+            "provider-field: unsafe",
+        ] {
+            let mut state = eligible_state(1024);
+            let event = format!(
+                "{field}\ndata: {{\"choices\":[{{\"index\":0,\"text\":\"x\",\"finish_reason\":null}}]}}\n\n"
+            );
+
+            let observation = state.observe_event(event.as_bytes(), false).unwrap();
+
+            assert_eq!(observation.event.as_ref(), event.as_bytes());
+            assert!(!observation.safe, "unsupported SSE field: {field}");
+            assert!(!state.is_continuable(), "unsupported SSE field: {field}");
+        }
+    }
+
+    #[test]
+    fn unsafe_top_level_completion_keys_disable_continuation() {
+        for key in ["payload", "tool_calls", "unknown_provider_state"] {
+            let mut state = eligible_state(1024);
+            let mut value = serde_json::json!({
+                "choices": [{"index": 0, "text": "x", "finish_reason": null}]
+            });
+            value[key] = serde_json::json!({"unsafe": true});
+            let event = format!("data: {value}\n\n");
+
+            let observation = state.observe_event(event.as_bytes(), false).unwrap();
+
+            assert!(!observation.safe, "unsafe key: {key}");
+            assert!(!state.is_continuable(), "unsafe key: {key}");
+        }
+    }
+
+    #[test]
+    fn safe_completion_metadata_remains_continuable() {
+        let mut state = eligible_state(1024);
+        let event = b"data: {\"id\":\"cmpl-a\",\"object\":\"text_completion\",\"created\":1,\"model\":\"m\",\"system_fingerprint\":\"fp\",\"choices\":[{\"index\":0,\"text\":\"x\",\"finish_reason\":null}],\"usage\":{\"completion_tokens\":1}}\n\n";
+
+        let observation = state.observe_event(event, false).unwrap();
+
+        assert!(observation.safe);
+        assert!(state.is_continuable());
+    }
+
+    #[test]
+    fn terminal_metric_reason_is_emitted_only_once() {
+        let mut state = TerminalMetricState::default();
+
+        assert_eq!(state.observe_finish_reason(), Some("finish_reason"));
+        assert_eq!(state.observe_done(), None);
+        assert_eq!(state.observe_finish_reason(), None);
     }
 
     #[test]

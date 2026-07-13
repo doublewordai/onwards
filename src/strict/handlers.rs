@@ -1454,12 +1454,12 @@ async fn sanitize_streaming_chat_response(
     original_model: String,
     trusted: bool,
 ) -> Response {
-    // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
+    // Use checked framing so sanitization receives complete SSE events.
     // Providers may send partial chunks that split JSON across network packets.
     // This buffering ensures we can successfully parse JSON in each event.
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::CheckedSseStream::new(body_stream);
     let stream_fallback_id = generated_chat_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
@@ -1675,7 +1675,7 @@ async fn sanitize_streaming_completions_response(
 ) -> Response {
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::CheckedSseStream::new(body_stream);
     let stream_fallback_id = generated_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
@@ -1952,12 +1952,12 @@ async fn sanitize_streaming_responses_response(
     trusted: bool,
     response_id_override: Option<String>,
 ) -> Response {
-    // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
+    // Use checked framing so sanitization receives complete SSE events.
     // Providers may send partial chunks that split JSON across network packets.
     // This buffering ensures we can successfully parse JSON in each event.
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::CheckedSseStream::new(body_stream);
     let response_id_override = response_id_override.clone();
     let stream_fallback_response_id = response_id_override
         .clone()
