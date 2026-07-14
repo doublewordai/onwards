@@ -425,6 +425,10 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         (request.reasoning.is_some(), "reasoning"),
         (request.thinking.is_some(), "thinking"),
         (
+            request.thinking_token_budget.is_some(),
+            "thinking_token_budget",
+        ),
+        (
             request.chat_template_kwargs.is_some(),
             "chat_template_kwargs",
         ),
@@ -580,6 +584,9 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     // Build per-request context from the request extensions and model name.
     let mut ctx = RequestContext::new().with_model(&request.model);
     ctx.extensions = extensions;
+    if let Some(reasoning) = canonical_reasoning.as_ref() {
+        ctx.extensions.insert(reasoning.clone());
+    }
 
     // Resolve *available* server-side tools for this request context.
     let available_server_tools = state.tool_executor.tools(&ctx).await;
@@ -709,7 +716,6 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             chat_request,
             server_tool_names,
             ctx,
-            canonical_reasoning,
             response_id.clone(),
         )
         .await;
@@ -972,9 +978,13 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     mut chat_request: ChatCompletionRequest,
     server_tool_names: HashSet<String>,
     ctx: RequestContext,
-    canonical_reasoning: Option<crate::reasoning::CanonicalReasoningRequest>,
     response_id: String,
 ) -> Response {
+    let canonical_reasoning = ctx
+        .extensions
+        .get::<crate::reasoning::CanonicalReasoningRequest>()
+        .cloned();
+
     // Ensure stream is enabled on the chat request
     chat_request.stream = Some(true);
 

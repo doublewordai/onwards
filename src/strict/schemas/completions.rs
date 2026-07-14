@@ -197,6 +197,10 @@ pub struct CompletionRequest {
 
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_token_budget: Option<serde_json::Value>,
+
+    /// Captured only to return a useful compatibility error.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
 }
 

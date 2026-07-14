@@ -413,6 +413,7 @@ pub fn validate_canonical_reasoning(
             ("/reasoning_effort", "reasoning_effort"),
             ("/reasoning", "reasoning"),
             ("/thinking", "thinking"),
+            ("/thinking_token_budget", "thinking_token_budget"),
             ("/chat_template_kwargs", "chat_template_kwargs"),
         ]
         .into_iter()
@@ -441,6 +442,7 @@ pub fn validate_canonical_reasoning(
             ),
             ("/chat_template_kwargs", "chat_template_kwargs"),
             ("/thinking", "thinking"),
+            ("/thinking_token_budget", "thinking_token_budget"),
             ("/reasoning", "reasoning"),
         ]
         .into_iter()
@@ -456,6 +458,7 @@ pub fn validate_canonical_reasoning(
             ),
             ("/chat_template_kwargs", "chat_template_kwargs"),
             ("/thinking", "thinking"),
+            ("/thinking_token_budget", "thinking_token_budget"),
             ("/reasoning_effort", "reasoning_effort"),
         ]
         .into_iter()
@@ -1085,6 +1088,29 @@ mod tests {
 
         assert_eq!(error.param(), Some("thinking"));
         assert_eq!(error.code(), "unsupported_parameter");
+    }
+
+    #[test]
+    fn rejects_client_supplied_thinking_token_budget_on_all_openai_surfaces() {
+        for (path, body) in [
+            (
+                "/chat/completions",
+                json!({"model": "model", "messages": [], "thinking_token_budget": 1024}),
+            ),
+            (
+                "/responses",
+                json!({"model": "model", "input": "Hello", "thinking_token_budget": 1024}),
+            ),
+            (
+                "/completions",
+                json!({"model": "model", "prompt": "Hello", "thinking_token_budget": 1024}),
+            ),
+        ] {
+            let error = validate_canonical_reasoning(path, &body).unwrap_err();
+
+            assert_eq!(error.param(), Some("thinking_token_budget"));
+            assert_eq!(error.code(), "unsupported_parameter");
+        }
     }
 
     #[test]
