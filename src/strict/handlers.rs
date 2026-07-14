@@ -213,11 +213,11 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
             );
         }
     };
-    if let Err(error) = crate::reasoning::validate_canonical_reasoning("/responses", &request_value)
-    {
-        return OnwardsErrorResponse::invalid_request(error.message(), error.param(), error.code())
-            .into_response();
-    }
+    let canonical_reasoning =
+        match crate::reasoning::validate_canonical_reasoning("/responses", &request_value) {
+            Ok(reasoning) => reasoning,
+            Err(error) => return OnwardsErrorResponse::reasoning(&error).into_response(),
+        };
 
     let response_id = match state
         .response_store
@@ -249,8 +249,15 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     if use_adapter {
         // Adapter mode: convert to Chat Completions, forward, convert back
         debug!(model = %request.model, "Using Open Responses adapter");
-        return handle_adapter_request(state, headers, request, extensions, effective_response_id)
-            .await;
+        return handle_adapter_request(
+            state,
+            headers,
+            request,
+            extensions,
+            canonical_reasoning,
+            effective_response_id,
+        )
+        .await;
     }
 
     // Passthrough mode: forward request as-is
@@ -564,6 +571,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     mut request: ResponsesRequest,
     extensions: axum::http::Extensions,
+    canonical_reasoning: Option<crate::reasoning::CanonicalReasoningRequest>,
     response_id: String,
 ) -> Response {
     let adapter =
@@ -701,6 +709,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             chat_request,
             server_tool_names,
             ctx,
+            canonical_reasoning,
             response_id.clone(),
         )
         .await;
@@ -750,6 +759,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             headers.clone(),
             "/chat/completions",
             body_bytes,
+            canonical_reasoning.as_ref(),
         )
         .await;
 
@@ -962,6 +972,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
     mut chat_request: ChatCompletionRequest,
     server_tool_names: HashSet<String>,
     ctx: RequestContext,
+    canonical_reasoning: Option<crate::reasoning::CanonicalReasoningRequest>,
     response_id: String,
 ) -> Response {
     // Ensure stream is enabled on the chat request
@@ -987,6 +998,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         headers.clone(),
         "/chat/completions",
         body_bytes,
+        canonical_reasoning.as_ref(),
     )
     .await;
 
@@ -1158,6 +1170,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                     headers.clone(),
                     "/chat/completions",
                     body_bytes,
+                    canonical_reasoning.as_ref(),
                 )
                 .await;
 
@@ -1205,6 +1218,7 @@ async fn forward_request_raw<T: HttpClient + Clone + Send + Sync + 'static>(
     mut headers: HeaderMap,
     path: &str,
     body_bytes: Vec<u8>,
+    canonical_reasoning: Option<&crate::reasoning::CanonicalReasoningRequest>,
 ) -> Response {
     // Ensure content-type is set
     headers.insert(
@@ -1223,6 +1237,9 @@ async fn forward_request_raw<T: HttpClient + Clone + Send + Sync + 'static>(
     {
         Ok(mut req) => {
             *req.headers_mut() = headers;
+            if let Some(reasoning) = canonical_reasoning {
+                req.extensions_mut().insert(reasoning.clone());
+            }
             req
         }
         Err(e) => {
@@ -3694,6 +3711,143 @@ mod tests {
         assert_eq!(body["error"]["param"], "reasoning.effort");
         assert_eq!(body["error"]["code"], "invalid_value");
         assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_strict_responses_budget_error_preserves_responses_parameter_names() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "reasoning-model".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .reasoning_translation(reasoning_translation)
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"reasoning-model","input":"Hello","reasoning":{"effort":"high"},"max_output_tokens":4096}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "max_output_tokens");
+        assert_eq!(body["error"]["code"], "reasoning_budget_exceeds_max_tokens");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("reasoning.effort 'high'")
+        );
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_strict_responses_adapter_applies_reasoning_effort_and_budget() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "reasoning-model".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .open_responses(OpenResponsesConfig { adapter: true })
+                .reasoning_translation(reasoning_translation)
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_response = json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "reasoning-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        });
+        let mock_client = MockHttpClient::new(StatusCode::OK, &mock_response.to_string());
+        let state = AppState::with_client(targets, mock_client.clone());
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"reasoning-model","input":"Hello","reasoning":{"effort":"high"},"max_output_tokens":9000}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let upstream_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(upstream_body["reasoning_effort"], "high");
+        assert_eq!(upstream_body["thinking_token_budget"], 8192);
+        assert_eq!(upstream_body["max_tokens"], 9000);
     }
 
     #[tokio::test]

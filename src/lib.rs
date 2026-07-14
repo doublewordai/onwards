@@ -3281,8 +3281,11 @@ mod tests {
     async fn test_provider_reasoning_translation_applies_to_upstream_body() {
         let reasoning_translation = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/thinking",
-                "values": {"none": false, "high": true}
+                "unsupported_efforts": ["minimal", "low", "medium", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/thinking",
+                    "values": {"none": false, "high": true}
+                }]
             }
         }))
         .unwrap();
@@ -3328,6 +3331,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_missing_output_limit_returns_422_before_upstream_request() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "reasoning-model".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://vllm.example.com".parse().unwrap())
+                    .reasoning_translation(reasoning_translation)
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "reasoning-model",
+                "messages": [],
+                "reasoning_effort": "high"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["param"], "max_completion_tokens");
+        assert_eq!(
+            body["error"]["code"],
+            "reasoning_budget_requires_max_tokens"
+        );
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_reasoning_budget_is_validated_for_every_pool_provider() {
+        let budget_config = |budget| {
+            serde_json::from_value(json!({
+                "chat_completions": {
+                    "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                    "writes": [
+                        {
+                            "target_path": "/reasoning_effort",
+                            "values": {"high": "high"}
+                        },
+                        {
+                            "target_path": "/thinking_token_budget",
+                            "values": {"high": budget}
+                        }
+                    ]
+                }
+            }))
+            .unwrap()
+        };
+        let providers = vec![
+            Provider::new(
+                Target::builder()
+                    .url("https://first.example.com".parse().unwrap())
+                    .reasoning_translation(budget_config(4096))
+                    .build(),
+                1,
+            ),
+            Provider::new(
+                Target::builder()
+                    .url("https://fallback.example.com".parse().unwrap())
+                    .reasoning_translation(budget_config(8192))
+                    .build(),
+                1,
+            ),
+        ];
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "reasoning-model".to_string(),
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                None,
+                target::LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "reasoning-model",
+                "messages": [],
+                "reasoning_effort": "high",
+                "max_completion_tokens": 6000
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "reasoning_budget_exceeds_max_tokens");
+        assert!(mock_client.get_requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_non_reasoning_routes_allow_non_json_payloads() {
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
@@ -3368,8 +3508,11 @@ mod tests {
     async fn test_invalid_reasoning_effort_returns_parameter_specific_400() {
         let reasoning_translation = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/thinking",
-                "values": {"none": false, "high": true}
+                "unsupported_efforts": ["minimal", "low", "medium", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/thinking",
+                    "values": {"none": false, "high": true}
+                }]
             }
         }))
         .unwrap();
@@ -3415,15 +3558,21 @@ mod tests {
     async fn test_reasoning_effort_must_be_supported_by_every_pool_provider() {
         let supports_high = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/thinking",
-                "values": {"none": false, "high": true}
+                "unsupported_efforts": ["minimal", "low", "medium", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/thinking",
+                    "values": {"none": false, "high": true}
+                }]
             }
         }))
         .unwrap();
         let binary_disabled_only = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/thinking",
-                "values": {"none": {"type": "disabled"}}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {"none": {"type": "disabled"}}
+                }]
             }
         }))
         .unwrap();
@@ -3488,15 +3637,21 @@ mod tests {
     async fn test_reasoning_translation_is_rebuilt_for_each_fallback_attempt() {
         let sglang = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/thinking",
-                "values": {"none": false}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/thinking",
+                    "values": {"none": false}
+                }]
             }
         }))
         .unwrap();
         let object_shape = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/thinking",
-                "values": {"none": {"type": "disabled"}}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {"none": {"type": "disabled"}}
+                }]
             }
         }))
         .unwrap();
