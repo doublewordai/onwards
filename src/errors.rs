@@ -11,6 +11,8 @@ use bon::Builder;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use crate::reasoning::ReasoningError;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponseBody {
     pub message: String,
@@ -26,6 +28,19 @@ pub struct OnwardsErrorResponse {
 }
 
 impl OnwardsErrorResponse {
+    pub fn reasoning(error: &ReasoningError) -> Self {
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: error.message().to_owned(),
+                r#type: "invalid_request_error".to_string(),
+                param: error.param().map(str::to_string),
+                code: error.code().to_string(),
+            }),
+            status: StatusCode::from_u16(error.status_code())
+                .expect("reasoning errors use valid HTTP status codes"),
+        }
+    }
+
     pub fn model_not_found(model: &str) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {

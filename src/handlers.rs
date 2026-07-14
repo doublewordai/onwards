@@ -539,30 +539,18 @@ pub async fn target_message_handler<T: HttpClient>(
             OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
         })?;
         crate::reasoning::validate_canonical_reasoning(&canonical_request_path, &body).map_err(
-            |error| {
-                OnwardsErrorResponse::invalid_request(
-                    error.message(),
-                    error.param(),
-                    error.code(),
-                )
-            },
+            |error| OnwardsErrorResponse::reasoning(&error),
         )?
     } else {
         None
     };
 
-    if let Some(effort) = canonical_reasoning {
+    if let Some(reasoning) = canonical_reasoning.as_ref() {
         for provider in pool.providers() {
             if let Some(config) = provider.target.reasoning_translation.as_ref() {
                 config
-                    .validate_effort(&canonical_request_path, effort)
-                    .map_err(|error| {
-                        OnwardsErrorResponse::invalid_request(
-                            error.message(),
-                            error.param(),
-                            error.code(),
-                        )
-                    })?;
+                    .validate_request(&canonical_request_path, reasoning)
+                    .map_err(|error| OnwardsErrorResponse::reasoning(&error))?;
             }
         }
     }
@@ -759,12 +747,14 @@ pub async fn target_message_handler<T: HttpClient>(
                     )))
                 }
             };
-            if let Err(error) = reasoning_translation.apply(&canonical_request_path, &mut body) {
-                return LoopAction::Done(Err(OnwardsErrorResponse::invalid_request(
-                    error.message(),
-                    error.param(),
-                    error.code(),
-                )));
+            if let Some(reasoning) = canonical_reasoning.as_ref()
+                && let Err(error) = reasoning_translation.apply_request(
+                    &canonical_request_path,
+                    reasoning,
+                    &mut body,
+                )
+            {
+                return LoopAction::Done(Err(OnwardsErrorResponse::reasoning(&error)));
             }
             attempt_body = match serde_json::to_vec(&body) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),

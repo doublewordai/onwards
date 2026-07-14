@@ -24,6 +24,53 @@ pub enum ReasoningEffort {
     Max,
 }
 
+/// Canonical reasoning controls normalized from the original client request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanonicalReasoningRequest {
+    effort: ReasoningEffort,
+    effort_param: &'static str,
+    output_limit: OutputLimit,
+}
+
+impl CanonicalReasoningRequest {
+    pub const fn effort(&self) -> ReasoningEffort {
+        self.effort
+    }
+
+    pub const fn effort_param(&self) -> &'static str {
+        self.effort_param
+    }
+
+    pub const fn output_limit_param(&self) -> &'static str {
+        self.output_limit.param()
+    }
+
+    pub fn output_limit_value(&self) -> Option<&Value> {
+        self.output_limit.value()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum OutputLimit {
+    Missing { param: &'static str },
+    Present { param: &'static str, value: Value },
+}
+
+impl OutputLimit {
+    const fn param(&self) -> &'static str {
+        match self {
+            Self::Missing { param } | Self::Present { param, .. } => param,
+        }
+    }
+
+    fn value(&self) -> Option<&Value> {
+        match self {
+            Self::Missing { .. } => None,
+            Self::Present { value, .. } => Some(value),
+        }
+    }
+}
+
 impl ReasoningEffort {
     pub const ALL: [Self; 7] = [
         Self::None,
@@ -94,6 +141,7 @@ pub struct ReasoningError {
     message: String,
     param: Option<String>,
     code: &'static str,
+    status_code: u16,
 }
 
 impl ReasoningError {
@@ -102,6 +150,16 @@ impl ReasoningError {
             message: message.into(),
             param: param.map(str::to_string),
             code,
+            status_code: 400,
+        }
+    }
+
+    fn unprocessable(message: impl Into<String>, param: Option<&str>, code: &'static str) -> Self {
+        Self {
+            message: message.into(),
+            param: param.map(str::to_string),
+            code,
+            status_code: 422,
         }
     }
 
@@ -123,6 +181,10 @@ impl ReasoningError {
 
     pub fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub const fn status_code(&self) -> u16 {
+        self.status_code
     }
 }
 
@@ -197,16 +259,26 @@ impl ReasoningTranslationConfig {
 
     /// Apply the configured provider mapping to a canonical request body.
     pub fn apply(&self, path: &str, body: &mut Value) -> Result<(), ReasoningError> {
-        self.validate()?;
-        let surface = ApiSurface::from_path(path);
-        let Some(effort) = validate_canonical_reasoning(path, body)? else {
+        let Some(request) = validate_canonical_reasoning(path, body)? else {
             return Ok(());
         };
+        self.apply_request(path, &request, body)
+    }
+
+    /// Apply a mapping using reasoning controls normalized from the original request.
+    pub(crate) fn apply_request(
+        &self,
+        path: &str,
+        request: &CanonicalReasoningRequest,
+        body: &mut Value,
+    ) -> Result<(), ReasoningError> {
+        self.validate_request(path, request)?;
+        let surface = ApiSurface::from_path(path);
+        let effort = request.effort();
         let translation = self.translation_for(surface);
         let Some(translation) = translation else {
             return Ok(());
         };
-        self.validate_effort(path, effort)?;
         let canonical_path = surface
             .canonical_path()
             .expect("translated reasoning surfaces have canonical paths");
@@ -224,6 +296,66 @@ impl ReasoningTranslationConfig {
                 .cloned()
                 .expect("validated effort has a provider mapping");
             set_json_pointer(body, &write.target_path, mapped_value)?;
+        }
+        Ok(())
+    }
+
+    /// Validate provider support and any absolute reasoning budget before routing.
+    pub fn validate_request(
+        &self,
+        path: &str,
+        request: &CanonicalReasoningRequest,
+    ) -> Result<(), ReasoningError> {
+        self.validate()?;
+        let surface = ApiSurface::from_path(path);
+        let Some(translation) = self.translation_for(surface) else {
+            return Ok(());
+        };
+        self.validate_effort(path, request.effort())?;
+
+        let Some(budget_write) = translation
+            .writes
+            .iter()
+            .find(|write| write.target_path == "/thinking_token_budget")
+        else {
+            return Ok(());
+        };
+        let budget = budget_write
+            .values
+            .get(&request.effort())
+            .and_then(Value::as_u64)
+            .expect("validated budget mappings contain non-negative integers");
+        let output_param = request.output_limit_param();
+        let Some(output_value) = request.output_limit_value() else {
+            return Err(ReasoningError::unprocessable(
+                format!(
+                    "{} '{}' maps to an {budget}-token reasoning budget for this model, but {output_param} is not set. Set {output_param} above {budget} or select a lower {}.",
+                    request.effort_param(),
+                    request.effort(),
+                    request.effort_param(),
+                ),
+                Some(output_param),
+                "reasoning_budget_requires_max_tokens",
+            ));
+        };
+        let output_limit = output_value.as_u64().ok_or_else(|| {
+            ReasoningError::new(
+                format!("Invalid type for '{output_param}'. Expected a non-negative integer."),
+                Some(output_param),
+                "invalid_type",
+            )
+        })?;
+        if budget >= output_limit {
+            return Err(ReasoningError::new(
+                format!(
+                    "{} '{}' maps to an {budget}-token reasoning budget for this model, but {output_param} is {output_limit}. Increase {output_param} above {budget} or select a lower {}.",
+                    request.effort_param(),
+                    request.effort(),
+                    request.effort_param(),
+                ),
+                Some(output_param),
+                "reasoning_budget_exceeds_max_tokens",
+            ));
         }
         Ok(())
     }
@@ -274,7 +406,7 @@ impl ReasoningTranslationConfig {
 pub fn validate_canonical_reasoning(
     path: &str,
     body: &Value,
-) -> Result<Option<ReasoningEffort>, ReasoningError> {
+) -> Result<Option<CanonicalReasoningRequest>, ReasoningError> {
     let surface = ApiSurface::from_path(path);
     if surface == ApiSurface::Completions {
         let unsupported = [
@@ -360,10 +492,46 @@ pub fn validate_canonical_reasoning(
             "invalid_type",
         )
     })?;
-    value
+    let effort = value
         .parse::<ReasoningEffort>()
-        .map(Some)
-        .map_err(|_| ReasoningError::invalid_effort(value, param))
+        .map_err(|_| ReasoningError::invalid_effort(value, param))?;
+    Ok(Some(CanonicalReasoningRequest {
+        effort,
+        effort_param: param,
+        output_limit: normalize_output_limit(surface, body),
+    }))
+}
+
+fn normalize_output_limit(surface: ApiSurface, body: &Value) -> OutputLimit {
+    let preferred_param = match surface {
+        ApiSurface::ChatCompletions => "max_completion_tokens",
+        ApiSurface::Responses => "max_output_tokens",
+        ApiSurface::Completions | ApiSurface::Other => {
+            unreachable!("output limits are normalized only for reasoning API surfaces")
+        }
+    };
+    let candidates = match surface {
+        ApiSurface::ChatCompletions => [
+            ("/max_completion_tokens", "max_completion_tokens"),
+            ("/max_tokens", "max_tokens"),
+        ]
+        .as_slice(),
+        ApiSurface::Responses => [("/max_output_tokens", "max_output_tokens")].as_slice(),
+        ApiSurface::Completions | ApiSurface::Other => unreachable!(),
+    };
+    candidates
+        .iter()
+        .find_map(|(pointer, param)| {
+            body.pointer(pointer)
+                .filter(|value| !value.is_null())
+                .map(|value| OutputLimit::Present {
+                    param,
+                    value: value.clone(),
+                })
+        })
+        .unwrap_or(OutputLimit::Missing {
+            param: preferred_param,
+        })
 }
 
 fn validate_translation(translation: &ReasoningTranslation) -> Result<(), ReasoningError> {
@@ -577,6 +745,44 @@ mod tests {
         .unwrap()
     }
 
+    fn token_budget_config() -> ReasoningTranslationConfig {
+        serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn responses_token_budget_config() -> ReasoningTranslationConfig {
+        serde_json::from_value(json!({
+            "responses": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn accepts_explicit_multi_write_config_covering_all_openai_efforts() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
@@ -734,6 +940,131 @@ mod tests {
 
         assert_eq!(error.param(), Some("reasoning_effort"));
         assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn chat_prefers_max_completion_tokens_over_legacy_max_tokens() {
+        let body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 9000,
+            "max_tokens": 4000
+        });
+
+        let request = validate_canonical_reasoning("/chat/completions", &body)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(request.output_limit_param(), "max_completion_tokens");
+        assert_eq!(request.output_limit_value(), Some(&json!(9000)));
+    }
+
+    #[test]
+    fn missing_chat_limit_returns_parameter_specific_422_for_budget_mapping() {
+        let config = token_budget_config();
+        let mut body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high"
+        });
+
+        let error = config.apply("/chat/completions", &mut body).unwrap_err();
+
+        assert_eq!(error.status_code(), 422);
+        assert_eq!(error.param(), Some("max_completion_tokens"));
+        assert_eq!(error.code(), "reasoning_budget_requires_max_tokens");
+        assert_eq!(
+            error.message(),
+            "reasoning_effort 'high' maps to an 8192-token reasoning budget for this model, but max_completion_tokens is not set. Set max_completion_tokens above 8192 or select a lower reasoning_effort."
+        );
+    }
+
+    #[test]
+    fn null_max_completion_tokens_falls_back_to_legacy_max_tokens() {
+        let config = token_budget_config();
+        let mut body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high",
+            "max_completion_tokens": null,
+            "max_tokens": 9000
+        });
+
+        config.apply("/chat/completions", &mut body).unwrap();
+
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["thinking_token_budget"], json!(8192));
+    }
+
+    #[test]
+    fn reasoning_budget_equal_to_output_limit_returns_400() {
+        let config = token_budget_config();
+        let mut body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high",
+            "max_completion_tokens": 8192
+        });
+
+        let error = config.apply("/chat/completions", &mut body).unwrap_err();
+
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.param(), Some("max_completion_tokens"));
+        assert_eq!(error.code(), "reasoning_budget_exceeds_max_tokens");
+        assert_eq!(
+            error.message(),
+            "reasoning_effort 'high' maps to an 8192-token reasoning budget for this model, but max_completion_tokens is 8192. Increase max_completion_tokens above 8192 or select a lower reasoning_effort."
+        );
+    }
+
+    #[test]
+    fn malformed_output_limit_is_rejected_only_for_budget_mappings() {
+        let config = token_budget_config();
+        let mut budget_body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high",
+            "max_completion_tokens": "many"
+        });
+
+        let error = config
+            .apply("/chat/completions", &mut budget_body)
+            .unwrap_err();
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.param(), Some("max_completion_tokens"));
+        assert_eq!(error.code(), "invalid_type");
+
+        let mut binary_body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "none",
+            "max_completion_tokens": "many"
+        });
+        sglang_config()
+            .apply("/chat/completions", &mut binary_body)
+            .unwrap();
+    }
+
+    #[test]
+    fn responses_budget_errors_name_original_openai_parameters() {
+        let config = responses_token_budget_config();
+        let mut body = json!({
+            "model": "model",
+            "input": "Hello",
+            "reasoning": {"effort": "high"},
+            "max_output_tokens": 4096
+        });
+
+        let error = config.apply("/responses", &mut body).unwrap_err();
+
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.param(), Some("max_output_tokens"));
+        assert_eq!(error.code(), "reasoning_budget_exceeds_max_tokens");
+        assert_eq!(
+            error.message(),
+            "reasoning.effort 'high' maps to an 8192-token reasoning budget for this model, but max_output_tokens is 4096. Increase max_output_tokens above 8192 or select a lower reasoning.effort."
+        );
     }
 
     #[test]
