@@ -542,15 +542,22 @@ fn validate_translation(translation: &ReasoningTranslation) -> Result<(), Reason
         return Err(invalid_config("writes must contain at least one write"));
     }
 
-    let mut target_paths = BTreeSet::new();
+    let mut target_paths: BTreeSet<&str> = BTreeSet::new();
     let mut supported_efforts: Option<BTreeSet<ReasoningEffort>> = None;
     let mut has_reasoning_effort = false;
     let mut has_thinking_token_budget = false;
 
     for write in &translation.writes {
-        if !target_paths.insert(write.target_path.as_str()) {
+        if target_paths.contains(write.target_path.as_str()) {
             return Err(invalid_config("target paths must be unique"));
         }
+        if target_paths
+            .iter()
+            .any(|target_path| target_paths_overlap(target_path, &write.target_path))
+        {
+            return Err(invalid_config("target paths must not overlap"));
+        }
+        target_paths.insert(write.target_path.as_str());
         validate_write(write)?;
         has_reasoning_effort |= write.target_path == "/reasoning_effort";
         has_thinking_token_budget |= write.target_path == "/thinking_token_budget";
@@ -594,6 +601,15 @@ fn validate_translation(translation: &ReasoningTranslation) -> Result<(), Reason
     }
 
     Ok(())
+}
+
+fn target_paths_overlap(left: &str, right: &str) -> bool {
+    right
+        .strip_prefix(left)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn validate_write(write: &ReasoningWrite) -> Result<(), ReasoningError> {
@@ -1243,6 +1259,30 @@ mod tests {
         let error = config.validate().unwrap_err();
 
         assert!(error.message().contains("unique"));
+    }
+
+    #[test]
+    fn rejects_overlapping_write_target_paths_in_either_order() {
+        for target_paths in [
+            ["/thinking", "/thinking/mode"],
+            ["/thinking/mode", "/thinking"],
+        ] {
+            let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                    "writes": [
+                        {"target_path": target_paths[0], "values": {"none": false}},
+                        {"target_path": target_paths[1], "values": {"none": false}}
+                    ]
+                }
+            }))
+            .unwrap();
+
+            let error = config.validate().unwrap_err();
+
+            assert_eq!(error.code(), "invalid_translation_config");
+            assert!(error.message().contains("overlap"));
+        }
     }
 
     #[test]
