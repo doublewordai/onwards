@@ -19,23 +19,30 @@ Replace the current single `{ target_path, values }` surface configuration with 
 {
   "reasoning_translation": {
     "chat_completions": {
+      "unsupported_efforts": [],
       "writes": [
         {
           "target_path": "/reasoning_effort",
           "values": {
             "none": "none",
+            "minimal": "low",
             "low": "low",
             "medium": "medium",
-            "high": "high"
+            "high": "high",
+            "xhigh": "high",
+            "max": "high"
           }
         },
         {
           "target_path": "/thinking_token_budget",
           "values": {
             "none": 0,
+            "minimal": 512,
             "low": 1024,
             "medium": 4096,
-            "high": 8192
+            "high": 8192,
+            "xhigh": 12288,
+            "max": 16384
           }
         }
       ]
@@ -44,15 +51,17 @@ Replace the current single `{ target_path, values }` surface configuration with 
 }
 ```
 
-Every write must explicitly map exactly the same non-empty effort set. A write is never silently skipped for one effort. Omitting an effort from the entire surface mapping intentionally marks that effort unsupported and requests for it receive `400 unsupported_value`.
+Every surface must explicitly account for all OpenAI reasoning efforts: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Every write must map exactly the same non-empty supported effort set, and a required `unsupported_efforts` array must list every remaining effort. The mapped keys and `unsupported_efforts` must be disjoint and their union must contain all seven values. An empty `unsupported_efforts` array is still required so accepting all OpenAI efforts is a conscious configuration choice.
+
+A write is never silently skipped for one effort. Requests for an explicitly unsupported effort receive `400 unsupported_value` and list only the mapped efforts as supported.
 
 Target paths within a surface must be unique. Existing reasoning-related target paths remain allowed, and `/thinking_token_budget` is added as an allowed top-level target. A `thinking_token_budget` write must be paired with a `/reasoning_effort` write so that recent vLLM and SGLang versions also activate the model's thinking mode.
 
-All `thinking_token_budget` values must be non-negative JSON integers. Configuration validation runs while targets load or reload, so malformed mappings do not become request-time client errors.
+All `thinking_token_budget` values must be non-negative JSON integers. The example budgets are illustrative configuration, not global defaults; production values remain model-specific and eval-derived. Configuration validation runs while targets load or reload, so malformed mappings do not become request-time client errors.
 
 The three provider capability shapes are represented without a separate strategy enum:
 
-- Native effort: one `/reasoning_effort` write containing only the levels the model genuinely supports.
+- Native effort: one `/reasoning_effort` write containing only the levels the model genuinely supports, with every other OpenAI level named in `unsupported_efforts`.
 - Absolute token budget: `/reasoning_effort` and `/thinking_token_budget` writes.
 - Binary thinking: one `/thinking`, `/chat_template_kwargs/thinking`, or `/chat_template_kwargs/enable_thinking` write.
 
@@ -129,6 +138,7 @@ Unit coverage in `reasoning.rs` will verify:
 
 - multi-write native, budget, and binary mappings;
 - complete and identical effort sets across writes;
+- explicit accounting for all seven OpenAI efforts through mapped values or `unsupported_efforts`;
 - duplicate and disallowed target paths;
 - integer budget validation and the required `/reasoning_effort` companion;
 - Chat limit precedence and legacy fallback;
