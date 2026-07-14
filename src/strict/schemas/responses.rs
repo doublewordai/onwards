@@ -665,7 +665,7 @@ pub enum TruncationStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReasoningConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
+    pub effort: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_filter: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

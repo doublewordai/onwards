@@ -15,6 +15,7 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
+use crate::reasoning::ReasoningTranslationConfig;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -97,6 +98,10 @@ pub struct ProviderSpec {
     /// `Some(false)` overrides the inherited value.
     #[serde(default)]
     pub propagate_trace_context: Option<bool>,
+
+    /// Translate canonical OpenAI reasoning controls into this provider's request shape.
+    #[serde(default)]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 /// Configuration for Open Responses API behavior
@@ -383,6 +388,10 @@ pub struct TargetSpec {
     /// reading the full response body (which may be streamed over a longer period).
     #[serde(default)]
     pub request_timeout_secs: Option<u64>,
+
+    /// Translate canonical OpenAI reasoning controls into this provider's request shape.
+    #[serde(default)]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 fn default_weight() -> u32 {
@@ -469,6 +478,7 @@ impl TargetSpecOrList {
                         // format), per-provider trace-context overrides are honoured;
                         // an unset value still inherits the resolved trusted value.
                         propagate_trace_context: t.propagate_trace_context,
+                        reasoning_translation: t.reasoning_translation,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -509,6 +519,7 @@ impl TargetSpecOrList {
                     // this, setting propagate_trace_context on the single-provider
                     // YAML form would be silently dropped.
                     propagate_trace_context: spec.propagate_trace_context,
+                    reasoning_translation: spec.reasoning_translation,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -563,6 +574,7 @@ impl From<TargetSpec> for Target {
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
+            reasoning_translation: value.reasoning_translation,
         }
     }
 }
@@ -588,6 +600,7 @@ impl From<ProviderSpec> for Target {
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
+            reasoning_translation: value.reasoning_translation,
         }
     }
 }
@@ -736,6 +749,8 @@ pub struct Target {
     /// Per-provider override for W3C trace context propagation on outbound
     /// requests. None means inherit from the resolved trusted value.
     pub propagate_trace_context: Option<bool>,
+    /// Provider-specific translation for canonical OpenAI reasoning controls.
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 impl Target {
@@ -1021,6 +1036,19 @@ impl Targets {
         for (name, target_spec_or_list) in config_file.targets {
             // Extract pool-level config and provider specs
             let pool_config = target_spec_or_list.into_pool_config()?;
+
+            for (index, provider) in pool_config.providers.iter().enumerate() {
+                if let Some(config) = provider.reasoning_translation.as_ref() {
+                    config.validate().map_err(|error| {
+                        anyhow!(
+                            "Invalid reasoning translation for target '{}' provider {}: {}",
+                            name,
+                            index,
+                            error.message()
+                        )
+                    })?;
+                }
+            }
 
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
@@ -2277,6 +2305,7 @@ mod tests {
                 request_timeout_secs: None,
                 trusted: None,
                 propagate_trace_context: None,
+                reasoning_translation: None,
             }],
         };
 
@@ -2846,5 +2875,31 @@ mod tests {
         assert_eq!(b.initial_ms, 100);
         assert_eq!(b.max_ms, 1500);
         assert_eq!(b.jitter, JitterStrategy::None);
+    }
+
+    #[test]
+    fn test_from_config_rejects_invalid_reasoning_translation() {
+        let config: ConfigFile = serde_json::from_value(serde_json::json!({
+            "targets": {
+                "reasoning-model": {
+                    "url": "https://provider.example.com/v1",
+                    "reasoning_translation": {
+                        "chat_completions": {
+                            "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                            "writes": [{
+                                "target_path": "/thinking_token_budget",
+                                "values": {"none": 0}
+                            }]
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = Targets::from_config(config).unwrap_err();
+
+        assert!(error.to_string().contains("thinking_token_budget"));
+        assert!(error.to_string().contains("reasoning_effort"));
     }
 }

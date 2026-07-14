@@ -447,6 +447,8 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
+    let canonical_request_path = req.uri().path().to_string();
+
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
         .headers()
@@ -528,6 +530,34 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
             }
         // If no bearer token, no labels to match — rules are skipped (allow by default)
+    }
+
+    let canonical_reasoning = if let Some(reasoning) = req
+        .extensions()
+        .get::<crate::reasoning::CanonicalReasoningRequest>()
+    {
+        Some(reasoning.clone())
+    } else if !body_bytes.is_empty()
+        && crate::reasoning::uses_reasoning_contract(&canonical_request_path)
+    {
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
+            OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
+        })?;
+        crate::reasoning::validate_canonical_reasoning(&canonical_request_path, &body).map_err(
+            |error| OnwardsErrorResponse::reasoning(&error),
+        )?
+    } else {
+        None
+    };
+
+    if let Some(reasoning) = canonical_reasoning.as_ref() {
+        for provider in pool.providers() {
+            if let Some(config) = provider.target.reasoning_translation.as_ref() {
+                config
+                    .validate_request(&canonical_request_path, reasoning)
+                    .map_err(|error| OnwardsErrorResponse::reasoning(&error))?;
+            }
+        }
     }
 
     // Check if pool has no providers (e.g., composite model with no enabled components).
@@ -704,6 +734,34 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
             }
             attempt_body = match serde_json::to_vec(&body_serialized) {
+                Ok(bytes) => axum::body::Bytes::from(bytes),
+                Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+            };
+        }
+
+        if canonical_reasoning.is_some()
+            && let Some(reasoning_translation) = target.reasoning_translation.as_ref()
+            && !attempt_body.is_empty()
+        {
+            let mut body: serde_json::Value = match serde_json::from_slice(&attempt_body) {
+                Ok(body) => body,
+                Err(_) => {
+                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
+                        "Request body must be valid JSON.",
+                        None,
+                    )))
+                }
+            };
+            if let Some(reasoning) = canonical_reasoning.as_ref()
+                && let Err(error) = reasoning_translation.apply_request(
+                    &canonical_request_path,
+                    reasoning,
+                    &mut body,
+                )
+            {
+                return LoopAction::Done(Err(OnwardsErrorResponse::reasoning(&error)));
+            }
+            attempt_body = match serde_json::to_vec(&body) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
             };
@@ -2396,6 +2454,7 @@ mod tests {
             request_timeout_secs: None,
             trusted,
             propagate_trace_context,
+            reasoning_translation: None,
         }
     }
 

@@ -815,6 +815,59 @@ mod tests {
         assert!(body_json["choices"][0]["text"].is_string());
     }
 
+    #[tokio::test]
+    async fn test_strict_router_rejects_reasoning_on_completions_endpoint() {
+        let (state, mock_client) = create_completions_test_app_state();
+        let router = build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello","reasoning_effort":"low"}"#,
+            ))
+            .unwrap();
+
+        let response = router.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "reasoning_effort");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello","thinking":false}"#,
+            ))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "thinking");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-3.5-turbo-instruct","prompt":"Say hello","thinking_token_budget":1024}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["param"], "thinking_token_budget");
+        assert_eq!(body["error"]["code"], "unsupported_parameter");
+        assert!(mock_client.get_requests().is_empty());
+    }
+
     /// The strict router forwards to the upstream /completions endpoint (not /chat/completions)
     #[tokio::test]
     async fn test_completions_proxied_to_upstream_completions() {

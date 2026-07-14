@@ -124,6 +124,10 @@ impl OpenResponsesAdapter {
             }),
             max_tokens: request.max_output_tokens,
             max_completion_tokens: None,
+            reasoning_effort: request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort.clone()),
             presence_penalty: None,
             frequency_penalty: None,
             logit_bias: None,
@@ -927,6 +931,24 @@ mod tests {
         assert_eq!(chat_request.messages[1].role, "user");
         assert_eq!(chat_request.temperature, Some(0.7));
         assert_eq!(chat_request.max_tokens, Some(100));
+    }
+
+    #[tokio::test]
+    async fn test_adapter_preserves_reasoning_effort_for_chat_translation() {
+        let adapter = create_test_adapter();
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "kimi-k2.5",
+            "input": "Hello",
+            "reasoning": {"effort": "none"}
+        }))
+        .unwrap();
+
+        let chat_request = adapter.to_chat_request(&request).await.unwrap();
+
+        assert_eq!(
+            chat_request.reasoning_effort.as_ref(),
+            Some(&serde_json::json!("none"))
+        );
     }
 
     #[tokio::test]
