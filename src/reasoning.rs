@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -67,9 +67,16 @@ impl FromStr for ReasoningEffort {
 
 /// Maps canonical reasoning efforts to values at one provider request path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReasoningTranslation {
+pub struct ReasoningWrite {
     pub target_path: String,
     pub values: BTreeMap<ReasoningEffort, Value>,
+}
+
+/// Maps every canonical reasoning effort to provider request writes or an explicit rejection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningTranslation {
+    pub unsupported_efforts: BTreeSet<ReasoningEffort>,
+    pub writes: Vec<ReasoningWrite>,
 }
 
 /// Provider translations for each supported OpenAI request surface.
@@ -200,19 +207,25 @@ impl ReasoningTranslationConfig {
             return Ok(());
         };
         self.validate_effort(path, effort)?;
-        let mapped_value = translation
-            .values
-            .get(&effort)
-            .cloned()
-            .expect("validated effort has a provider mapping");
-
         let canonical_path = surface
             .canonical_path()
             .expect("translated reasoning surfaces have canonical paths");
-        if translation.target_path != canonical_path {
+        if !translation
+            .writes
+            .iter()
+            .any(|write| write.target_path == canonical_path)
+        {
             remove_json_pointer(body, canonical_path);
         }
-        set_json_pointer(body, &translation.target_path, mapped_value)
+        for write in &translation.writes {
+            let mapped_value = write
+                .values
+                .get(&effort)
+                .cloned()
+                .expect("validated effort has a provider mapping");
+            set_json_pointer(body, &write.target_path, mapped_value)?;
+        }
+        Ok(())
     }
 
     /// Ensure a provider can represent an effort before load balancing begins.
@@ -226,11 +239,15 @@ impl ReasoningTranslationConfig {
         let Some(translation) = self.translation_for(surface) else {
             return Ok(());
         };
-        if translation.values.contains_key(&effort) {
+        let supported_values = &translation
+            .writes
+            .first()
+            .expect("validated translations contain at least one write")
+            .values;
+        if supported_values.contains_key(&effort) {
             return Ok(());
         }
-        let supported = translation
-            .values
+        let supported = supported_values
             .keys()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -350,12 +367,72 @@ pub fn validate_canonical_reasoning(
 }
 
 fn validate_translation(translation: &ReasoningTranslation) -> Result<(), ReasoningError> {
-    let segments = pointer_segments(&translation.target_path)?;
+    if translation.writes.is_empty() {
+        return Err(invalid_config("writes must contain at least one write"));
+    }
+
+    let mut target_paths = BTreeSet::new();
+    let mut supported_efforts: Option<BTreeSet<ReasoningEffort>> = None;
+    let mut has_reasoning_effort = false;
+    let mut has_thinking_token_budget = false;
+
+    for write in &translation.writes {
+        if !target_paths.insert(write.target_path.as_str()) {
+            return Err(invalid_config("target paths must be unique"));
+        }
+        validate_write(write)?;
+        has_reasoning_effort |= write.target_path == "/reasoning_effort";
+        has_thinking_token_budget |= write.target_path == "/thinking_token_budget";
+
+        let write_efforts = write.values.keys().copied().collect::<BTreeSet<_>>();
+        if write_efforts.is_empty() {
+            return Err(invalid_config(
+                "values must contain at least one effort mapping",
+            ));
+        }
+        if let Some(expected) = supported_efforts.as_ref()
+            && expected != &write_efforts
+        {
+            return Err(invalid_config(
+                "every write must map exactly the same reasoning efforts",
+            ));
+        }
+        supported_efforts.get_or_insert(write_efforts);
+    }
+
+    if has_thinking_token_budget && !has_reasoning_effort {
+        return Err(invalid_config(
+            "thinking_token_budget requires a reasoning_effort write",
+        ));
+    }
+
+    let supported_efforts = supported_efforts.expect("validated writes contain effort mappings");
+    if !supported_efforts.is_disjoint(&translation.unsupported_efforts) {
+        return Err(invalid_config(
+            "mapped and unsupported reasoning efforts must not overlap",
+        ));
+    }
+    let accounted_efforts = supported_efforts
+        .union(&translation.unsupported_efforts)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if accounted_efforts != ReasoningEffort::ALL.into_iter().collect() {
+        return Err(invalid_config(
+            "mapped and unsupported reasoning efforts must account for every OpenAI reasoning effort",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_write(write: &ReasoningWrite) -> Result<(), ReasoningError> {
+    let segments = pointer_segments(&write.target_path)?;
     let Some(root) = segments.first().map(String::as_str) else {
         return Err(invalid_config("target_path must not be empty"));
     };
     let allowed_path = match root {
         "reasoning_effort" => segments.len() == 1,
+        "thinking_token_budget" => segments.len() == 1,
         "reasoning" | "thinking" => true,
         "chat_template_kwargs" => {
             segments.len() == 2 && matches!(segments[1].as_str(), "thinking" | "enable_thinking")
@@ -367,12 +444,12 @@ fn validate_translation(translation: &ReasoningTranslation) -> Result<(), Reason
             "target_path must address a reasoning-related request field",
         ));
     }
-    if translation.values.is_empty() {
-        return Err(invalid_config(
-            "values must contain at least one effort mapping",
-        ));
-    }
-    for value in translation.values.values() {
+    for value in write.values.values() {
+        if write.target_path == "/thinking_token_budget" && value.as_u64().is_none() {
+            return Err(invalid_config(
+                "thinking_token_budget values must be non-negative integers",
+            ));
+        }
         let bytes = serde_json::to_vec(value)
             .map_err(|_| invalid_config("mapped values must be valid JSON"))?;
         if bytes.len() > MAX_VALUE_BYTES {
@@ -485,16 +562,57 @@ mod tests {
     fn sglang_config() -> ReasoningTranslationConfig {
         serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/thinking",
-                "values": {
-                    "none": false,
-                    "low": true,
-                    "medium": true,
-                    "high": true
-                }
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/thinking",
+                    "values": {
+                        "none": false,
+                        "low": true,
+                        "medium": true,
+                        "high": true
+                    }
+                }]
             }
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn accepts_explicit_multi_write_config_covering_all_openai_efforts() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": [],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "minimal": "low",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high",
+                            "xhigh": "high",
+                            "max": "high"
+                        }
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {
+                            "none": 0,
+                            "minimal": 512,
+                            "low": 1024,
+                            "medium": 4096,
+                            "high": 8192,
+                            "xhigh": 12288,
+                            "max": 16384
+                        }
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        config.validate().unwrap();
     }
 
     #[test]
@@ -530,11 +648,14 @@ mod tests {
     fn supports_object_shaped_provider_values() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/thinking",
-                "values": {
-                    "none": {"type": "disabled"},
-                    "high": {"type": "enabled"}
-                }
+                "unsupported_efforts": ["minimal", "low", "medium", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {
+                        "none": {"type": "disabled"},
+                        "high": {"type": "enabled"}
+                    }
+                }]
             }
         }))
         .unwrap();
@@ -549,8 +670,11 @@ mod tests {
     fn responses_translation_removes_empty_canonical_parent() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "responses": {
-                "target_path": "/thinking",
-                "values": {"low": {"type": "enabled"}}
+                "unsupported_efforts": ["none", "minimal", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {"low": {"type": "enabled"}}
+                }]
             }
         }))
         .unwrap();
@@ -570,8 +694,11 @@ mod tests {
     fn responses_translation_preserves_canonical_reasoning_siblings() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "responses": {
-                "target_path": "/thinking",
-                "values": {"low": true}
+                "unsupported_efforts": ["none", "minimal", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {"low": true}
+                }]
             }
         }))
         .unwrap();
@@ -662,8 +789,11 @@ mod tests {
     fn rejects_translation_paths_outside_reasoning_fields() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/messages/0/content",
-                "values": {"none": "replaced"}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/messages/0/content",
+                    "values": {"none": "replaced"}
+                }]
             }
         }))
         .unwrap();
@@ -678,8 +808,11 @@ mod tests {
     fn rejects_non_reasoning_chat_template_kwargs_paths() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/chat_template_kwargs/template",
-                "values": {"none": "replacement"}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/chat_template_kwargs/template",
+                    "values": {"none": "replacement"}
+                }]
             }
         }))
         .unwrap();
@@ -694,8 +827,11 @@ mod tests {
     fn rejects_excessively_deep_target_paths() {
         let config: ReasoningTranslationConfig = serde_json::from_value(json!({
             "chat_completions": {
-                "target_path": "/thinking/a/b/c/d/e/f/g/h",
-                "values": {"none": false}
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking/a/b/c/d/e/f/g/h",
+                    "values": {"none": false}
+                }]
             }
         }))
         .unwrap();
@@ -704,5 +840,118 @@ mod tests {
 
         assert_eq!(error.code(), "invalid_translation_config");
         assert!(error.message().contains("target_path"));
+    }
+
+    #[test]
+    fn rejects_multi_write_effort_set_mismatches() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none", "low": "low", "high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"none": 0, "low": 1024}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("exactly the same reasoning efforts")
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_write_target_paths() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {"target_path": "/thinking", "values": {"none": false}},
+                    {"target_path": "/thinking", "values": {"none": true}}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.message().contains("unique"));
+    }
+
+    #[test]
+    fn rejects_overlapping_mapped_and_unsupported_efforts() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{"target_path": "/thinking", "values": {"none": false}}]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.message().contains("must not overlap"));
+    }
+
+    #[test]
+    fn rejects_incomplete_openai_effort_accounting() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh"],
+                "writes": [{"target_path": "/thinking", "values": {"none": false}}]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.message().contains("every OpenAI reasoning effort"));
+    }
+
+    #[test]
+    fn rejects_non_integer_thinking_token_budgets() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {"target_path": "/reasoning_effort", "values": {"none": "none"}},
+                    {"target_path": "/thinking_token_budget", "values": {"none": 1.5}}
+                ]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.message().contains("non-negative integers"));
+    }
+
+    #[test]
+    fn rejects_budget_mapping_without_reasoning_effort_activation() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [{"target_path": "/thinking_token_budget", "values": {"none": 0}}]
+            }
+        }))
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+
+        assert!(
+            error
+                .message()
+                .contains("requires a reasoning_effort write")
+        );
     }
 }

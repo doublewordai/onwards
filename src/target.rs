@@ -1037,6 +1037,19 @@ impl Targets {
             // Extract pool-level config and provider specs
             let pool_config = target_spec_or_list.into_pool_config()?;
 
+            for (index, provider) in pool_config.providers.iter().enumerate() {
+                if let Some(config) = provider.reasoning_translation.as_ref() {
+                    config.validate().map_err(|error| {
+                        anyhow!(
+                            "Invalid reasoning translation for target '{}' provider {}: {}",
+                            name,
+                            index,
+                            error.message()
+                        )
+                    })?;
+                }
+            }
+
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
                 debug!("Pool '{}' has {} keys configured", name, keys.len());
@@ -2862,5 +2875,31 @@ mod tests {
         assert_eq!(b.initial_ms, 100);
         assert_eq!(b.max_ms, 1500);
         assert_eq!(b.jitter, JitterStrategy::None);
+    }
+
+    #[test]
+    fn test_from_config_rejects_invalid_reasoning_translation() {
+        let config: ConfigFile = serde_json::from_value(serde_json::json!({
+            "targets": {
+                "reasoning-model": {
+                    "url": "https://provider.example.com/v1",
+                    "reasoning_translation": {
+                        "chat_completions": {
+                            "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                            "writes": [{
+                                "target_path": "/thinking_token_budget",
+                                "values": {"none": 0}
+                            }]
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        let error = Targets::from_config(config).unwrap_err();
+
+        assert!(error.to_string().contains("thinking_token_budget"));
+        assert!(error.to_string().contains("reasoning_effort"));
     }
 }
