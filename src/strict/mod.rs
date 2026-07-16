@@ -183,8 +183,13 @@ pub fn build_strict_router<T: HttpClient + Clone + Send + Sync + 'static>(
         .route("/messages", post(handlers::chat_completions_handler::<T>))
         // Legacy text completions
         .route("/completions", post(handlers::completions_handler::<T>))
-        // Open Responses
-        .route("/responses", post(handlers::responses_handler::<T>))
+        // Open Responses ingress alias. The Responses->Chat Completions
+        // translation happens at the dwctl edge (the request body is already
+        // Chat Completions and the path is normalised to `/chat/completions`
+        // by the time it reaches here); this alias only exists so strict-mode
+        // routing matches `/responses` and dispatches to the chat-completions
+        // handler. No Responses logic lives in onwards. Mirrors `/messages`.
+        .route("/responses", post(handlers::chat_completions_handler::<T>))
         // Embeddings
         .route("/embeddings", post(handlers::embeddings_handler::<T>))
         // Without this layer the `Json` extractors above fall back to Axum's
@@ -343,6 +348,26 @@ mod tests {
         let request = Request::builder()
             .method("POST")
             .uri("/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(padded_chat_completions_body(16)))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_strict_router_responses_alias_routes_to_chat_completions() {
+        // `/responses` is an unconditional alias to the chat-completions handler:
+        // the Responses->Chat translation happens upstream at the dwctl edge (the
+        // body posted here is already Chat Completions), so onwards just matches
+        // the route, exactly like `/messages`.
+        let state = create_test_app_state();
+        let router = build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
             .header("content-type", "application/json")
             .body(Body::from(padded_chat_completions_body(16)))
             .unwrap();
