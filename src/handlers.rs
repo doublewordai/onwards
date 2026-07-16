@@ -221,6 +221,21 @@ struct OriginalModel(String);
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedTrust(pub(crate) bool);
 
+/// Response extension identifying the upstream provider that produced this response.
+///
+/// Set on the success path after final load-balancer selection — i.e. after any
+/// fallback/retry — so it always names the provider that actually completed the
+/// request. Integrators (e.g. request-logging middleware) can read it to attribute
+/// traffic to a concrete upstream without re-deriving the routing decision.
+/// Requests that fail before a provider produces a response carry no `ServedBy`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServedBy {
+    /// Full URL of the upstream target that served the request.
+    pub url: String,
+    /// The upstream model name after any `onwards_model` rewrite, when configured.
+    pub onwards_model: Option<String>,
+}
+
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
 /// when unset, defaults to the resolved trusted value (per-provider `trusted`
@@ -1401,6 +1416,10 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
+        response.extensions_mut().insert(ServedBy {
+            url: target.url.to_string(),
+            onwards_model: target.onwards_model.clone(),
+        });
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
