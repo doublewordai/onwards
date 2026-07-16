@@ -1147,7 +1147,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let served_by = response
             .extensions()
-            .get::<handlers::ServedBy>()
+            .get::<crate::ServedBy>()
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
