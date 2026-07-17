@@ -476,6 +476,17 @@ pub fn validate_canonical_reasoning(
         ));
     }
 
+    if surface == ApiSurface::Responses
+        && let Some(reasoning) = body.get("reasoning").filter(|value| !value.is_null())
+        && !reasoning.is_object()
+    {
+        return Err(ReasoningError::new(
+            "Invalid type for 'reasoning'. Expected an object.",
+            Some("reasoning"),
+            "invalid_type",
+        ));
+    }
+
     let Some(canonical_path) = surface.canonical_path() else {
         return Ok(None);
     };
@@ -959,6 +970,45 @@ mod tests {
 
         assert_eq!(error.param(), Some("reasoning_effort"));
         assert_eq!(error.code(), "invalid_value");
+    }
+
+    #[test]
+    fn rejects_non_object_responses_reasoning() {
+        for reasoning in [json!("high"), json!(1), json!(true), json!([])] {
+            let body = json!({
+                "model": "model",
+                "input": "Hello",
+                "reasoning": reasoning
+            });
+
+            let error = validate_canonical_reasoning("/responses", &body).unwrap_err();
+
+            assert_eq!(error.status_code(), 400);
+            assert_eq!(error.param(), Some("reasoning"));
+            assert_eq!(error.code(), "invalid_type");
+            assert_eq!(
+                error.message(),
+                "Invalid type for 'reasoning'. Expected an object."
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_responses_reasoning_without_an_effort() {
+        for body in [
+            json!({"model": "model", "input": "Hello"}),
+            json!({"model": "model", "input": "Hello", "reasoning": null}),
+            json!({
+                "model": "model",
+                "input": "Hello",
+                "reasoning": {"summary": "auto"}
+            }),
+        ] {
+            assert_eq!(
+                validate_canonical_reasoning("/responses", &body).unwrap(),
+                None
+            );
+        }
     }
 
     #[test]
