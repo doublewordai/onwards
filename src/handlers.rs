@@ -223,11 +223,17 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 
 /// Response extension identifying the upstream provider that produced this response.
 ///
-/// Set on the success path after final load-balancer selection — i.e. after any
-/// fallback/retry — so it always names the provider that actually completed the
-/// request. Integrators (e.g. request-logging middleware) can read it to attribute
-/// traffic to a concrete upstream without re-deriving the routing decision.
-/// Requests that fail before a provider produces a response carry no `ServedBy`.
+/// Present whenever an upstream produced the response that reached the client —
+/// including passed-through non-2xx upstream statuses. Set after final
+/// load-balancer selection (i.e. after any fallback/retry), so it names the
+/// provider whose response was returned; its presence means "an upstream
+/// answered", not "the request succeeded" — check the status code for that.
+/// Absent when no upstream produced a response (auth/validation rejections,
+/// exhausted fallbacks, gateway-generated errors). For streaming tool loops the
+/// response is returned before follow-up iterations run, so it names the
+/// provider of the initial iteration. Integrators (e.g. request-logging
+/// middleware) can read it to attribute traffic to a concrete upstream without
+/// re-deriving the routing decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedBy {
     /// Full URL of the upstream target that served the request.
