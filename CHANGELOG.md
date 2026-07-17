@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.35.3](https://github.com/doublewordai/onwards/compare/v0.35.2...v0.35.3) - 2026-07-17
+## [0.36.0](https://github.com/doublewordai/onwards/compare/v0.35.2...v0.36.0) - 2026-07-17
 
 ### Added
 
