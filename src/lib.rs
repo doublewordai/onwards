@@ -66,9 +66,9 @@ pub mod telemetry;
 pub mod traits;
 
 use client::{HttpClient, HyperClient};
+pub use handlers::ServedBy;
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-pub use handlers::ServedBy;
 #[cfg(feature = "multi-step")]
 pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
 #[cfg(feature = "multi-step")]

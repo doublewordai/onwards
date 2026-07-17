@@ -34,7 +34,7 @@ use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{FromRequest, State};
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{Extensions, HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use http_body_util::BodyExt;
@@ -562,6 +562,16 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
 
 /// Handle a request using the Open Responses adapter
 ///
+/// Carry the upstream response's extensions (ServedBy, ResolvedTrust) onto a
+/// freshly built conversion response. Every adapter path that constructs a new
+/// `Response` from upstream `parts` must route through this — a site that
+/// forgets silently breaks provider attribution for integrators (which is
+/// exactly how the requires_action path was missed initially).
+fn carry_upstream_extensions(mut response: Response, extensions: Extensions) -> Response {
+    response.extensions_mut().extend(extensions);
+    response
+}
+
 /// This function implements the full Open Responses adapter flow including tool loop orchestration:
 /// 1. Convert Responses request to Chat Completions request
 /// 2. Forward to upstream
@@ -878,17 +888,20 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                     }
                 };
 
-                return Response::builder()
-                    .status(parts.status)
-                    .header("content-type", "application/json")
-                    .body(Body::from(response_bytes))
-                    .unwrap_or_else(|_| {
-                        error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            "Failed to build response",
-                        )
-                    });
+                return carry_upstream_extensions(
+                    Response::builder()
+                        .status(parts.status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response_bytes))
+                        .unwrap_or_else(|_| {
+                            error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "Failed to build response",
+                            )
+                        }),
+                    parts.extensions,
+                );
             }
 
             // All tools handled - add results to messages and continue loop
@@ -950,22 +963,20 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
         };
 
-        let mut converted = Response::builder()
-            .status(parts.status)
-            .header("content-type", "application/json")
-            .body(Body::from(response_bytes))
-            .unwrap_or_else(|_| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "Failed to build response",
-                )
-            });
-        // The conversion built a fresh response; carry over the upstream
-        // response's extensions (ServedBy, ResolvedTrust) so integrators can
-        // still attribute which provider served the final iteration.
-        converted.extensions_mut().extend(parts.extensions);
-        return converted;
+        return carry_upstream_extensions(
+            Response::builder()
+                .status(parts.status)
+                .header("content-type", "application/json")
+                .body(Body::from(response_bytes))
+                .unwrap_or_else(|_| {
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "Failed to build response",
+                    )
+                }),
+            parts.extensions,
+        );
     }
 }
 
@@ -1212,25 +1223,26 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         }
     };
 
-    let mut converted = Response::builder()
-        .status(parts.status)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .body(Body::from_stream(transformed_stream))
-        .unwrap_or_else(|_| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to build streaming response",
-            )
-        });
-    // The conversion built a fresh response; carry over the first upstream
-    // response's extensions (ServedBy, ResolvedTrust) so integrators can still
-    // attribute the serving provider. Tool-loop follow-ups discard their parts,
-    // so the initial provider stands in for the whole stream.
-    converted.extensions_mut().extend(parts.extensions);
-    converted
+    // Attribution note: for streaming tool loops the response (and its
+    // extensions) is returned before follow-up iterations run, so ServedBy
+    // necessarily names the provider of the initial iteration — the final
+    // iteration's provider is unknowable at header time.
+    carry_upstream_extensions(
+        Response::builder()
+            .status(parts.status)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("connection", "keep-alive")
+            .body(Body::from_stream(transformed_stream))
+            .unwrap_or_else(|_| {
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "Failed to build streaming response",
+                )
+            }),
+        parts.extensions,
+    )
 }
 
 /// Forward a validated request to the upstream provider (returns raw response for adapter)
