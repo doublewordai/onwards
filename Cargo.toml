@@ -70,7 +70,7 @@ metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-fusillade = { version = "21.0.1", optional = true }
+fusillade = { version = "22.0.1", optional = true }
 
 [dev-dependencies]
 axum-test = "18.0.0"
