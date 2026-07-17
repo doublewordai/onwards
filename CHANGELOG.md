@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.1](https://github.com/doublewordai/onwards/compare/v0.35.0...v0.35.1) - 2026-07-17
+
+### Added
+
+- attach ServedBy response extension identifying the serving upstream ([#254](https://github.com/doublewordai/onwards/pull/254))
+
 ## [0.35.0](https://github.com/doublewordai/onwards/compare/v0.34.6...v0.35.0) - 2026-07-14
 
 ### Added
