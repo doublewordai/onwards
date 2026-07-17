@@ -950,7 +950,7 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
             }
         };
 
-        return Response::builder()
+        let mut converted = Response::builder()
             .status(parts.status)
             .header("content-type", "application/json")
             .body(Body::from(response_bytes))
@@ -961,6 +961,11 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
                     "Failed to build response",
                 )
             });
+        // The conversion built a fresh response; carry over the upstream
+        // response's extensions (ServedBy, ResolvedTrust) so integrators can
+        // still attribute which provider served the final iteration.
+        converted.extensions_mut().extend(parts.extensions);
+        return converted;
     }
 }
 
@@ -1207,7 +1212,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
         }
     };
 
-    Response::builder()
+    let mut converted = Response::builder()
         .status(parts.status)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
@@ -1219,7 +1224,13 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                 "server_error",
                 "Failed to build streaming response",
             )
-        })
+        });
+    // The conversion built a fresh response; carry over the first upstream
+    // response's extensions (ServedBy, ResolvedTrust) so integrators can still
+    // attribute the serving provider. Tool-loop follow-ups discard their parts,
+    // so the initial provider stands in for the whole stream.
+    converted.extensions_mut().extend(parts.extensions);
+    converted
 }
 
 /// Forward a validated request to the upstream provider (returns raw response for adapter)

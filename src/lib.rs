@@ -68,6 +68,7 @@ pub mod traits;
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
+pub use handlers::ServedBy;
 #[cfg(feature = "multi-step")]
 pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
 #[cfg(feature = "multi-step")]
@@ -1093,6 +1094,63 @@ mod tests {
         // Check that requests were made to the correct URLs
         assert!(requests[0].uri.contains("api.openai.com"));
         assert!(requests[1].uri.contains("api.anthropic.com"));
+    }
+
+    /// The success path must attach a `ServedBy` response extension naming the
+    /// upstream that produced the response, so integrators (request logging,
+    /// billing attribution) can read it in-process. Driven through the router
+    /// as a tower service — extensions don't survive a real HTTP hop, which is
+    /// exactly why the extension (not a header) carries this.
+    #[tokio::test]
+    async fn test_served_by_extension_set_on_success() {
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .onwards_model("gpt-4-upstream".to_string())
+                    .build(),
+            ),
+        );
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"choices": [{"message": {"content": "Hello!"}}]}"#,
+        );
+        let app_state = AppState::with_client(targets, mock_client);
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("success response must carry ServedBy");
+        assert_eq!(served_by.url, "https://api.openai.com/");
+        assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
