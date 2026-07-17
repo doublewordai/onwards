@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.2](https://github.com/doublewordai/onwards/compare/v0.35.1...v0.35.2) - 2026-07-17
+
+### Fixed
+
+- served-by attribution follow-ups from review ([#256](https://github.com/doublewordai/onwards/pull/256))
+
+### Other
+
+- *(deps)* update rust crate brotli to v8.0.4 ([#202](https://github.com/doublewordai/onwards/pull/202))
+- *(deps)* update rust crate uuid to v1.24.0 ([#203](https://github.com/doublewordai/onwards/pull/203))
+- *(deps)* update rust crate hyper to v1.10.1 ([#204](https://github.com/doublewordai/onwards/pull/204))
+- *(deps)* update rust crate bon to v3.9.3 ([#206](https://github.com/doublewordai/onwards/pull/206))
+- *(deps)* update rust crate bytes to v1.12.1 ([#217](https://github.com/doublewordai/onwards/pull/217))
+- *(deps)* update actions/checkout action to v7 ([#233](https://github.com/doublewordai/onwards/pull/233))
+- *(deps)* update rust crate anyhow to v1.0.103 ([#248](https://github.com/doublewordai/onwards/pull/248))
+- *(deps)* update rust docker tag to v1.97.1 ([#249](https://github.com/doublewordai/onwards/pull/249))
+
 ## [0.35.1](https://github.com/doublewordai/onwards/compare/v0.35.0...v0.35.1) - 2026-07-17
 
 ### Added
