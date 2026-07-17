@@ -978,9 +978,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade"
-version = "21.0.1"
+version = "22.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5d04f5b7ddafc991a80fd3e5d4988efaf6af791e3b8ea5557232f462eafdf35"
+checksum = "207a954a5c551dd324b6b6fda2a2c6df84e691e49bf43b41c05429adafafd2e5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1012,9 +1012,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-arsenal"
-version = "1.0.1"
+version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06df8fb12fcaa31fd34880a656abf9292dbb98ee8d9109164f9295e2f1ffcc6a"
+checksum = "30f5635e1ce53339246b3eba6f5e2c1a289b295bd35134e1c9bf72315a17ab9c"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1040,9 +1040,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-core"
-version = "1.0.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "523273ae988756dd1260bba667af3f078df2e1171d798f3c06655d91052127b8"
+checksum = "436000560d13e67d8008ca61e5f920bb7f41775dcdfc56a4340ce3849a04bad9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2211,7 +2211,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.2"
+version = "0.35.3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3668,7 +3668,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
