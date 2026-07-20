@@ -54,33 +54,15 @@ pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
 pub mod response_id;
-#[cfg(feature = "multi-step")]
-pub mod response_loop;
 pub mod response_sanitizer;
 pub mod sse;
-#[cfg(feature = "multi-step")]
-pub mod streaming;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
-pub mod traits;
 
 use client::{HttpClient, HyperClient};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-#[cfg(feature = "multi-step")]
-pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
-#[cfg(feature = "multi-step")]
-pub use streaming::{EventSink, EventSinkError, LoopEvent, LoopEventKind};
-#[cfg(feature = "multi-step")]
-pub use traits::{
-    ChainStep, ExecutorError, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind,
-    StepState,
-};
-pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolKind, ToolSchema,
-};
 
 /// Type alias for body transformation function
 ///
@@ -225,8 +207,6 @@ pub struct AppState<T: HttpClient> {
     /// correlate responses with pre-created tracking records without needing to
     /// patch the response body after the fact.
     pub response_id_header: Option<String>,
-    pub tool_executor: Arc<dyn ToolExecutor>,
-    pub response_store: Arc<dyn ResponseStore>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
@@ -256,8 +236,6 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             )
             .field("streaming_header", &self.streaming_header)
             .field("response_id_header", &self.response_id_header)
-            .field("tool_executor", &"<dyn ToolExecutor>")
-            .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
             .finish()
     }
@@ -280,8 +258,6 @@ impl AppState<HyperClient> {
             response_transform_fn: None,
             streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -302,8 +278,6 @@ impl AppState<HyperClient> {
             response_transform_fn: None,
             streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -319,8 +293,6 @@ impl<T: HttpClient> AppState<T> {
             response_transform_fn: None,
             streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -338,8 +310,6 @@ impl<T: HttpClient> AppState<T> {
             response_transform_fn: None,
             streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -360,18 +330,6 @@ impl<T: HttpClient> AppState<T> {
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
-        self
-    }
-
-    /// Set the tool executor for server-side tool handling (builder pattern)
-    pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.tool_executor = executor;
-        self
-    }
-
-    /// Set the response store for stateful conversations (builder pattern)
-    pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
-        self.response_store = store;
         self
     }
 

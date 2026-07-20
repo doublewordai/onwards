@@ -2369,8 +2369,6 @@ mod tests {
             response_transform_fn: None,
             streaming_header: None,
             response_id_header: None,
-            tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
-            response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
         };
 
