@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.4](https://github.com/doublewordai/onwards/compare/v0.35.3...v0.35.4) - 2026-07-20
+
+### Fixed
+
+- update fusillade to 23.0.1 ([#271](https://github.com/doublewordai/onwards/pull/271))
+
 ## [0.35.3](https://github.com/doublewordai/onwards/compare/v0.35.2...v0.35.3) - 2026-07-17
 
 ### Added
