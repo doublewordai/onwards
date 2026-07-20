@@ -10,8 +10,9 @@
 //! - Sanitizing error responses to prevent third-party info leakage
 
 use super::schemas::chat_completions::{
-    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, generated_chat_completion_id,
-    normalize_chat_completion_chunk_value, normalize_chat_completion_response_value,
+    ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse,
+    generated_chat_completion_id, normalize_chat_completion_chunk_value,
+    normalize_chat_completion_response_value,
 };
 use super::schemas::completions::{
     CompletionChunk, CompletionRequest, CompletionResponse, generated_completion_id,
@@ -24,7 +25,7 @@ use crate::errors::OnwardsErrorResponse;
 use crate::extract_model_from_request;
 use crate::handlers::{ResolvedTrust, target_message_handler};
 use axum::Json;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -77,9 +78,16 @@ pub async fn models_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(mut request): Json<ChatCompletionRequest>,
+    body: Bytes,
 ) -> Response {
-    request.scrub_request_id_fields();
+    // Strict-mode validation: parse a throwaway copy. dwctl owns the single
+    // parse-and-shape (including the id scrub from PR #240, now on the dwctl
+    // edge), so we forward the ORIGINAL bytes verbatim (COR-522) instead of
+    // re-serialising a parsed struct.
+    let request: ChatCompletionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return invalid_request_response(&e),
+    };
 
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
@@ -91,26 +99,13 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         "Chat completions request validated"
     );
 
-    // Re-serialize the validated request and forward it
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize chat completions request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
     let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+        extract_model_from_request(&headers, &body).unwrap_or(original_model.clone());
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/chat/completions", body_bytes).await;
+    } = forward_request(state, headers, "/chat/completions", body.to_vec()).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -145,8 +140,13 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<EmbeddingsRequest>,
+    body: Bytes,
 ) -> Response {
+    // Validate a throwaway copy; forward the original bytes verbatim (COR-522).
+    let request: EmbeddingsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return invalid_request_response(&e),
+    };
     let original_model = request.model.clone();
 
     debug!(
@@ -154,26 +154,13 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Embeddings request validated"
     );
 
-    // Re-serialize the validated request and forward it
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize embeddings request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
     let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+        extract_model_from_request(&headers, &body).unwrap_or(original_model.clone());
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/embeddings", body_bytes).await;
+    } = forward_request(state, headers, "/embeddings", body.to_vec()).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -195,8 +182,13 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    body: Bytes,
 ) -> Response {
+    // Validate a throwaway copy; forward the original bytes verbatim (COR-522).
+    let request: CompletionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return invalid_request_response(&e),
+    };
     let unsupported_reasoning_param = [
         (request.reasoning_effort.is_some(), "reasoning_effort"),
         (request.reasoning.is_some(), "reasoning"),
@@ -233,25 +225,12 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Completions request validated"
     );
 
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize completions request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
-    let resolved_model =
-        extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model);
+    let resolved_model = extract_model_from_request(&headers, &body).unwrap_or(original_model);
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/completions", body_bytes).await;
+    } = forward_request(state, headers, "/completions", body.to_vec()).await;
 
     if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
@@ -344,6 +323,22 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     });
 
     (status, Json(body)).into_response()
+}
+
+/// Strict-mode request validation error, matching what the `Json` extractor
+/// used to return: `422 Unprocessable Entity` for a valid-JSON body that fails
+/// the schema (missing/typed field), `400 Bad Request` for malformed JSON.
+fn invalid_request_response(e: &serde_json::Error) -> Response {
+    let status = if e.is_data() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    error_response(
+        status,
+        "invalid_request_error",
+        &format!("Invalid request: {e}"),
+    )
 }
 
 /// Sanitize non-streaming chat completion response
@@ -1369,8 +1364,12 @@ mod tests {
         assert!(!body_str.contains("custom_field"));
     }
 
+    /// COR-522: onwards forwards the chat request body VERBATIM (no re-serialise,
+    /// no scrub). The id-field scrubbing that used to happen here now happens
+    /// upstream at the dwctl edge, so the bytes must reach the provider exactly as
+    /// received - client-supplied ids included.
     #[tokio::test]
-    async fn test_strict_chat_request_scrubs_request_id_fields_before_forwarding() {
+    async fn test_strict_chat_request_forwarded_verbatim() {
         let targets = Arc::new(DashMap::new());
         targets.insert(
             "gpt-4".to_string(),
@@ -1433,14 +1432,18 @@ mod tests {
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 1);
 
-        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let forwarded_object = forwarded_json.as_object().unwrap();
+        // The body reaches the provider byte-for-byte as received: no re-serialise,
+        // no scrub. (The dwctl edge is responsible for stripping the ids upstream.)
+        assert_eq!(
+            requests[0].body,
+            request_body.as_bytes(),
+            "onwards must forward verbatim"
+        );
 
-        assert!(!forwarded_object.contains_key("id"));
-        assert!(!forwarded_object.contains_key("completion_id"));
-        assert!(!forwarded_object.contains_key("completionId"));
-        assert!(!forwarded_object.contains_key("response_id"));
-        assert!(!forwarded_object.contains_key("responseId"));
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        // Client-supplied ids are still present here - proof onwards did not scrub.
+        assert_eq!(forwarded_json["id"], "chatcmpl-client-leak");
+        assert_eq!(forwarded_json["responseId"], "respClientLeak");
         assert_eq!(forwarded_json["provider_extension"], "preserve-me");
     }
 

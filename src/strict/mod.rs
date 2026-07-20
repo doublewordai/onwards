@@ -491,5 +491,4 @@ mod tests {
         assert!(body_str.contains("\"text\":\" world\""));
         assert!(body_str.contains("[DONE]"));
     }
-
 }
