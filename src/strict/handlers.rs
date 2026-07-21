@@ -161,6 +161,20 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     req: Request<Body>,
 ) -> Response {
+    // An upstream edge (dwctl) may have already translated this Responses request
+    // into Chat Completions, normalising the path to `/chat/completions` as it did
+    // so. Axum cannot re-trigger route matching from a URI rewrite through a nest,
+    // so such a request still matches `/responses` and arrives here - with a body
+    // this handler's Responses schema would reject. Hand it to the chat handler.
+    // A native Responses request keeps its `/responses` path and falls through to
+    // the normal adapter/passthrough logic below.
+    if req.uri().path().ends_with("/chat/completions") {
+        return match Json::<ChatCompletionRequest>::from_request(req, &state).await {
+            Ok(chat_request) => chat_completions_handler(State(state), headers, chat_request).await,
+            Err(rejection) => rejection.into_response(),
+        };
+    }
+
     // Split the request so we can grab extensions (inserted by middleware)
     // before Axum's Json extractor consumes the body.
     let (mut parts, body) = req.into_parts();

@@ -351,6 +351,40 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The dwctl edge translates a Responses request into Chat Completions and
+    /// normalises the path to `/chat/completions`, but that rewrite cannot
+    /// re-trigger route matching through a nest, so the request still arrives on
+    /// the `/responses` route carrying a Chat Completions body. `responses_handler`
+    /// must recognise the normalised path and hand it to the chat handler rather
+    /// than rejecting it against the Responses schema.
+    ///
+    /// Driven through the handler directly because routing in a test follows the
+    /// URI, so a router-level test cannot reproduce that path/route mismatch.
+    #[tokio::test]
+    async fn test_responses_handler_dispatches_edge_translated_body_to_chat() {
+        let state = create_test_app_state();
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(padded_chat_completions_body(16)))
+            .unwrap();
+
+        let response = handlers::responses_handler(
+            axum::extract::State(state),
+            axum::http::HeaderMap::new(),
+            request,
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an edge-translated chat body on /responses must be served by the chat handler"
+        );
+    }
+
     #[tokio::test]
     async fn test_strict_router_accepts_base64_image_over_axum_2mb_default() {
         // The prod failure mode for COR-440: a vision request whose base64
