@@ -1,3 +1,7 @@
+Onwards has moved to [Control Layer](https://github.com/doublewordai/control-layer). Future versions of Onwards will be developed and released from there.
+
+---
+
 # Onwards
 
 [![Crates.io](https://img.shields.io/crates/v/onwards)](https://crates.io/crates/onwards)
