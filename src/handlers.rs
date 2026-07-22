@@ -76,6 +76,29 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
     (400..600).contains(&status).then_some(status)
 }
 
+/// A bounded, lossy-UTF-8 sample of an upstream *error envelope* (unary body or
+/// SSE frame), logged when an embedded provider error is detected. The offending
+/// provider name and human-readable message live in the body, not the status
+/// line — so without this an embedded error is only ever visible as a bare
+/// status code. Only ever called on a detected error envelope (an `error.code`
+/// in 400..600), never a normal completion body. Bounded in both output length
+/// *and* decode work — we validate at most `SAMPLE_CHARS * 4` bytes — so an
+/// arbitrary upstream body can't blow up a log line or the cost of building it.
+/// Mirrors the `data_sample` field the streaming sanitizer already logs.
+fn embedded_error_sample(bytes: &[u8]) -> String {
+    const SAMPLE_CHARS: usize = 256;
+    // A UTF-8 codepoint is at most 4 bytes, so this prefix always yields at least
+    // `SAMPLE_CHARS` chars while bounding the UTF-8 validation work for a huge
+    // body. A codepoint split at the boundary only affects chars past the cut,
+    // which `take(SAMPLE_CHARS)` discards anyway.
+    const MAX_PREFIX_BYTES: usize = SAMPLE_CHARS * 4;
+    let prefix = &bytes[..bytes.len().min(MAX_PREFIX_BYTES)];
+    String::from_utf8_lossy(prefix)
+        .chars()
+        .take(SAMPLE_CHARS)
+        .collect()
+}
+
 /// Classification of a single SSE event for the streaming embedded-error peek.
 #[derive(Debug, PartialEq, Eq)]
 enum SseEventKind {
@@ -1043,8 +1066,9 @@ pub async fn target_message_handler<T: HttpClient>(
         enum Scan2xx {
             Clean,
             /// Provider embedded an error status in the 2xx body
-            /// (`{"error":{"code":N}}`).
-            Embedded(u16),
+            /// (`{"error":{"code":N}}`). `sample` is a bounded snippet of that
+            /// body, carried through so the warn can name the provider/message.
+            Embedded { status: u16, sample: Option<String> },
             /// 2xx whose body *terminated* empty before any content frame — e.g.
             /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
@@ -1075,6 +1099,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // peek survives a budget timeout (consumed frames are not lost).
                 let mut peeked = Vec::new();
                 let mut embedded = None;
+                let mut embedded_sample = None;
                 // `saw_data` = a real content frame arrived (definitely not empty).
                 // `stream_ended` = the stream closed (`None`) or errored (`Err`)
                 // before any content — a *terminal* empty, safe to retry.
@@ -1086,6 +1111,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             Some(Ok(chunk)) => match classify_sse_event(&chunk) {
                                 SseEventKind::Error(status) => {
                                     embedded = Some(status);
+                                    embedded_sample = Some(embedded_error_sample(&chunk));
                                     peeked.push(Ok(chunk));
                                     break;
                                 }
@@ -1120,7 +1146,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
                 if let Some(status) = embedded {
-                    Scan2xx::Embedded(status)
+                    Scan2xx::Embedded { status, sample: embedded_sample }
                 } else if !timed_out && stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A *timeout* (stream still open,
@@ -1158,6 +1184,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     } else {
                         None
                     };
+                    // Snapshot a bounded sample of the offending body before it is
+                    // moved back into `response`, so the warn below can name the
+                    // provider / message instead of dead-ending at a bare status.
+                    let embedded_sample = embedded.map(|_| embedded_error_sample(&buffered));
                     // Re-attach the buffered body so downstream sees an intact response.
                     let len = buffered.len();
                     response = Response::from_parts(parts, axum::body::Body::from(buffered));
@@ -1166,7 +1196,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         .headers_mut()
                         .insert(CONTENT_LENGTH, HeaderValue::from(len));
                     match embedded {
-                        Some(status) => Scan2xx::Embedded(status),
+                        Some(status) => Scan2xx::Embedded { status, sample: embedded_sample },
                         None => Scan2xx::Clean,
                     }
                 }
@@ -1176,11 +1206,12 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         match scan {
-            Scan2xx::Embedded(embedded) => {
+            Scan2xx::Embedded { status: embedded, sample } => {
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
                     upstream = %target.url,
+                    error_sample = ?sample,
                     "Upstream returned 2xx with an embedded provider error; treating it as status {embedded}"
                 );
                 upstream_span.record("http.response.status_code", embedded);
@@ -1605,6 +1636,27 @@ mod tests {
             embedded_error_status(&serde_json::json!({"error": {"code": 999}})),
             None
         );
+    }
+
+    #[test]
+    fn embedded_error_sample_captures_provider_and_truncates() {
+        // The whole point: surface the provider name + message that the bare
+        // status code discards.
+        let body =
+            br#"{"provider":"Together","error":{"code":504,"message":"Provider returned error"}}"#;
+        let sample = embedded_error_sample(body);
+        assert!(sample.contains("Together"));
+        assert!(sample.contains("Provider returned error"));
+
+        // Bounded to 256 chars, counted in chars (never split codepoints), even
+        // when the input exceeds the byte-prefix scan window (256 * 4 = 1024
+        // bytes). 700 × 2-byte "é" = 1400 bytes > 1024, so this also exercises
+        // the prefix-slice path.
+        let big = format!("{}{}", "é".repeat(700), "tail");
+        let sample = embedded_error_sample(big.as_bytes());
+        assert_eq!(sample.chars().count(), 256);
+        assert!(sample.chars().all(|c| c == 'é'));
+        assert!(!sample.contains("tail"));
     }
 
     #[test]
